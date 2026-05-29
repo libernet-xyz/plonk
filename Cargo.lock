@@ -341,20 +341,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "plonk"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "ff",
- "primitive-types",
- "rand_core",
- "sha3",
- "starkom-bluesky",
- "starkom-pcs",
- "starkom-poly",
-]
-
-[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -533,6 +519,20 @@ dependencies = [
  "starkom-bluesky",
  "starkom-poly",
  "starkom-poseidon2",
+]
+
+[[package]]
+name = "starkom-plonk"
+version = "1.0.1"
+dependencies = [
+ "anyhow",
+ "ff",
+ "primitive-types",
+ "rand_core",
+ "sha3",
+ "starkom-bluesky",
+ "starkom-pcs",
+ "starkom-poly",
 ]
 
 [[package]]

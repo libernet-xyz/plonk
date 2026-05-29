@@ -1,6 +1,6 @@
 [package]
-name = "plonk"
-version = "1.0.0"
+name = "starkom-plonk"
+version = "1.0.1"
 description = "The PLONK arithmetization scheme used in Starkom."
 license = "Apache-2.0"
 repository = "https://github.com/libernet-xyz/plonk.git"
