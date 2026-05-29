@@ -951,6 +951,1074 @@ impl CompressedCircuit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::circuit::WireOrUnconstrained;
+    use starkom_pcs::hash::{Poseidon2Hash, Sha2Hash};
 
-    // TODO
+    /// Builds the circuit at https://vitalik.eth.limo/general/2019/09/22/plonk.html.
+    fn build_test_circuit() -> (Circuit, usize) {
+        let mut builder = CircuitBuilder::default();
+        let gate1 = builder.add_raw_gate(0.into(), 0.into(), -Scalar::from(1), 1.into(), 0.into());
+        builder.connect(Wire::LeftIn(gate1), Wire::RightIn(gate1));
+        let gate2 = builder.add_raw_gate(0.into(), 0.into(), -Scalar::from(1), 1.into(), 0.into());
+        builder.connect(Wire::LeftIn(gate2), Wire::Out(gate1));
+        builder.connect(Wire::RightIn(gate2), Wire::LeftIn(gate1));
+        let gate3 = builder.add_raw_gate(1.into(), 1.into(), -Scalar::from(1), 0.into(), 0.into());
+        builder.connect(Wire::LeftIn(gate3), Wire::LeftIn(gate1));
+        builder.connect(Wire::RightIn(gate3), Wire::Out(gate2));
+        let gate4 = builder.add_raw_gate(1.into(), 1.into(), -Scalar::from(1), 0.into(), 0.into());
+        builder.connect(Wire::LeftIn(gate4), Wire::Out(gate3));
+        builder.declare_public_gates([gate4]);
+        (builder.build(), gate4)
+    }
+
+    fn witness(mut left: Vec<Scalar>, mut right: Vec<Scalar>, mut out: Vec<Scalar>) -> Witness {
+        let original_size = left.len();
+        assert_eq!(original_size, right.len());
+        assert_eq!(original_size, out.len());
+        let blinded_size = original_size + NUM_BLINDING_ROWS;
+        let padded_size = padded_size(blinded_size);
+        left.resize(padded_size, Scalar::ZERO);
+        right.resize(padded_size, Scalar::ZERO);
+        out.resize(padded_size, Scalar::ZERO);
+        Witness {
+            size: blinded_size,
+            gate_counter: original_size,
+            left,
+            right,
+            out,
+        }
+    }
+
+    fn test_circuit1<H: Hash<Scalar>>(blowup_log2: usize) {
+        let (circuit, gate) = build_test_circuit();
+        let compressed_circuit = circuit.compress::<H>(blowup_log2);
+        let proof = circuit
+            .prove::<H>(
+                witness(
+                    vec![3.into(), 9.into(), 3.into(), 30.into()],
+                    vec![3.into(), 3.into(), 27.into(), 5.into()],
+                    vec![9.into(), 27.into(), 30.into(), 35.into()],
+                ),
+                blowup_log2,
+            )
+            .unwrap();
+        let public_inputs = compressed_circuit.verify(&proof).unwrap();
+        assert_eq!(*public_inputs.get(&Wire::RightIn(gate)).unwrap(), 5.into());
+        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 35.into());
+    }
+
+    #[test]
+    fn test_circuit1_blowup_2() {
+        test_circuit1::<Sha2Hash<Scalar>>(1);
+        test_circuit1::<Poseidon2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_circuit1_blowup_4() {
+        test_circuit1::<Sha2Hash<Scalar>>(2);
+        test_circuit1::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_circuit1_blowup_8() {
+        test_circuit1::<Sha2Hash<Scalar>>(3);
+        test_circuit1::<Poseidon2Hash<Scalar>>(3);
+    }
+
+    #[test]
+    fn test_circuit1_blowup_16() {
+        test_circuit1::<Sha2Hash<Scalar>>(4);
+        test_circuit1::<Poseidon2Hash<Scalar>>(4);
+    }
+
+    #[test]
+    fn test_circuit1_blowup_32() {
+        test_circuit1::<Sha2Hash<Scalar>>(5);
+        test_circuit1::<Poseidon2Hash<Scalar>>(5);
+    }
+
+    #[test]
+    fn test_circuit1_blowup_64() {
+        test_circuit1::<Sha2Hash<Scalar>>(6);
+        test_circuit1::<Poseidon2Hash<Scalar>>(6);
+    }
+
+    #[test]
+    fn test_circuit1_blowup_128() {
+        test_circuit1::<Sha2Hash<Scalar>>(7);
+        test_circuit1::<Poseidon2Hash<Scalar>>(7);
+    }
+
+    #[test]
+    fn test_circuit1_blowup_256() {
+        test_circuit1::<Sha2Hash<Scalar>>(8);
+        test_circuit1::<Poseidon2Hash<Scalar>>(8);
+    }
+
+    fn test_circuit1_with_helpers<H: Hash<Scalar>>(blowup_log2: usize) {
+        let mut builder = CircuitBuilder::default();
+        let input = Wire::LeftIn(builder.gate_count());
+        let gate1 = builder.add_square_gate(input.into());
+        let gate2 = builder.add_mul_gate(gate1.into(), input.into());
+        let gate3 = builder.add_sum_gate(input.into(), gate2.into());
+        let gate4 = builder.add_sum_with_const_gate(gate3.into(), 5.into());
+        builder.declare_public_gates([gate4.gate()]);
+        let witness = witness(
+            vec![3.into(), 9.into(), 3.into(), 30.into()],
+            vec![3.into(), 3.into(), 27.into(), 30.into()],
+            vec![9.into(), 27.into(), 30.into(), 35.into()],
+        );
+        assert!(builder.check_witness(&witness).is_ok());
+        let circuit = builder.build();
+        let compressed_circuit = circuit.compress::<H>(blowup_log2);
+        let proof = circuit.prove::<H>(witness, blowup_log2).unwrap();
+        let public_inputs = compressed_circuit.verify(&proof).unwrap();
+        assert_eq!(*public_inputs.get(&gate4).unwrap(), 35.into());
+    }
+
+    #[test]
+    fn test_circuit1_with_helpers_blowup_2() {
+        test_circuit1_with_helpers::<Sha2Hash<Scalar>>(1);
+        test_circuit1_with_helpers::<Poseidon2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_circuit1_with_helpers_blowup_4() {
+        test_circuit1_with_helpers::<Sha2Hash<Scalar>>(2);
+        test_circuit1_with_helpers::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    fn test_circuit2<H: Hash<Scalar>>(blowup_log2: usize) {
+        let (circuit, gate) = build_test_circuit();
+        let compressed_circuit = circuit.compress::<H>(blowup_log2);
+        let proof = circuit
+            .prove::<H>(
+                witness(
+                    vec![4.into(), 16.into(), 4.into(), 68.into()],
+                    vec![4.into(), 4.into(), 64.into(), 5.into()],
+                    vec![16.into(), 64.into(), 68.into(), 73.into()],
+                ),
+                blowup_log2,
+            )
+            .unwrap();
+        let public_inputs = compressed_circuit.verify(&proof).unwrap();
+        assert_eq!(*public_inputs.get(&Wire::RightIn(gate)).unwrap(), 5.into());
+        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 73.into());
+    }
+
+    #[test]
+    fn test_circuit2_blowup_2() {
+        test_circuit2::<Sha2Hash<Scalar>>(1);
+        test_circuit2::<Poseidon2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_circuit2_blowup_4() {
+        test_circuit2::<Sha2Hash<Scalar>>(2);
+        test_circuit2::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_circuit2_blowup_8() {
+        test_circuit2::<Sha2Hash<Scalar>>(3);
+        test_circuit2::<Poseidon2Hash<Scalar>>(3);
+    }
+
+    fn test_gate_constraint_violation<H: Hash<Scalar>>(blowup_log2: usize) {
+        let (circuit, _) = build_test_circuit();
+        assert!(
+            circuit
+                .prove::<H>(
+                    witness(
+                        vec![4.into(), 16.into(), 4.into(), 68.into()],
+                        vec![4.into(), 4.into(), 64.into(), 5.into()],
+                        vec![16.into(), 64.into(), 68.into(), 35.into()],
+                    ),
+                    blowup_log2
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_gate_constraint_violation_blowup_2() {
+        test_gate_constraint_violation::<Sha2Hash<Scalar>>(1);
+        test_gate_constraint_violation::<Poseidon2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_gate_constraint_violation_blowup_4() {
+        test_gate_constraint_violation::<Sha2Hash<Scalar>>(2);
+        test_gate_constraint_violation::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_gate_constraint_violation_blowup_8() {
+        test_gate_constraint_violation::<Sha2Hash<Scalar>>(3);
+        test_gate_constraint_violation::<Poseidon2Hash<Scalar>>(3);
+    }
+
+    fn test_compressed_circuit1<H: Hash<Scalar>>(blowup_log2: usize) {
+        let (circuit, gate) = build_test_circuit();
+        let proof = circuit
+            .prove::<H>(
+                witness(
+                    vec![3.into(), 9.into(), 3.into(), 30.into()],
+                    vec![3.into(), 3.into(), 27.into(), 5.into()],
+                    vec![9.into(), 27.into(), 30.into(), 35.into()],
+                ),
+                blowup_log2,
+            )
+            .unwrap();
+        let circuit = circuit.to_compressed::<H>(blowup_log2);
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(*public_inputs.get(&Wire::RightIn(gate)).unwrap(), 5.into());
+        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 35.into());
+    }
+
+    #[test]
+    fn test_compressed_circuit1_blowup_2() {
+        test_compressed_circuit1::<Sha2Hash<Scalar>>(1);
+        test_compressed_circuit1::<Poseidon2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_compressed_circuit1_blowup_4() {
+        test_compressed_circuit1::<Sha2Hash<Scalar>>(2);
+        test_compressed_circuit1::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_compressed_circuit1_blowup_8() {
+        test_compressed_circuit1::<Sha2Hash<Scalar>>(3);
+        test_compressed_circuit1::<Poseidon2Hash<Scalar>>(3);
+    }
+
+    fn test_compressed_circuit2<H: Hash<Scalar>>(blowup_log2: usize) {
+        let (circuit, gate) = build_test_circuit();
+        let proof = circuit
+            .prove::<H>(
+                witness(
+                    vec![4.into(), 16.into(), 4.into(), 68.into()],
+                    vec![4.into(), 4.into(), 64.into(), 5.into()],
+                    vec![16.into(), 64.into(), 68.into(), 73.into()],
+                ),
+                blowup_log2,
+            )
+            .unwrap();
+        let circuit = circuit.to_compressed::<H>(blowup_log2);
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(*public_inputs.get(&Wire::RightIn(gate)).unwrap(), 5.into());
+        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 73.into());
+    }
+
+    #[test]
+    fn test_compressed_circuit2_blowup_2() {
+        test_compressed_circuit2::<Sha2Hash<Scalar>>(1);
+        test_compressed_circuit2::<Poseidon2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_compressed_circuit2_blowup_4() {
+        test_compressed_circuit2::<Sha2Hash<Scalar>>(2);
+        test_compressed_circuit2::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_compressed_circuit2_blowup_8() {
+        test_compressed_circuit2::<Sha2Hash<Scalar>>(3);
+        test_compressed_circuit2::<Poseidon2Hash<Scalar>>(3);
+    }
+
+    fn test_compile_separately<H: Hash<Scalar>>(blowup_log2: usize) {
+        let (prover_circuit, _) = build_test_circuit();
+        let proof = prover_circuit
+            .prove::<H>(
+                witness(
+                    vec![3.into(), 9.into(), 3.into(), 30.into()],
+                    vec![3.into(), 3.into(), 27.into(), 5.into()],
+                    vec![9.into(), 27.into(), 30.into(), 35.into()],
+                ),
+                blowup_log2,
+            )
+            .unwrap();
+        let (verifier_circuit, gate) = build_test_circuit();
+        let verifier_circuit = verifier_circuit.to_compressed::<H>(blowup_log2);
+        let public_inputs = verifier_circuit.verify(&proof).unwrap();
+        assert_eq!(*public_inputs.get(&Wire::RightIn(gate)).unwrap(), 5.into());
+        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 35.into());
+    }
+
+    #[test]
+    fn test_compile_separately_blowup_2() {
+        test_compile_separately::<Sha2Hash<Scalar>>(1);
+        test_compile_separately::<Poseidon2Hash<Scalar>>(1);
+        test_compile_separately::<Sha2Hash<Scalar>>(2);
+        test_compile_separately::<Poseidon2Hash<Scalar>>(2);
+        test_compile_separately::<Sha2Hash<Scalar>>(3);
+        test_compile_separately::<Poseidon2Hash<Scalar>>(3);
+    }
+
+    const DEFAULT_BLOWUP_LOG2: usize = 3;
+
+    fn test_gate(circuit: &Circuit, left: u64, right: u64, out: u64) -> Result<()> {
+        let proof = circuit.prove::<Sha2Hash<Scalar>>(
+            witness(vec![left.into()], vec![right.into()], vec![out.into()]),
+            DEFAULT_BLOWUP_LOG2,
+        )?;
+        let compressed_circuit = circuit.compress::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
+        compressed_circuit.verify(&proof).unwrap();
+        Ok(())
+    }
+
+    fn test_connected_unary_gate(circuit: &Circuit, input: u64, output: u64) -> Result<()> {
+        let proof = circuit.prove::<Sha2Hash<Scalar>>(
+            witness(
+                vec![0.into(), input.into()],
+                vec![0.into(), input.into()],
+                vec![input.into(), output.into()],
+            ),
+            DEFAULT_BLOWUP_LOG2,
+        )?;
+        let compressed_circuit = circuit.compress::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
+        compressed_circuit.verify(&proof).unwrap();
+        Ok(())
+    }
+
+    fn test_connected_binary_gate(
+        circuit: &Circuit,
+        left: u64,
+        right: u64,
+        out: u64,
+    ) -> Result<()> {
+        let proof = circuit.prove::<Sha2Hash<Scalar>>(
+            witness(
+                vec![0.into(), 0.into(), left.into()],
+                vec![0.into(), 0.into(), right.into()],
+                vec![left.into(), right.into(), out.into()],
+            ),
+            DEFAULT_BLOWUP_LOG2,
+        )?;
+        let compressed_circuit = circuit.compress::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
+        compressed_circuit.verify(&proof).unwrap();
+        Ok(())
+    }
+
+    fn test_connected_nop_gate_impl(
+        circuit: &Circuit,
+        left: u64,
+        right: u64,
+        out: u64,
+    ) -> Result<()> {
+        let proof = circuit.prove::<Sha2Hash<Scalar>>(
+            witness(
+                vec![0.into(), 0.into(), 0.into(), left.into()],
+                vec![0.into(), 0.into(), 0.into(), right.into()],
+                vec![left.into(), right.into(), out.into(), out.into()],
+            ),
+            DEFAULT_BLOWUP_LOG2,
+        )?;
+        let compressed_circuit = circuit.compress::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
+        compressed_circuit.verify(&proof).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn test_nop_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_nop_gate(None, None, None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 12, 34, 56).is_ok());
+        assert!(test_gate(&circuit, 34, 56, 78).is_ok());
+    }
+
+    #[test]
+    fn test_connected_nop_gate() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(123.into());
+        let rhs = builder.add_const_gate(456.into());
+        let out = builder.add_const_gate(789.into());
+        builder.add_nop_gate(lhs.into(), rhs.into(), out.into());
+        let circuit = builder.build();
+        assert!(test_connected_nop_gate_impl(&circuit, 123, 456, 789).is_ok());
+        assert!(test_connected_nop_gate_impl(&circuit, 42, 456, 789).is_err());
+        assert!(test_connected_nop_gate_impl(&circuit, 123, 42, 789).is_err());
+        assert!(test_connected_nop_gate_impl(&circuit, 123, 456, 42).is_err());
+    }
+
+    #[test]
+    fn test_const_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_const_gate(42.into());
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 0, 0, 41).is_err());
+        assert!(test_gate(&circuit, 0, 0, 42).is_ok());
+        assert!(test_gate(&circuit, 0, 0, 43).is_err());
+    }
+
+    #[test]
+    fn test_sum_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_sum_gate(None, None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 12, 34, 46).is_ok());
+        assert!(test_gate(&circuit, 34, 12, 46).is_ok());
+        assert!(test_gate(&circuit, 56, 78, 134).is_ok());
+        assert!(test_gate(&circuit, 56, 34, 45).is_err());
+        assert!(test_gate(&circuit, 12, 56, 46).is_err());
+        assert!(test_gate(&circuit, 12, 34, 56).is_err());
+    }
+
+    #[test]
+    fn test_connected_sum_gate() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(123.into());
+        let rhs = builder.add_const_gate(456.into());
+        builder.add_sum_gate(lhs.into(), rhs.into());
+        let circuit = builder.build();
+        assert!(test_connected_binary_gate(&circuit, 123, 456, 579).is_ok());
+        assert!(test_connected_binary_gate(&circuit, 123, 456, 975).is_err());
+        assert!(test_connected_binary_gate(&circuit, 321, 456, 579).is_err());
+        assert!(test_connected_binary_gate(&circuit, 123, 654, 579).is_err());
+    }
+
+    #[test]
+    fn test_sum_with_const_gate1() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_sum_with_const_gate(None, 12.into());
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 34, 34, 46).is_ok());
+        assert!(test_gate(&circuit, 34, 56, 46).is_err());
+        assert!(test_gate(&circuit, 56, 56, 68).is_ok());
+        assert!(test_gate(&circuit, 56, 78, 68).is_err());
+        assert!(test_gate(&circuit, 78, 78, 45).is_err());
+        assert!(test_gate(&circuit, 90, 90, 45).is_err());
+    }
+
+    #[test]
+    fn test_sum_with_const_gate2() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_sum_with_const_gate(None, 34.into());
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 34, 34, 68).is_ok());
+        assert!(test_gate(&circuit, 34, 56, 68).is_err());
+        assert!(test_gate(&circuit, 56, 56, 90).is_ok());
+        assert!(test_gate(&circuit, 56, 78, 90).is_err());
+        assert!(test_gate(&circuit, 78, 78, 45).is_err());
+        assert!(test_gate(&circuit, 90, 90, 46).is_err());
+    }
+
+    #[test]
+    fn test_connected_sum_with_const_gate1() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(34.into());
+        builder.add_sum_with_const_gate(input.into(), 12.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 34, 46).is_ok());
+        assert!(test_connected_unary_gate(&circuit, 34, 56).is_err());
+    }
+
+    #[test]
+    fn test_connected_sum_with_const_gate2() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(56.into());
+        builder.add_sum_with_const_gate(input.into(), 34.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 56, 90).is_ok());
+        assert!(test_connected_unary_gate(&circuit, 56, 78).is_err());
+    }
+
+    #[test]
+    fn test_sub_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_sub_gate(None, None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 34, 12, 22).is_ok());
+        assert!(test_gate(&circuit, 56, 12, 44).is_ok());
+        assert!(test_gate(&circuit, 56, 12, 22).is_err());
+        assert!(test_gate(&circuit, 34, 56, 22).is_err());
+        assert!(test_gate(&circuit, 34, 12, 56).is_err());
+    }
+
+    #[test]
+    fn test_connected_sub_gate() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(456.into());
+        let rhs = builder.add_const_gate(123.into());
+        builder.add_sub_gate(lhs.into(), rhs.into());
+        let circuit = builder.build();
+        assert!(test_connected_binary_gate(&circuit, 456, 123, 333).is_ok());
+        assert!(test_connected_binary_gate(&circuit, 456, 123, 999).is_err());
+        assert!(test_connected_binary_gate(&circuit, 654, 123, 333).is_err());
+        assert!(test_connected_binary_gate(&circuit, 456, 321, 333).is_err());
+    }
+
+    #[test]
+    fn test_sub_const_gate1() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_sub_const_gate(None, 12.into());
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 34, 34, 22).is_ok());
+        assert!(test_gate(&circuit, 34, 56, 22).is_err());
+        assert!(test_gate(&circuit, 56, 56, 44).is_ok());
+        assert!(test_gate(&circuit, 56, 78, 44).is_err());
+        assert!(test_gate(&circuit, 78, 78, 45).is_err());
+        assert!(test_gate(&circuit, 90, 90, 46).is_err());
+    }
+
+    #[test]
+    fn test_sub_const_gate2() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_sub_const_gate(None, 34.into());
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 34, 34, 0).is_ok());
+        assert!(test_gate(&circuit, 34, 56, 0).is_err());
+        assert!(test_gate(&circuit, 56, 56, 22).is_ok());
+        assert!(test_gate(&circuit, 56, 78, 22).is_err());
+        assert!(test_gate(&circuit, 78, 78, 45).is_err());
+        assert!(test_gate(&circuit, 90, 90, 46).is_err());
+    }
+
+    #[test]
+    fn test_connected_sub_const_gate1() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(34.into());
+        builder.add_sub_const_gate(input.into(), 12.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 34, 22).is_ok());
+        assert!(test_connected_unary_gate(&circuit, 34, 56).is_err());
+    }
+
+    #[test]
+    fn test_connected_sub_const_gate2() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(56.into());
+        builder.add_sub_const_gate(input.into(), 34.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 56, 22).is_ok());
+        assert!(test_connected_unary_gate(&circuit, 56, 78).is_err());
+    }
+
+    #[test]
+    fn test_sub_from_const_gate1() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_sub_from_const_gate(90.into(), None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 34, 34, 56).is_ok());
+        assert!(test_gate(&circuit, 34, 56, 56).is_err());
+        assert!(test_gate(&circuit, 56, 56, 34).is_ok());
+        assert!(test_gate(&circuit, 56, 78, 34).is_err());
+        assert!(test_gate(&circuit, 78, 78, 13).is_err());
+        assert!(test_gate(&circuit, 90, 90, 14).is_err());
+    }
+
+    #[test]
+    fn test_sub_from_const_gate2() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_sub_from_const_gate(78.into(), None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 12, 12, 66).is_ok());
+        assert!(test_gate(&circuit, 12, 34, 66).is_err());
+        assert!(test_gate(&circuit, 34, 34, 44).is_ok());
+        assert!(test_gate(&circuit, 34, 56, 44).is_err());
+        assert!(test_gate(&circuit, 56, 56, 23).is_err());
+        assert!(test_gate(&circuit, 78, 78, 24).is_err());
+    }
+
+    #[test]
+    fn test_connected_sub_from_const_gate1() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(34.into());
+        builder.add_sub_from_const_gate(90.into(), input.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 34, 56).is_ok());
+        assert!(test_connected_unary_gate(&circuit, 34, 78).is_err());
+    }
+
+    #[test]
+    fn test_connected_sub_from_const_gate2() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(12.into());
+        builder.add_sub_from_const_gate(78.into(), input.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 12, 66).is_ok());
+        assert!(test_connected_unary_gate(&circuit, 12, 34).is_err());
+    }
+
+    #[test]
+    fn test_mul_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_mul_gate(None, None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 12, 34, 408).is_ok());
+        assert!(test_gate(&circuit, 34, 12, 408).is_ok());
+        assert!(test_gate(&circuit, 56, 78, 4368).is_ok());
+        assert!(test_gate(&circuit, 56, 34, 408).is_err());
+        assert!(test_gate(&circuit, 12, 56, 408).is_err());
+        assert!(test_gate(&circuit, 12, 34, 56).is_err());
+    }
+
+    #[test]
+    fn test_connected_mul_gate() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(12.into());
+        let rhs = builder.add_const_gate(34.into());
+        builder.add_mul_gate(lhs.into(), rhs.into());
+        let circuit = builder.build();
+        assert!(test_connected_binary_gate(&circuit, 12, 34, 408).is_ok());
+        assert!(test_connected_binary_gate(&circuit, 12, 34, 804).is_err());
+    }
+
+    #[test]
+    fn test_mul_by_const_gate1() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_mul_by_const_gate(None, 12.into());
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 12, 12, 144).is_ok());
+        assert!(test_gate(&circuit, 12, 34, 144).is_err());
+        assert!(test_gate(&circuit, 34, 34, 408).is_ok());
+        assert!(test_gate(&circuit, 34, 56, 408).is_err());
+        assert!(test_gate(&circuit, 56, 56, 409).is_err());
+        assert!(test_gate(&circuit, 78, 78, 410).is_err());
+    }
+
+    #[test]
+    fn test_mul_by_const_gate2() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_mul_by_const_gate(None, 34.into());
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 12, 12, 408).is_ok());
+        assert!(test_gate(&circuit, 12, 34, 408).is_err());
+        assert!(test_gate(&circuit, 34, 34, 1156).is_ok());
+        assert!(test_gate(&circuit, 34, 56, 1156).is_err());
+        assert!(test_gate(&circuit, 56, 56, 1157).is_err());
+        assert!(test_gate(&circuit, 78, 78, 1158).is_err());
+    }
+
+    #[test]
+    fn test_connected_mul_by_const_gate1() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(12.into());
+        builder.add_mul_by_const_gate(lhs.into(), 34.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 12, 408).is_ok());
+        assert!(test_connected_unary_gate(&circuit, 12, 804).is_err());
+    }
+
+    #[test]
+    fn test_connected_mul_by_const_gate2() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(34.into());
+        builder.add_mul_by_const_gate(lhs.into(), 12.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 34, 408).is_ok());
+        assert!(test_connected_unary_gate(&circuit, 34, 804).is_err());
+    }
+
+    #[test]
+    fn test_linear_combination_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_linear_combination_gate(12.into(), None, 56.into(), None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 34, 78, 4776).is_ok());
+        assert!(test_gate(&circuit, 78, 90, 5976).is_ok());
+        assert!(test_gate(&circuit, 42, 78, 4776).is_err());
+        assert!(test_gate(&circuit, 34, 42, 4776).is_err());
+        assert!(test_gate(&circuit, 34, 78, 42).is_err());
+    }
+
+    #[test]
+    fn test_connected_linear_combination_gate() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(34.into());
+        let rhs = builder.add_const_gate(78.into());
+        builder.add_linear_combination_gate(12.into(), lhs.into(), 56.into(), rhs.into());
+        let circuit = builder.build();
+        assert!(test_connected_binary_gate(&circuit, 34, 78, 4776).is_ok());
+        assert!(test_connected_binary_gate(&circuit, 34, 78, 7647).is_err());
+    }
+
+    #[test]
+    fn test_poly2_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_poly2_gate(12.into(), 34.into(), 56.into(), None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 42, 42, 22652).is_ok());
+        assert!(test_gate(&circuit, 78, 42, 22652).is_err());
+        assert!(test_gate(&circuit, 42, 78, 22652).is_err());
+        assert!(test_gate(&circuit, 42, 42, 78).is_err());
+    }
+
+    #[test]
+    fn test_connected_poly2_gate() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(43.into());
+        builder.add_poly2_gate(34.into(), 56.into(), 78.into(), input.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 43, 65352).is_ok());
+        assert!(test_connected_unary_gate(&circuit, 43, 22652).is_err());
+        assert!(test_connected_unary_gate(&circuit, 43, 23706).is_err());
+    }
+
+    #[test]
+    fn test_bit_assertion_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_bit_assertion_gate(None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 0, 0, 0).is_ok());
+        assert!(test_gate(&circuit, 0, 1, 0).is_err());
+        assert!(test_gate(&circuit, 1, 0, 0).is_err());
+        assert!(test_gate(&circuit, 1, 1, 0).is_ok());
+        assert!(test_gate(&circuit, 2, 2, 0).is_err());
+        assert!(test_gate(&circuit, 3, 3, 0).is_err());
+        assert!(test_gate(&circuit, 123, 123, 0).is_err());
+    }
+
+    #[test]
+    fn test_connected_bit_assertion_gate1() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(0.into());
+        builder.add_bit_assertion_gate(input.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn test_connected_bit_assertion_gate2() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(1.into());
+        builder.add_bit_assertion_gate(input.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 1, 0).is_ok());
+    }
+
+    #[test]
+    fn test_connected_bit_assertion_gate3() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(2.into());
+        builder.add_bit_assertion_gate(input.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 2, 0).is_err());
+    }
+
+    #[test]
+    fn test_connected_bit_assertion_gate4() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(2.into());
+        builder.add_bit_assertion_gate(input.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 3, 0).is_err());
+    }
+
+    fn test_trit_assertion_gate_impl(value: u64) -> Result<()> {
+        let mut builder = CircuitBuilder::default();
+        builder.add_trit_assertion_gate(None);
+        let circuit = builder.build();
+        let mut witness = Witness::new(circuit.size());
+        witness.assert_trit(WireOrUnconstrained::Unconstrained(value.into()));
+        let proof = circuit.prove::<Sha2Hash<Scalar>>(witness, DEFAULT_BLOWUP_LOG2)?;
+        let compressed_circuit = circuit.to_compressed::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
+        compressed_circuit.verify(&proof)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_trit_assertion_gate() {
+        assert!(test_trit_assertion_gate_impl(0).is_ok());
+        assert!(test_trit_assertion_gate_impl(1).is_ok());
+        assert!(test_trit_assertion_gate_impl(2).is_ok());
+        assert!(test_trit_assertion_gate_impl(3).is_err());
+        assert!(test_trit_assertion_gate_impl(4).is_err());
+    }
+
+    fn test_connected_trit_assertion_gate_impl(value: u64) -> Result<()> {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(value.into());
+        builder.add_trit_assertion_gate(input.into());
+        let circuit = builder.build();
+        let mut witness = Witness::new(circuit.size());
+        let input = witness.assert_constant(value.into());
+        witness.assert_trit(input.into());
+        let proof = circuit.prove::<Sha2Hash<Scalar>>(witness, DEFAULT_BLOWUP_LOG2)?;
+        let compressed_circuit = circuit.to_compressed::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
+        compressed_circuit.verify(&proof)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_connected_trit_assertion_gate() {
+        assert!(test_connected_trit_assertion_gate_impl(0).is_ok());
+        assert!(test_connected_trit_assertion_gate_impl(1).is_ok());
+        assert!(test_connected_trit_assertion_gate_impl(2).is_ok());
+        assert!(test_connected_trit_assertion_gate_impl(3).is_err());
+        assert!(test_connected_trit_assertion_gate_impl(4).is_err());
+    }
+
+    #[test]
+    fn test_not_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_not_gate(None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 0, 0, 0).is_err());
+        assert!(test_gate(&circuit, 0, 0, 1).is_ok());
+        assert!(test_gate(&circuit, 0, 1, 0).is_err());
+        assert!(test_gate(&circuit, 0, 1, 1).is_err());
+        assert!(test_gate(&circuit, 1, 0, 0).is_err());
+        assert!(test_gate(&circuit, 1, 0, 1).is_err());
+        assert!(test_gate(&circuit, 1, 1, 0).is_ok());
+        assert!(test_gate(&circuit, 1, 1, 1).is_err());
+    }
+
+    #[test]
+    fn test_connected_not_gate() {
+        let mut builder = CircuitBuilder::default();
+        let input = builder.add_const_gate(0.into());
+        builder.add_not_gate(input.into());
+        let circuit = builder.build();
+        assert!(test_connected_unary_gate(&circuit, 0, 1).is_ok());
+        assert!(test_connected_unary_gate(&circuit, 1, 1).is_err());
+        assert!(test_connected_unary_gate(&circuit, 0, 0).is_err());
+    }
+
+    #[test]
+    fn test_and_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_and_gate(None, None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 0, 0, 0).is_ok());
+        assert!(test_gate(&circuit, 0, 0, 1).is_err());
+        assert!(test_gate(&circuit, 0, 1, 0).is_ok());
+        assert!(test_gate(&circuit, 0, 1, 1).is_err());
+        assert!(test_gate(&circuit, 1, 0, 0).is_ok());
+        assert!(test_gate(&circuit, 1, 0, 1).is_err());
+        assert!(test_gate(&circuit, 1, 1, 0).is_err());
+        assert!(test_gate(&circuit, 1, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn test_connected_and_gate1() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(0.into());
+        let rhs = builder.add_const_gate(1.into());
+        builder.add_and_gate(lhs.into(), rhs.into());
+        let circuit = builder.build();
+        assert!(test_connected_binary_gate(&circuit, 0, 1, 0).is_ok());
+        assert!(test_connected_binary_gate(&circuit, 0, 1, 1).is_err());
+    }
+
+    #[test]
+    fn test_connected_and_gate2() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(1.into());
+        let rhs = builder.add_const_gate(1.into());
+        builder.add_and_gate(lhs.into(), rhs.into());
+        let circuit = builder.build();
+        assert!(test_connected_binary_gate(&circuit, 1, 1, 1).is_ok());
+        assert!(test_connected_binary_gate(&circuit, 1, 1, 0).is_err());
+    }
+
+    #[test]
+    fn test_or_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_or_gate(None, None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 0, 0, 0).is_ok());
+        assert!(test_gate(&circuit, 0, 0, 1).is_err());
+        assert!(test_gate(&circuit, 0, 1, 0).is_err());
+        assert!(test_gate(&circuit, 0, 1, 1).is_ok());
+        assert!(test_gate(&circuit, 1, 0, 0).is_err());
+        assert!(test_gate(&circuit, 1, 0, 1).is_ok());
+        assert!(test_gate(&circuit, 1, 1, 0).is_err());
+        assert!(test_gate(&circuit, 1, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn test_connected_or_gate1() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(0.into());
+        let rhs = builder.add_const_gate(0.into());
+        builder.add_or_gate(lhs.into(), rhs.into());
+        let circuit = builder.build();
+        assert!(test_connected_binary_gate(&circuit, 0, 0, 0).is_ok());
+        assert!(test_connected_binary_gate(&circuit, 0, 0, 1).is_err());
+    }
+
+    #[test]
+    fn test_connected_or_gate2() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(0.into());
+        let rhs = builder.add_const_gate(1.into());
+        builder.add_or_gate(lhs.into(), rhs.into());
+        let circuit = builder.build();
+        assert!(test_connected_binary_gate(&circuit, 0, 1, 1).is_ok());
+        assert!(test_connected_binary_gate(&circuit, 0, 1, 0).is_err());
+    }
+
+    #[test]
+    fn test_xor_gate() {
+        let mut builder = CircuitBuilder::default();
+        builder.add_xor_gate(None, None);
+        let circuit = builder.build();
+        assert!(test_gate(&circuit, 0, 0, 0).is_ok());
+        assert!(test_gate(&circuit, 0, 0, 1).is_err());
+        assert!(test_gate(&circuit, 0, 1, 0).is_err());
+        assert!(test_gate(&circuit, 0, 1, 1).is_ok());
+        assert!(test_gate(&circuit, 1, 0, 0).is_err());
+        assert!(test_gate(&circuit, 1, 0, 1).is_ok());
+        assert!(test_gate(&circuit, 1, 1, 0).is_ok());
+        assert!(test_gate(&circuit, 1, 1, 1).is_err());
+    }
+
+    #[test]
+    fn test_connected_xor_gate1() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(0.into());
+        let rhs = builder.add_const_gate(1.into());
+        builder.add_xor_gate(lhs.into(), rhs.into());
+        let circuit = builder.build();
+        assert!(test_connected_binary_gate(&circuit, 0, 1, 1).is_ok());
+        assert!(test_connected_binary_gate(&circuit, 0, 1, 0).is_err());
+    }
+
+    #[test]
+    fn test_connected_xor_gate2() {
+        let mut builder = CircuitBuilder::default();
+        let lhs = builder.add_const_gate(1.into());
+        let rhs = builder.add_const_gate(1.into());
+        builder.add_xor_gate(lhs.into(), rhs.into());
+        let circuit = builder.build();
+        assert!(test_connected_binary_gate(&circuit, 1, 1, 0).is_ok());
+        assert!(test_connected_binary_gate(&circuit, 1, 1, 1).is_err());
+    }
+
+    /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
+    /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81). This
+    /// test circuit is meaningful because its size is not a power of 2 (it's 6, or 9 including the
+    /// blinding rows), so it tests padding.
+    fn build_uneven_size_circuit() -> (Circuit, usize) {
+        let mut builder = CircuitBuilder::default();
+        let input = Wire::LeftIn(builder.gate_count());
+        let gate1 = builder.add_square_gate(input.into());
+        let gate2 = builder.add_mul_gate(gate1.into(), input.into());
+        let gate3 = builder.add_mul_gate(input.into(), None);
+        let gate4 = builder.add_sum_gate(gate3.into(), gate2.into());
+        let gate5 = builder.add_sum_gate(None, gate4.into());
+        let gate6 = builder.add_nop_gate(Wire::LeftIn(gate5.gate()).into(), None, gate5.into());
+        builder.declare_public_gates([gate6]);
+        (builder.build(), gate6)
+    }
+
+    fn test_uneven_size_circuit1<H: Hash<Scalar>>(blowup_log2: usize) {
+        let (circuit, gate) = build_uneven_size_circuit();
+        let proof = circuit
+            .prove::<H>(
+                witness(
+                    vec![3.into(), 9.into(), 3.into(), 12.into(), 5.into(), 5.into()],
+                    vec![3.into(), 3.into(), 4.into(), 27.into(), 39.into(), 0.into()],
+                    vec![
+                        9.into(),
+                        27.into(),
+                        12.into(),
+                        39.into(),
+                        44.into(),
+                        44.into(),
+                    ],
+                ),
+                blowup_log2,
+            )
+            .unwrap();
+        let compressed_circuit = circuit.to_compressed::<H>(blowup_log2);
+        let public_inputs = compressed_circuit.verify::<H>(&proof).unwrap();
+        assert_eq!(*public_inputs.get(&Wire::LeftIn(gate)).unwrap(), 5.into());
+        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 44.into());
+    }
+
+    #[test]
+    fn test_uneven_size_circuit1_blowup_2() {
+        test_uneven_size_circuit1::<Sha2Hash<Scalar>>(1);
+        test_uneven_size_circuit1::<Poseidon2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_uneven_size_circuit1_blowup_4() {
+        test_uneven_size_circuit1::<Sha2Hash<Scalar>>(2);
+        test_uneven_size_circuit1::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_uneven_size_circuit1_blowup_8() {
+        test_uneven_size_circuit1::<Sha2Hash<Scalar>>(3);
+        test_uneven_size_circuit1::<Poseidon2Hash<Scalar>>(3);
+    }
+
+    fn test_uneven_size_circuit2<H: Hash<Scalar>>(blowup_log2: usize) {
+        let (circuit, gate) = build_uneven_size_circuit();
+        let proof = circuit
+            .prove::<H>(
+                witness(
+                    vec![4.into(), 16.into(), 4.into(), 12.into(), 5.into(), 5.into()],
+                    vec![4.into(), 4.into(), 3.into(), 64.into(), 76.into(), 0.into()],
+                    vec![
+                        16.into(),
+                        64.into(),
+                        12.into(),
+                        76.into(),
+                        81.into(),
+                        81.into(),
+                    ],
+                ),
+                blowup_log2,
+            )
+            .unwrap();
+        let compressed_circuit = circuit.to_compressed::<H>(blowup_log2);
+        let public_inputs = compressed_circuit.verify::<H>(&proof).unwrap();
+        assert_eq!(*public_inputs.get(&Wire::LeftIn(gate)).unwrap(), 5.into());
+        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 81.into());
+    }
+
+    #[test]
+    fn test_uneven_size_circuit2_blowup_2() {
+        test_uneven_size_circuit2::<Sha2Hash<Scalar>>(1);
+        test_uneven_size_circuit2::<Poseidon2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_uneven_size_circuit2_blowup_4() {
+        test_uneven_size_circuit2::<Sha2Hash<Scalar>>(2);
+        test_uneven_size_circuit2::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_uneven_size_circuit2_blowup_8() {
+        test_uneven_size_circuit2::<Sha2Hash<Scalar>>(3);
+        test_uneven_size_circuit2::<Poseidon2Hash<Scalar>>(3);
+    }
+
+    #[test]
+    fn test_compile_uneven_size_circuit_separately() {
+        let (prover_circuit, _) = build_uneven_size_circuit();
+        let proof = prover_circuit
+            .prove::<Sha2Hash<Scalar>>(
+                witness(
+                    vec![3.into(), 9.into(), 3.into(), 12.into(), 5.into(), 5.into()],
+                    vec![3.into(), 3.into(), 4.into(), 27.into(), 39.into(), 0.into()],
+                    vec![
+                        9.into(),
+                        27.into(),
+                        12.into(),
+                        39.into(),
+                        44.into(),
+                        44.into(),
+                    ],
+                ),
+                DEFAULT_BLOWUP_LOG2,
+            )
+            .unwrap();
+        let (verifier_circuit, gate) = build_uneven_size_circuit();
+        let verifier_circuit =
+            verifier_circuit.to_compressed::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
+        let public_inputs = verifier_circuit.verify::<Sha2Hash<Scalar>>(&proof).unwrap();
+        assert_eq!(*public_inputs.get(&Wire::LeftIn(gate)).unwrap(), 5.into());
+        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 44.into());
+    }
 }
