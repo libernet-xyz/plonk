@@ -1,12 +1,12 @@
 use crate::circuit::{GateConstraint, Wire, WirePartitioning, padded_size};
 use crate::utils;
 use crate::witness::Witness;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use ff::Field;
 use starkom_bluesky::Scalar;
 use starkom_pcs::{self as pcs, hash::Hash};
 use starkom_poly;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
@@ -577,7 +577,196 @@ impl Circuit {
         }
     }
 
-    // TODO
+    /// Builds the two polynomials used in the permutation argument. The components of the returned
+    /// tuple are, respectively: the coordinate pair accumulator, the fixpoint constraint, and the
+    /// recurrence constraint.
+    fn build_permutation_argument(
+        &self,
+        witness: &Witness,
+        left: &Polynomial,
+        right: &Polynomial,
+        out: &Polynomial,
+        beta: Scalar,
+        gamma: Scalar,
+    ) -> Result<(Polynomial, Polynomial, Polynomial)> {
+        let n = padded_size(self.size);
+
+        let sl = self.sl_values.as_slice();
+        let sr = self.sr_values.as_slice();
+        let so = self.so_values.as_slice();
+
+        let mut accumulator = vec![Scalar::ZERO; n + 1];
+
+        accumulator[0] = Scalar::ONE;
+        for i in 0..n {
+            let x = Polynomial::domain_element2(i, n);
+            accumulator[i + 1] = accumulator[i]
+                * (witness.left[i] + beta * x + gamma)
+                * (witness.right[i] + beta * K1 * x + gamma)
+                * (witness.out[i] + beta * K2 * x + gamma)
+                * ((witness.left[i] + beta * sl[i] + gamma)
+                    * (witness.right[i] + beta * sr[i] + gamma)
+                    * (witness.out[i] + beta * so[i] + gamma))
+                    .invert()
+                    .into_option()
+                    .context("division by zero in permutation accumulator")?;
+        }
+
+        if accumulator.pop().unwrap() != Scalar::ONE {
+            return Err(anyhow!("permutation accumulator wraparound check failed"));
+        }
+
+        let accumulator = Polynomial::encode2(accumulator);
+
+        let shifted = {
+            let mut coefficients = accumulator.clone().take();
+            let omega = Polynomial::domain_element2(1, n);
+            let mut x = Scalar::ONE;
+            for coefficient in coefficients.iter_mut() {
+                *coefficient *= x;
+                x *= omega;
+            }
+            Polynomial::with_coefficients(coefficients)
+        };
+
+        let recurrence_constraint = Polynomial::multiply_many([
+            shifted,
+            left.clone() + self.sl.clone() * beta + gamma,
+            right.clone() + self.sr.clone() * beta + gamma,
+            out.clone() + self.so.clone() * beta + gamma,
+        ]) - Polynomial::multiply_many([
+            accumulator.clone(),
+            left.clone() + Polynomial::with_coefficients(vec![gamma, beta]),
+            right.clone() + Polynomial::with_coefficients(vec![gamma, beta * K1]),
+            out.clone() + Polynomial::with_coefficients(vec![gamma, beta * K2]),
+        ]);
+
+        let fixpoint_constraint =
+            (accumulator.clone() - Scalar::ONE) * Polynomial::lagrange0(n).clone();
+
+        Ok((accumulator, fixpoint_constraint, recurrence_constraint))
+    }
+
+    fn split_polynomial(polynomial: Polynomial, n: usize) -> (Polynomial, Polynomial, Polynomial) {
+        let mut coefficients = polynomial.take();
+        coefficients.resize(n * 3, Scalar::ZERO);
+        let low = Vec::from(&coefficients[0..n]);
+        let mid = Vec::from(&coefficients[n..(n * 2)]);
+        let high = Vec::from(&coefficients[(n * 2)..(n * 3)]);
+        (
+            Polynomial::with_coefficients(low),
+            Polynomial::with_coefficients(mid),
+            Polynomial::with_coefficients(high),
+        )
+    }
+
+    pub fn prove<H: Hash<Scalar>>(
+        &self,
+        mut witness: Witness,
+        blowup_log2: usize,
+    ) -> Result<Proof<H>> {
+        witness.blind();
+        if witness.size() != self.size {
+            return Err(anyhow!(
+                "incorrect witness size (got {}, want {})",
+                witness.size(),
+                self.size
+            ));
+        }
+
+        let degree_bound = padded_size(self.size);
+
+        let left = Polynomial::encode2(witness.left.clone());
+        let right = Polynomial::encode2(witness.right.clone());
+        let out = Polynomial::encode2(witness.out.clone());
+
+        let mut committer = pcs::Committer::<H>::new(
+            degree_bound,
+            blowup_log2,
+            vec![
+                self.ql.clone(),
+                self.qr.clone(),
+                self.qo.clone(),
+                self.qm.clone(),
+                self.qc.clone(),
+                self.sl.clone(),
+                self.sr.clone(),
+                self.so.clone(),
+            ],
+        );
+
+        let witness_commit_index =
+            committer.add_batch(vec![left.clone(), right.clone(), out.clone()]);
+        assert_eq!(witness_commit_index, COMMIT_INDEX_WITNESS);
+        let beta = H::hash_raw(
+            *DST,
+            committer.root_hash(witness_commit_index),
+            Scalar::from_const(1),
+        );
+        let gamma = H::hash_raw(
+            *DST,
+            committer.root_hash(witness_commit_index),
+            Scalar::from_const(2),
+        );
+
+        let (
+            permutation_accumulator,
+            permutation_fixpoint_constraint,
+            permutation_recurrence_constraint,
+        ) = self.build_permutation_argument(&witness, &left, &right, &out, beta, gamma)?;
+
+        let permutation_commit_index = committer.add_batch(vec![permutation_accumulator]);
+        assert_eq!(permutation_commit_index, COMMIT_INDEX_PERMUTATION_ARGUMENT);
+        let alpha = H::hash_raw(
+            *DST,
+            committer.root_hash(permutation_commit_index),
+            Scalar::ZERO,
+        );
+
+        let quotient = {
+            let gate_constraint = self.ql.clone() * left.clone()
+                + self.qr.clone() * right.clone()
+                + self.qo.clone() * out.clone()
+                + Polynomial::multiply_many([self.qm.clone(), left.clone(), right.clone()])
+                + self.qc.clone();
+            let constraint = gate_constraint
+                + permutation_fixpoint_constraint * alpha
+                + permutation_recurrence_constraint * alpha.square();
+            constraint.divide_by_zero(degree_bound)?
+        };
+
+        let omega = Polynomial::domain_element2(1, degree_bound);
+
+        let (quotient_low, quotient_mid, quotient_high) =
+            Self::split_polynomial(quotient, degree_bound);
+
+        let quotient_commit_index =
+            committer.add_batch(vec![quotient_low, quotient_mid, quotient_high]);
+        assert_eq!(quotient_commit_index, COMMIT_INDEX_QUOTIENT);
+        let xi = H::hash_raw(
+            *DST,
+            committer.root_hash(quotient_commit_index),
+            Scalar::ZERO,
+        );
+
+        let (commitment, prover) = committer.commit(BTreeSet::from_iter(
+            [xi, xi * omega].into_iter().chain(
+                self.public_gates
+                    .iter()
+                    .map(|&row| omega.pow_vartime([row as u64, 0, 0, 0])),
+            ),
+        ));
+        let inner_proof = prover.prove(&commitment);
+
+        Ok(Proof {
+            commitment,
+            inner_proof,
+        })
+    }
+
+    pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>) -> Result<BTreeMap<Wire, Scalar>> {
+        self.compress::<H>(proof.blowup_log2()).verify(proof)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -609,7 +798,154 @@ impl CompressedCircuit {
                 .unwrap()
     }
 
-    // TODO
+    pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>) -> Result<BTreeMap<Wire, Scalar>> {
+        let commitment = &proof.commitment;
+        let inner_proof = &proof.inner_proof;
+
+        if commitment.tree_roots().len() != NUM_COMMIT_INDICES {
+            return Err(anyhow!(
+                "wrong number of Merkle roots (got {}, want {})",
+                commitment.tree_roots().len(),
+                NUM_COMMIT_INDICES
+            ));
+        }
+        if commitment.tree_roots()[0] != self.circuit_commitment {
+            return Err(anyhow!(
+                "wrong circuit commitment (got {}, want {})",
+                commitment.tree_roots()[0],
+                self.circuit_commitment
+            ));
+        }
+
+        let n = padded_size(self.original_size);
+        if inner_proof.degree_bound() != n {
+            return Err(anyhow!(
+                "wrong degree bound (got {}, want {})",
+                inner_proof.degree_bound(),
+                n
+            ));
+        }
+        if inner_proof.blowup_log2() != self.blowup_log2 {
+            return Err(anyhow!(
+                "blowup factor mismatch (got {}, want {})",
+                1usize << inner_proof.blowup_log2(),
+                1usize << self.blowup_log2
+            ));
+        }
+        if inner_proof.num_polys() != 15 {
+            return Err(anyhow!(
+                "incorrect number of committed polynomials (got {}, want 17)",
+                inner_proof.num_polys()
+            ));
+        }
+
+        let omega = Polynomial::domain_element2(1, n);
+
+        let beta = H::hash_raw(
+            *DST,
+            commitment.tree_roots()[COMMIT_INDEX_WITNESS],
+            Scalar::from_const(1),
+        );
+        let gamma = H::hash_raw(
+            *DST,
+            commitment.tree_roots()[COMMIT_INDEX_WITNESS],
+            Scalar::from_const(2),
+        );
+        let alpha = H::hash_raw(
+            *DST,
+            commitment.tree_roots()[COMMIT_INDEX_PERMUTATION_ARGUMENT],
+            Scalar::ZERO,
+        );
+        let xi = H::hash_raw(
+            *DST,
+            commitment.tree_roots()[COMMIT_INDEX_QUOTIENT],
+            Scalar::ZERO,
+        );
+
+        let points = inner_proof.points();
+        if !points.contains_key(&xi) {
+            return Err(anyhow!(
+                "the proof doesn't have an opening for the Fiat-Shamir challenge value"
+            ));
+        }
+        if !points.contains_key(&(xi * omega)) {
+            return Err(anyhow!(
+                "the proof doesn't have an opening for the shifted Fiat-Shamir challenge value"
+            ));
+        }
+        for &gate in &self.public_gates {
+            let z = omega.pow_vartime([gate as u64, 0, 0, 0]);
+            if !points.contains_key(&z) {
+                return Err(anyhow!(
+                    "the proof doesn't have an opening for public gate {gate}"
+                ));
+            }
+        }
+
+        inner_proof.verify(&commitment)?;
+
+        let ql = points[&xi][0];
+        let qr = points[&xi][1];
+        let qo = points[&xi][2];
+        let qm = points[&xi][3];
+        let qc = points[&xi][4];
+        let sl = points[&xi][5];
+        let sr = points[&xi][6];
+        let so = points[&xi][7];
+
+        let left = points[&xi][8];
+        let right = points[&xi][9];
+        let out = points[&xi][10];
+
+        let xi_n = xi.pow_vartime([n as u64, 0, 0, 0]);
+        let xi_2n = xi.pow_vartime([n as u64 * 2, 0, 0, 0]);
+
+        let permutation_accumulator = points[&xi][11];
+        let shifted_permutation_accumulator = points[&(xi * omega)][11];
+        let quotient = {
+            let quotient_low = points[&xi][12];
+            let quotient_mid = points[&xi][13];
+            let quotient_high = points[&xi][14];
+            quotient_low + xi_n * quotient_mid + xi_2n * quotient_high
+        };
+        let zero = xi_n - Scalar::ONE;
+
+        let gate_constraint = ql * left + qr * right + qo * out + qm * left * right + qc;
+
+        let permutation_numerator = (left + beta * xi + gamma)
+            * (right + beta * K1 * xi + gamma)
+            * (out + beta * K2 * xi + gamma);
+        let permutation_denominator = {
+            (left + beta * sl + gamma) * (right + beta * sr + gamma) * (out + beta * so + gamma)
+        };
+        let permutation_recurrence_constraint = shifted_permutation_accumulator
+            * permutation_denominator
+            - permutation_accumulator * permutation_numerator;
+        let permutation_fixpoint_constraint =
+            (permutation_accumulator - Scalar::from_const(1)) * Self::lagrange0(xi, n);
+
+        let full_constraint = gate_constraint
+            + alpha * permutation_fixpoint_constraint
+            + alpha.square() * permutation_recurrence_constraint;
+        if full_constraint != quotient * zero {
+            return Err(anyhow!("constraint violation"));
+        }
+
+        Ok(BTreeMap::from_iter(
+            self.public_gates
+                .iter()
+                .map(|&gate| {
+                    let z = omega.pow_vartime([gate as u64, 0, 0, 0]);
+                    [
+                        (Wire::LeftIn(gate), points[&z][8]),
+                        (Wire::RightIn(gate), points[&z][9]),
+                        (Wire::Out(gate), points[&z][10]),
+                    ]
+                    .into_iter()
+                })
+                .flatten(),
+        ))
+    }
 }
 
 #[cfg(test)]
