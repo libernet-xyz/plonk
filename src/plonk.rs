@@ -807,10 +807,10 @@ impl CompressedCircuit {
                 NUM_COMMIT_INDICES
             ));
         }
-        if commitment.tree_roots()[0] != self.circuit_commitment {
+        if commitment.tree_roots()[COMMIT_INDEX_CIRCUIT] != self.circuit_commitment {
             return Err(anyhow!(
                 "wrong circuit commitment (got {}, want {})",
-                commitment.tree_roots()[0],
+                commitment.tree_roots()[COMMIT_INDEX_CIRCUIT],
                 self.circuit_commitment
             ));
         }
@@ -896,7 +896,7 @@ impl CompressedCircuit {
         let out = points[&xi][10];
 
         let xi_n = xi.pow_small(n);
-        let xi_2n = xi.pow_small(n);
+        let xi_2n = xi.pow_small(2 * n);
 
         let permutation_accumulator = points[&xi][11];
         let shifted_permutation_accumulator = points[&(xi * omega)][11];
