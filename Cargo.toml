@@ -7,6 +7,9 @@ repository = "https://github.com/libernet-xyz/plonk.git"
 readme = "README.md"
 edition = "2024"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 anyhow = "1.0.103"
 primitive-types = "0.14.0"
