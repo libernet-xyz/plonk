@@ -16,10 +16,7 @@ pub(crate) fn hash_to_scalar(message: &[u8]) -> Scalar {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn parse_scalar(s: &'static str) -> Scalar {
-        s.parse().unwrap()
-    }
+    use starkom_bluesky::parse_scalar;
 
     #[test]
     fn test_hash_to_scalar() {
