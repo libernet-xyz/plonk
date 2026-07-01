@@ -261,10 +261,7 @@ impl Witness {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const fn from_const(value: u64) -> Scalar {
-        Scalar::from_const(value)
-    }
+    use starkom_bluesky::from_const;
 
     #[test]
     fn test_one_row_initial_state() {
