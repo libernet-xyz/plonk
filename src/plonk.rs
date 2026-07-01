@@ -2,8 +2,8 @@ use crate::circuit::{GateConstraint, Wire, WirePartitioning, padded_size};
 use crate::utils;
 use crate::witness::Witness;
 use anyhow::{Context, Result, anyhow};
-use ff::Field;
 use starkom_bluesky::Scalar;
+use starkom_ff::Field;
 use starkom_pcs::{self as pcs, hash::Hash};
 use starkom_poly;
 use std::collections::{BTreeMap, BTreeSet};
@@ -698,12 +698,12 @@ impl Circuit {
         let witness_commit_index =
             committer.add_batch(vec![left.clone(), right.clone(), out.clone()]);
         assert_eq!(witness_commit_index, COMMIT_INDEX_WITNESS);
-        let beta = H::hash_raw(
+        let beta = H::hash_two(
             *DST,
             committer.root_hash(witness_commit_index),
             Scalar::from_const(1),
         );
-        let gamma = H::hash_raw(
+        let gamma = H::hash_two(
             *DST,
             committer.root_hash(witness_commit_index),
             Scalar::from_const(2),
@@ -717,7 +717,7 @@ impl Circuit {
 
         let permutation_commit_index = committer.add_batch(vec![permutation_accumulator]);
         assert_eq!(permutation_commit_index, COMMIT_INDEX_PERMUTATION_ARGUMENT);
-        let alpha = H::hash_raw(
+        let alpha = H::hash_two(
             *DST,
             committer.root_hash(permutation_commit_index),
             Scalar::ZERO,
@@ -743,18 +743,16 @@ impl Circuit {
         let quotient_commit_index =
             committer.add_batch(vec![quotient_low, quotient_mid, quotient_high]);
         assert_eq!(quotient_commit_index, COMMIT_INDEX_QUOTIENT);
-        let xi = H::hash_raw(
+        let xi = H::hash_two(
             *DST,
             committer.root_hash(quotient_commit_index),
             Scalar::ZERO,
         );
 
         let (commitment, prover) = committer.commit(BTreeSet::from_iter(
-            [xi, xi * omega].into_iter().chain(
-                self.public_gates
-                    .iter()
-                    .map(|&row| omega.pow_vartime([row as u64, 0, 0, 0])),
-            ),
+            [xi, xi * omega]
+                .into_iter()
+                .chain(self.public_gates.iter().map(|&row| omega.pow_small(row))),
         ));
         let inner_proof = prover.prove(&commitment);
 
@@ -791,7 +789,7 @@ impl CompressedCircuit {
     }
 
     fn lagrange0(x: Scalar, n: usize) -> Scalar {
-        (x.pow_vartime([n as u64, 0, 0, 0]) - Scalar::ONE)
+        (x.pow_small(n) - Scalar::ONE)
             * (Scalar::from(n as u64) * (x - Scalar::ONE))
                 .invert()
                 .into_option()
@@ -809,10 +807,10 @@ impl CompressedCircuit {
                 NUM_COMMIT_INDICES
             ));
         }
-        if commitment.tree_roots()[0] != self.circuit_commitment {
+        if commitment.tree_roots()[COMMIT_INDEX_CIRCUIT] != self.circuit_commitment {
             return Err(anyhow!(
                 "wrong circuit commitment (got {}, want {})",
-                commitment.tree_roots()[0],
+                commitment.tree_roots()[COMMIT_INDEX_CIRCUIT],
                 self.circuit_commitment
             ));
         }
@@ -841,22 +839,22 @@ impl CompressedCircuit {
 
         let omega = Polynomial::domain_element2(1, n);
 
-        let beta = H::hash_raw(
+        let beta = H::hash_two(
             *DST,
             commitment.tree_roots()[COMMIT_INDEX_WITNESS],
             Scalar::from_const(1),
         );
-        let gamma = H::hash_raw(
+        let gamma = H::hash_two(
             *DST,
             commitment.tree_roots()[COMMIT_INDEX_WITNESS],
             Scalar::from_const(2),
         );
-        let alpha = H::hash_raw(
+        let alpha = H::hash_two(
             *DST,
             commitment.tree_roots()[COMMIT_INDEX_PERMUTATION_ARGUMENT],
             Scalar::ZERO,
         );
-        let xi = H::hash_raw(
+        let xi = H::hash_two(
             *DST,
             commitment.tree_roots()[COMMIT_INDEX_QUOTIENT],
             Scalar::ZERO,
@@ -874,7 +872,7 @@ impl CompressedCircuit {
             ));
         }
         for &gate in &self.public_gates {
-            let z = omega.pow_vartime([gate as u64, 0, 0, 0]);
+            let z = omega.pow_small(gate);
             if !points.contains_key(&z) {
                 return Err(anyhow!(
                     "the proof doesn't have an opening for public gate {gate}"
@@ -897,8 +895,8 @@ impl CompressedCircuit {
         let right = points[&xi][9];
         let out = points[&xi][10];
 
-        let xi_n = xi.pow_vartime([n as u64, 0, 0, 0]);
-        let xi_2n = xi.pow_vartime([n as u64 * 2, 0, 0, 0]);
+        let xi_n = xi.pow_small(n);
+        let xi_2n = xi.pow_small(2 * n);
 
         let permutation_accumulator = points[&xi][11];
         let shifted_permutation_accumulator = points[&(xi * omega)][11];
@@ -935,7 +933,7 @@ impl CompressedCircuit {
             self.public_gates
                 .iter()
                 .map(|&gate| {
-                    let z = omega.pow_vartime([gate as u64, 0, 0, 0]);
+                    let z = omega.pow_small(gate);
                     [
                         (Wire::LeftIn(gate), points[&z][8]),
                         (Wire::RightIn(gate), points[&z][9]),
@@ -954,18 +952,46 @@ mod tests {
     use crate::circuit::WireOrUnconstrained;
     use starkom_pcs::hash::{Poseidon2Hash, Sha2Hash};
 
+    const fn from_const(value: u64) -> Scalar {
+        Scalar::from_const(value)
+    }
+
     /// Builds the circuit at https://vitalik.eth.limo/general/2019/09/22/plonk.html.
     fn build_test_circuit() -> (Circuit, usize) {
         let mut builder = CircuitBuilder::default();
-        let gate1 = builder.add_raw_gate(0.into(), 0.into(), -Scalar::from(1), 1.into(), 0.into());
+        let gate1 = builder.add_raw_gate(
+            from_const(0),
+            from_const(0),
+            -from_const(1),
+            from_const(1),
+            from_const(0),
+        );
         builder.connect(Wire::LeftIn(gate1), Wire::RightIn(gate1));
-        let gate2 = builder.add_raw_gate(0.into(), 0.into(), -Scalar::from(1), 1.into(), 0.into());
+        let gate2 = builder.add_raw_gate(
+            from_const(0),
+            from_const(0),
+            -from_const(1),
+            from_const(1),
+            from_const(0),
+        );
         builder.connect(Wire::LeftIn(gate2), Wire::Out(gate1));
         builder.connect(Wire::RightIn(gate2), Wire::LeftIn(gate1));
-        let gate3 = builder.add_raw_gate(1.into(), 1.into(), -Scalar::from(1), 0.into(), 0.into());
+        let gate3 = builder.add_raw_gate(
+            from_const(1),
+            from_const(1),
+            -from_const(1),
+            from_const(0),
+            from_const(0),
+        );
         builder.connect(Wire::LeftIn(gate3), Wire::LeftIn(gate1));
         builder.connect(Wire::RightIn(gate3), Wire::Out(gate2));
-        let gate4 = builder.add_raw_gate(1.into(), 1.into(), -Scalar::from(1), 0.into(), 0.into());
+        let gate4 = builder.add_raw_gate(
+            from_const(1),
+            from_const(1),
+            -from_const(1),
+            from_const(0),
+            from_const(0),
+        );
         builder.connect(Wire::LeftIn(gate4), Wire::Out(gate3));
         builder.declare_public_gates([gate4]);
         (builder.build(), gate4)
@@ -995,16 +1021,27 @@ mod tests {
         let proof = circuit
             .prove::<H>(
                 witness(
-                    vec![3.into(), 9.into(), 3.into(), 30.into()],
-                    vec![3.into(), 3.into(), 27.into(), 5.into()],
-                    vec![9.into(), 27.into(), 30.into(), 35.into()],
+                    vec![from_const(3), from_const(9), from_const(3), from_const(30)],
+                    vec![from_const(3), from_const(3), from_const(27), from_const(5)],
+                    vec![
+                        from_const(9),
+                        from_const(27),
+                        from_const(30),
+                        from_const(35),
+                    ],
                 ),
                 blowup_log2,
             )
             .unwrap();
         let public_inputs = compressed_circuit.verify(&proof).unwrap();
-        assert_eq!(*public_inputs.get(&Wire::RightIn(gate)).unwrap(), 5.into());
-        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 35.into());
+        assert_eq!(
+            *public_inputs.get(&Wire::RightIn(gate)).unwrap(),
+            from_const(5)
+        );
+        assert_eq!(
+            *public_inputs.get(&Wire::Out(gate)).unwrap(),
+            from_const(35)
+        );
     }
 
     #[test]
@@ -1061,19 +1098,24 @@ mod tests {
         let gate1 = builder.add_square_gate(input.into());
         let gate2 = builder.add_mul_gate(gate1.into(), input.into());
         let gate3 = builder.add_sum_gate(input.into(), gate2.into());
-        let gate4 = builder.add_sum_with_const_gate(gate3.into(), 5.into());
+        let gate4 = builder.add_sum_with_const_gate(gate3.into(), from_const(5));
         builder.declare_public_gates([gate4.gate()]);
         let witness = witness(
-            vec![3.into(), 9.into(), 3.into(), 30.into()],
-            vec![3.into(), 3.into(), 27.into(), 30.into()],
-            vec![9.into(), 27.into(), 30.into(), 35.into()],
+            vec![from_const(3), from_const(9), from_const(3), from_const(30)],
+            vec![from_const(3), from_const(3), from_const(27), from_const(30)],
+            vec![
+                from_const(9),
+                from_const(27),
+                from_const(30),
+                from_const(35),
+            ],
         );
         assert!(builder.check_witness(&witness).is_ok());
         let circuit = builder.build();
         let compressed_circuit = circuit.compress::<H>(blowup_log2);
         let proof = circuit.prove::<H>(witness, blowup_log2).unwrap();
         let public_inputs = compressed_circuit.verify(&proof).unwrap();
-        assert_eq!(*public_inputs.get(&gate4).unwrap(), 35.into());
+        assert_eq!(*public_inputs.get(&gate4).unwrap(), from_const(35));
     }
 
     #[test]
@@ -1094,16 +1136,27 @@ mod tests {
         let proof = circuit
             .prove::<H>(
                 witness(
-                    vec![4.into(), 16.into(), 4.into(), 68.into()],
-                    vec![4.into(), 4.into(), 64.into(), 5.into()],
-                    vec![16.into(), 64.into(), 68.into(), 73.into()],
+                    vec![from_const(4), from_const(16), from_const(4), from_const(68)],
+                    vec![from_const(4), from_const(4), from_const(64), from_const(5)],
+                    vec![
+                        from_const(16),
+                        from_const(64),
+                        from_const(68),
+                        from_const(73),
+                    ],
                 ),
                 blowup_log2,
             )
             .unwrap();
         let public_inputs = compressed_circuit.verify(&proof).unwrap();
-        assert_eq!(*public_inputs.get(&Wire::RightIn(gate)).unwrap(), 5.into());
-        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 73.into());
+        assert_eq!(
+            *public_inputs.get(&Wire::RightIn(gate)).unwrap(),
+            from_const(5)
+        );
+        assert_eq!(
+            *public_inputs.get(&Wire::Out(gate)).unwrap(),
+            from_const(73)
+        );
     }
 
     #[test]
@@ -1130,9 +1183,14 @@ mod tests {
             circuit
                 .prove::<H>(
                     witness(
-                        vec![4.into(), 16.into(), 4.into(), 68.into()],
-                        vec![4.into(), 4.into(), 64.into(), 5.into()],
-                        vec![16.into(), 64.into(), 68.into(), 35.into()],
+                        vec![from_const(4), from_const(16), from_const(4), from_const(68)],
+                        vec![from_const(4), from_const(4), from_const(64), from_const(5)],
+                        vec![
+                            from_const(16),
+                            from_const(64),
+                            from_const(68),
+                            from_const(35)
+                        ],
                     ),
                     blowup_log2
                 )
@@ -1163,17 +1221,28 @@ mod tests {
         let proof = circuit
             .prove::<H>(
                 witness(
-                    vec![3.into(), 9.into(), 3.into(), 30.into()],
-                    vec![3.into(), 3.into(), 27.into(), 5.into()],
-                    vec![9.into(), 27.into(), 30.into(), 35.into()],
+                    vec![from_const(3), from_const(9), from_const(3), from_const(30)],
+                    vec![from_const(3), from_const(3), from_const(27), from_const(5)],
+                    vec![
+                        from_const(9),
+                        from_const(27),
+                        from_const(30),
+                        from_const(35),
+                    ],
                 ),
                 blowup_log2,
             )
             .unwrap();
         let circuit = circuit.to_compressed::<H>(blowup_log2);
         let public_inputs = circuit.verify(&proof).unwrap();
-        assert_eq!(*public_inputs.get(&Wire::RightIn(gate)).unwrap(), 5.into());
-        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 35.into());
+        assert_eq!(
+            *public_inputs.get(&Wire::RightIn(gate)).unwrap(),
+            from_const(5)
+        );
+        assert_eq!(
+            *public_inputs.get(&Wire::Out(gate)).unwrap(),
+            from_const(35)
+        );
     }
 
     #[test]
@@ -1199,17 +1268,28 @@ mod tests {
         let proof = circuit
             .prove::<H>(
                 witness(
-                    vec![4.into(), 16.into(), 4.into(), 68.into()],
-                    vec![4.into(), 4.into(), 64.into(), 5.into()],
-                    vec![16.into(), 64.into(), 68.into(), 73.into()],
+                    vec![from_const(4), from_const(16), from_const(4), from_const(68)],
+                    vec![from_const(4), from_const(4), from_const(64), from_const(5)],
+                    vec![
+                        from_const(16),
+                        from_const(64),
+                        from_const(68),
+                        from_const(73),
+                    ],
                 ),
                 blowup_log2,
             )
             .unwrap();
         let circuit = circuit.to_compressed::<H>(blowup_log2);
         let public_inputs = circuit.verify(&proof).unwrap();
-        assert_eq!(*public_inputs.get(&Wire::RightIn(gate)).unwrap(), 5.into());
-        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 73.into());
+        assert_eq!(
+            *public_inputs.get(&Wire::RightIn(gate)).unwrap(),
+            from_const(5)
+        );
+        assert_eq!(
+            *public_inputs.get(&Wire::Out(gate)).unwrap(),
+            from_const(73)
+        );
     }
 
     #[test]
@@ -1235,9 +1315,14 @@ mod tests {
         let proof = prover_circuit
             .prove::<H>(
                 witness(
-                    vec![3.into(), 9.into(), 3.into(), 30.into()],
-                    vec![3.into(), 3.into(), 27.into(), 5.into()],
-                    vec![9.into(), 27.into(), 30.into(), 35.into()],
+                    vec![from_const(3), from_const(9), from_const(3), from_const(30)],
+                    vec![from_const(3), from_const(3), from_const(27), from_const(5)],
+                    vec![
+                        from_const(9),
+                        from_const(27),
+                        from_const(30),
+                        from_const(35),
+                    ],
                 ),
                 blowup_log2,
             )
@@ -1245,8 +1330,14 @@ mod tests {
         let (verifier_circuit, gate) = build_test_circuit();
         let verifier_circuit = verifier_circuit.to_compressed::<H>(blowup_log2);
         let public_inputs = verifier_circuit.verify(&proof).unwrap();
-        assert_eq!(*public_inputs.get(&Wire::RightIn(gate)).unwrap(), 5.into());
-        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 35.into());
+        assert_eq!(
+            *public_inputs.get(&Wire::RightIn(gate)).unwrap(),
+            from_const(5)
+        );
+        assert_eq!(
+            *public_inputs.get(&Wire::Out(gate)).unwrap(),
+            from_const(35)
+        );
     }
 
     #[test]
@@ -1274,8 +1365,8 @@ mod tests {
     fn test_connected_unary_gate(circuit: &Circuit, input: u64, output: u64) -> Result<()> {
         let proof = circuit.prove::<Sha2Hash<Scalar>>(
             witness(
-                vec![0.into(), input.into()],
-                vec![0.into(), input.into()],
+                vec![from_const(0), input.into()],
+                vec![from_const(0), input.into()],
                 vec![input.into(), output.into()],
             ),
             DEFAULT_BLOWUP_LOG2,
@@ -1293,8 +1384,8 @@ mod tests {
     ) -> Result<()> {
         let proof = circuit.prove::<Sha2Hash<Scalar>>(
             witness(
-                vec![0.into(), 0.into(), left.into()],
-                vec![0.into(), 0.into(), right.into()],
+                vec![from_const(0), from_const(0), left.into()],
+                vec![from_const(0), from_const(0), right.into()],
                 vec![left.into(), right.into(), out.into()],
             ),
             DEFAULT_BLOWUP_LOG2,
@@ -1312,8 +1403,8 @@ mod tests {
     ) -> Result<()> {
         let proof = circuit.prove::<Sha2Hash<Scalar>>(
             witness(
-                vec![0.into(), 0.into(), 0.into(), left.into()],
-                vec![0.into(), 0.into(), 0.into(), right.into()],
+                vec![from_const(0), from_const(0), from_const(0), left.into()],
+                vec![from_const(0), from_const(0), from_const(0), right.into()],
                 vec![left.into(), right.into(), out.into(), out.into()],
             ),
             DEFAULT_BLOWUP_LOG2,
@@ -1335,9 +1426,9 @@ mod tests {
     #[test]
     fn test_connected_nop_gate() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(123.into());
-        let rhs = builder.add_const_gate(456.into());
-        let out = builder.add_const_gate(789.into());
+        let lhs = builder.add_const_gate(from_const(123));
+        let rhs = builder.add_const_gate(from_const(456));
+        let out = builder.add_const_gate(from_const(789));
         builder.add_nop_gate(lhs.into(), rhs.into(), out.into());
         let circuit = builder.build();
         assert!(test_connected_nop_gate_impl(&circuit, 123, 456, 789).is_ok());
@@ -1349,7 +1440,7 @@ mod tests {
     #[test]
     fn test_const_gate() {
         let mut builder = CircuitBuilder::default();
-        builder.add_const_gate(42.into());
+        builder.add_const_gate(from_const(42));
         let circuit = builder.build();
         assert!(test_gate(&circuit, 0, 0, 41).is_err());
         assert!(test_gate(&circuit, 0, 0, 42).is_ok());
@@ -1372,8 +1463,8 @@ mod tests {
     #[test]
     fn test_connected_sum_gate() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(123.into());
-        let rhs = builder.add_const_gate(456.into());
+        let lhs = builder.add_const_gate(from_const(123));
+        let rhs = builder.add_const_gate(from_const(456));
         builder.add_sum_gate(lhs.into(), rhs.into());
         let circuit = builder.build();
         assert!(test_connected_binary_gate(&circuit, 123, 456, 579).is_ok());
@@ -1385,7 +1476,7 @@ mod tests {
     #[test]
     fn test_sum_with_const_gate1() {
         let mut builder = CircuitBuilder::default();
-        builder.add_sum_with_const_gate(None, 12.into());
+        builder.add_sum_with_const_gate(None, from_const(12));
         let circuit = builder.build();
         assert!(test_gate(&circuit, 34, 34, 46).is_ok());
         assert!(test_gate(&circuit, 34, 56, 46).is_err());
@@ -1398,7 +1489,7 @@ mod tests {
     #[test]
     fn test_sum_with_const_gate2() {
         let mut builder = CircuitBuilder::default();
-        builder.add_sum_with_const_gate(None, 34.into());
+        builder.add_sum_with_const_gate(None, from_const(34));
         let circuit = builder.build();
         assert!(test_gate(&circuit, 34, 34, 68).is_ok());
         assert!(test_gate(&circuit, 34, 56, 68).is_err());
@@ -1411,8 +1502,8 @@ mod tests {
     #[test]
     fn test_connected_sum_with_const_gate1() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(34.into());
-        builder.add_sum_with_const_gate(input.into(), 12.into());
+        let input = builder.add_const_gate(from_const(34));
+        builder.add_sum_with_const_gate(input.into(), from_const(12));
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 34, 46).is_ok());
         assert!(test_connected_unary_gate(&circuit, 34, 56).is_err());
@@ -1421,8 +1512,8 @@ mod tests {
     #[test]
     fn test_connected_sum_with_const_gate2() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(56.into());
-        builder.add_sum_with_const_gate(input.into(), 34.into());
+        let input = builder.add_const_gate(from_const(56));
+        builder.add_sum_with_const_gate(input.into(), from_const(34));
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 56, 90).is_ok());
         assert!(test_connected_unary_gate(&circuit, 56, 78).is_err());
@@ -1443,8 +1534,8 @@ mod tests {
     #[test]
     fn test_connected_sub_gate() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(456.into());
-        let rhs = builder.add_const_gate(123.into());
+        let lhs = builder.add_const_gate(from_const(456));
+        let rhs = builder.add_const_gate(from_const(123));
         builder.add_sub_gate(lhs.into(), rhs.into());
         let circuit = builder.build();
         assert!(test_connected_binary_gate(&circuit, 456, 123, 333).is_ok());
@@ -1456,7 +1547,7 @@ mod tests {
     #[test]
     fn test_sub_const_gate1() {
         let mut builder = CircuitBuilder::default();
-        builder.add_sub_const_gate(None, 12.into());
+        builder.add_sub_const_gate(None, from_const(12));
         let circuit = builder.build();
         assert!(test_gate(&circuit, 34, 34, 22).is_ok());
         assert!(test_gate(&circuit, 34, 56, 22).is_err());
@@ -1469,7 +1560,7 @@ mod tests {
     #[test]
     fn test_sub_const_gate2() {
         let mut builder = CircuitBuilder::default();
-        builder.add_sub_const_gate(None, 34.into());
+        builder.add_sub_const_gate(None, from_const(34));
         let circuit = builder.build();
         assert!(test_gate(&circuit, 34, 34, 0).is_ok());
         assert!(test_gate(&circuit, 34, 56, 0).is_err());
@@ -1482,8 +1573,8 @@ mod tests {
     #[test]
     fn test_connected_sub_const_gate1() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(34.into());
-        builder.add_sub_const_gate(input.into(), 12.into());
+        let input = builder.add_const_gate(from_const(34));
+        builder.add_sub_const_gate(input.into(), from_const(12));
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 34, 22).is_ok());
         assert!(test_connected_unary_gate(&circuit, 34, 56).is_err());
@@ -1492,8 +1583,8 @@ mod tests {
     #[test]
     fn test_connected_sub_const_gate2() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(56.into());
-        builder.add_sub_const_gate(input.into(), 34.into());
+        let input = builder.add_const_gate(from_const(56));
+        builder.add_sub_const_gate(input.into(), from_const(34));
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 56, 22).is_ok());
         assert!(test_connected_unary_gate(&circuit, 56, 78).is_err());
@@ -1502,7 +1593,7 @@ mod tests {
     #[test]
     fn test_sub_from_const_gate1() {
         let mut builder = CircuitBuilder::default();
-        builder.add_sub_from_const_gate(90.into(), None);
+        builder.add_sub_from_const_gate(from_const(90), None);
         let circuit = builder.build();
         assert!(test_gate(&circuit, 34, 34, 56).is_ok());
         assert!(test_gate(&circuit, 34, 56, 56).is_err());
@@ -1515,7 +1606,7 @@ mod tests {
     #[test]
     fn test_sub_from_const_gate2() {
         let mut builder = CircuitBuilder::default();
-        builder.add_sub_from_const_gate(78.into(), None);
+        builder.add_sub_from_const_gate(from_const(78), None);
         let circuit = builder.build();
         assert!(test_gate(&circuit, 12, 12, 66).is_ok());
         assert!(test_gate(&circuit, 12, 34, 66).is_err());
@@ -1528,8 +1619,8 @@ mod tests {
     #[test]
     fn test_connected_sub_from_const_gate1() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(34.into());
-        builder.add_sub_from_const_gate(90.into(), input.into());
+        let input = builder.add_const_gate(from_const(34));
+        builder.add_sub_from_const_gate(from_const(90), input.into());
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 34, 56).is_ok());
         assert!(test_connected_unary_gate(&circuit, 34, 78).is_err());
@@ -1538,8 +1629,8 @@ mod tests {
     #[test]
     fn test_connected_sub_from_const_gate2() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(12.into());
-        builder.add_sub_from_const_gate(78.into(), input.into());
+        let input = builder.add_const_gate(from_const(12));
+        builder.add_sub_from_const_gate(from_const(78), input.into());
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 12, 66).is_ok());
         assert!(test_connected_unary_gate(&circuit, 12, 34).is_err());
@@ -1561,8 +1652,8 @@ mod tests {
     #[test]
     fn test_connected_mul_gate() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(12.into());
-        let rhs = builder.add_const_gate(34.into());
+        let lhs = builder.add_const_gate(from_const(12));
+        let rhs = builder.add_const_gate(from_const(34));
         builder.add_mul_gate(lhs.into(), rhs.into());
         let circuit = builder.build();
         assert!(test_connected_binary_gate(&circuit, 12, 34, 408).is_ok());
@@ -1572,7 +1663,7 @@ mod tests {
     #[test]
     fn test_mul_by_const_gate1() {
         let mut builder = CircuitBuilder::default();
-        builder.add_mul_by_const_gate(None, 12.into());
+        builder.add_mul_by_const_gate(None, from_const(12));
         let circuit = builder.build();
         assert!(test_gate(&circuit, 12, 12, 144).is_ok());
         assert!(test_gate(&circuit, 12, 34, 144).is_err());
@@ -1585,7 +1676,7 @@ mod tests {
     #[test]
     fn test_mul_by_const_gate2() {
         let mut builder = CircuitBuilder::default();
-        builder.add_mul_by_const_gate(None, 34.into());
+        builder.add_mul_by_const_gate(None, from_const(34));
         let circuit = builder.build();
         assert!(test_gate(&circuit, 12, 12, 408).is_ok());
         assert!(test_gate(&circuit, 12, 34, 408).is_err());
@@ -1598,8 +1689,8 @@ mod tests {
     #[test]
     fn test_connected_mul_by_const_gate1() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(12.into());
-        builder.add_mul_by_const_gate(lhs.into(), 34.into());
+        let lhs = builder.add_const_gate(from_const(12));
+        builder.add_mul_by_const_gate(lhs.into(), from_const(34));
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 12, 408).is_ok());
         assert!(test_connected_unary_gate(&circuit, 12, 804).is_err());
@@ -1608,8 +1699,8 @@ mod tests {
     #[test]
     fn test_connected_mul_by_const_gate2() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(34.into());
-        builder.add_mul_by_const_gate(lhs.into(), 12.into());
+        let lhs = builder.add_const_gate(from_const(34));
+        builder.add_mul_by_const_gate(lhs.into(), from_const(12));
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 34, 408).is_ok());
         assert!(test_connected_unary_gate(&circuit, 34, 804).is_err());
@@ -1618,7 +1709,7 @@ mod tests {
     #[test]
     fn test_linear_combination_gate() {
         let mut builder = CircuitBuilder::default();
-        builder.add_linear_combination_gate(12.into(), None, 56.into(), None);
+        builder.add_linear_combination_gate(from_const(12), None, from_const(56), None);
         let circuit = builder.build();
         assert!(test_gate(&circuit, 34, 78, 4776).is_ok());
         assert!(test_gate(&circuit, 78, 90, 5976).is_ok());
@@ -1630,9 +1721,9 @@ mod tests {
     #[test]
     fn test_connected_linear_combination_gate() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(34.into());
-        let rhs = builder.add_const_gate(78.into());
-        builder.add_linear_combination_gate(12.into(), lhs.into(), 56.into(), rhs.into());
+        let lhs = builder.add_const_gate(from_const(34));
+        let rhs = builder.add_const_gate(from_const(78));
+        builder.add_linear_combination_gate(from_const(12), lhs.into(), from_const(56), rhs.into());
         let circuit = builder.build();
         assert!(test_connected_binary_gate(&circuit, 34, 78, 4776).is_ok());
         assert!(test_connected_binary_gate(&circuit, 34, 78, 7647).is_err());
@@ -1641,7 +1732,7 @@ mod tests {
     #[test]
     fn test_poly2_gate() {
         let mut builder = CircuitBuilder::default();
-        builder.add_poly2_gate(12.into(), 34.into(), 56.into(), None);
+        builder.add_poly2_gate(from_const(12), from_const(34), from_const(56), None);
         let circuit = builder.build();
         assert!(test_gate(&circuit, 42, 42, 22652).is_ok());
         assert!(test_gate(&circuit, 78, 42, 22652).is_err());
@@ -1652,8 +1743,8 @@ mod tests {
     #[test]
     fn test_connected_poly2_gate() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(43.into());
-        builder.add_poly2_gate(34.into(), 56.into(), 78.into(), input.into());
+        let input = builder.add_const_gate(from_const(43));
+        builder.add_poly2_gate(from_const(34), from_const(56), from_const(78), input.into());
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 43, 65352).is_ok());
         assert!(test_connected_unary_gate(&circuit, 43, 22652).is_err());
@@ -1677,7 +1768,7 @@ mod tests {
     #[test]
     fn test_connected_bit_assertion_gate1() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(0.into());
+        let input = builder.add_const_gate(from_const(0));
         builder.add_bit_assertion_gate(input.into());
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 0, 0).is_ok());
@@ -1686,7 +1777,7 @@ mod tests {
     #[test]
     fn test_connected_bit_assertion_gate2() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(1.into());
+        let input = builder.add_const_gate(from_const(1));
         builder.add_bit_assertion_gate(input.into());
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 1, 0).is_ok());
@@ -1695,7 +1786,7 @@ mod tests {
     #[test]
     fn test_connected_bit_assertion_gate3() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(2.into());
+        let input = builder.add_const_gate(from_const(2));
         builder.add_bit_assertion_gate(input.into());
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 2, 0).is_err());
@@ -1704,7 +1795,7 @@ mod tests {
     #[test]
     fn test_connected_bit_assertion_gate4() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(2.into());
+        let input = builder.add_const_gate(from_const(2));
         builder.add_bit_assertion_gate(input.into());
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 3, 0).is_err());
@@ -1772,7 +1863,7 @@ mod tests {
     #[test]
     fn test_connected_not_gate() {
         let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(0.into());
+        let input = builder.add_const_gate(from_const(0));
         builder.add_not_gate(input.into());
         let circuit = builder.build();
         assert!(test_connected_unary_gate(&circuit, 0, 1).is_ok());
@@ -1798,8 +1889,8 @@ mod tests {
     #[test]
     fn test_connected_and_gate1() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(0.into());
-        let rhs = builder.add_const_gate(1.into());
+        let lhs = builder.add_const_gate(from_const(0));
+        let rhs = builder.add_const_gate(from_const(1));
         builder.add_and_gate(lhs.into(), rhs.into());
         let circuit = builder.build();
         assert!(test_connected_binary_gate(&circuit, 0, 1, 0).is_ok());
@@ -1809,8 +1900,8 @@ mod tests {
     #[test]
     fn test_connected_and_gate2() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(1.into());
-        let rhs = builder.add_const_gate(1.into());
+        let lhs = builder.add_const_gate(from_const(1));
+        let rhs = builder.add_const_gate(from_const(1));
         builder.add_and_gate(lhs.into(), rhs.into());
         let circuit = builder.build();
         assert!(test_connected_binary_gate(&circuit, 1, 1, 1).is_ok());
@@ -1835,8 +1926,8 @@ mod tests {
     #[test]
     fn test_connected_or_gate1() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(0.into());
-        let rhs = builder.add_const_gate(0.into());
+        let lhs = builder.add_const_gate(from_const(0));
+        let rhs = builder.add_const_gate(from_const(0));
         builder.add_or_gate(lhs.into(), rhs.into());
         let circuit = builder.build();
         assert!(test_connected_binary_gate(&circuit, 0, 0, 0).is_ok());
@@ -1846,8 +1937,8 @@ mod tests {
     #[test]
     fn test_connected_or_gate2() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(0.into());
-        let rhs = builder.add_const_gate(1.into());
+        let lhs = builder.add_const_gate(from_const(0));
+        let rhs = builder.add_const_gate(from_const(1));
         builder.add_or_gate(lhs.into(), rhs.into());
         let circuit = builder.build();
         assert!(test_connected_binary_gate(&circuit, 0, 1, 1).is_ok());
@@ -1872,8 +1963,8 @@ mod tests {
     #[test]
     fn test_connected_xor_gate1() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(0.into());
-        let rhs = builder.add_const_gate(1.into());
+        let lhs = builder.add_const_gate(from_const(0));
+        let rhs = builder.add_const_gate(from_const(1));
         builder.add_xor_gate(lhs.into(), rhs.into());
         let circuit = builder.build();
         assert!(test_connected_binary_gate(&circuit, 0, 1, 1).is_ok());
@@ -1883,8 +1974,8 @@ mod tests {
     #[test]
     fn test_connected_xor_gate2() {
         let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(1.into());
-        let rhs = builder.add_const_gate(1.into());
+        let lhs = builder.add_const_gate(from_const(1));
+        let rhs = builder.add_const_gate(from_const(1));
         builder.add_xor_gate(lhs.into(), rhs.into());
         let circuit = builder.build();
         assert!(test_connected_binary_gate(&circuit, 1, 1, 0).is_ok());
@@ -1913,15 +2004,29 @@ mod tests {
         let proof = circuit
             .prove::<H>(
                 witness(
-                    vec![3.into(), 9.into(), 3.into(), 12.into(), 5.into(), 5.into()],
-                    vec![3.into(), 3.into(), 4.into(), 27.into(), 39.into(), 0.into()],
                     vec![
-                        9.into(),
-                        27.into(),
-                        12.into(),
-                        39.into(),
-                        44.into(),
-                        44.into(),
+                        from_const(3),
+                        from_const(9),
+                        from_const(3),
+                        from_const(12),
+                        from_const(5),
+                        from_const(5),
+                    ],
+                    vec![
+                        from_const(3),
+                        from_const(3),
+                        from_const(4),
+                        from_const(27),
+                        from_const(39),
+                        from_const(0),
+                    ],
+                    vec![
+                        from_const(9),
+                        from_const(27),
+                        from_const(12),
+                        from_const(39),
+                        from_const(44),
+                        from_const(44),
                     ],
                 ),
                 blowup_log2,
@@ -1929,8 +2034,14 @@ mod tests {
             .unwrap();
         let compressed_circuit = circuit.to_compressed::<H>(blowup_log2);
         let public_inputs = compressed_circuit.verify::<H>(&proof).unwrap();
-        assert_eq!(*public_inputs.get(&Wire::LeftIn(gate)).unwrap(), 5.into());
-        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 44.into());
+        assert_eq!(
+            *public_inputs.get(&Wire::LeftIn(gate)).unwrap(),
+            from_const(5)
+        );
+        assert_eq!(
+            *public_inputs.get(&Wire::Out(gate)).unwrap(),
+            from_const(44)
+        );
     }
 
     #[test]
@@ -1956,15 +2067,29 @@ mod tests {
         let proof = circuit
             .prove::<H>(
                 witness(
-                    vec![4.into(), 16.into(), 4.into(), 12.into(), 5.into(), 5.into()],
-                    vec![4.into(), 4.into(), 3.into(), 64.into(), 76.into(), 0.into()],
                     vec![
-                        16.into(),
-                        64.into(),
-                        12.into(),
-                        76.into(),
-                        81.into(),
-                        81.into(),
+                        from_const(4),
+                        from_const(16),
+                        from_const(4),
+                        from_const(12),
+                        from_const(5),
+                        from_const(5),
+                    ],
+                    vec![
+                        from_const(4),
+                        from_const(4),
+                        from_const(3),
+                        from_const(64),
+                        from_const(76),
+                        from_const(0),
+                    ],
+                    vec![
+                        from_const(16),
+                        from_const(64),
+                        from_const(12),
+                        from_const(76),
+                        from_const(81),
+                        from_const(81),
                     ],
                 ),
                 blowup_log2,
@@ -1972,8 +2097,14 @@ mod tests {
             .unwrap();
         let compressed_circuit = circuit.to_compressed::<H>(blowup_log2);
         let public_inputs = compressed_circuit.verify::<H>(&proof).unwrap();
-        assert_eq!(*public_inputs.get(&Wire::LeftIn(gate)).unwrap(), 5.into());
-        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 81.into());
+        assert_eq!(
+            *public_inputs.get(&Wire::LeftIn(gate)).unwrap(),
+            from_const(5)
+        );
+        assert_eq!(
+            *public_inputs.get(&Wire::Out(gate)).unwrap(),
+            from_const(81)
+        );
     }
 
     #[test]
@@ -2000,15 +2131,29 @@ mod tests {
         let proof = prover_circuit
             .prove::<Sha2Hash<Scalar>>(
                 witness(
-                    vec![3.into(), 9.into(), 3.into(), 12.into(), 5.into(), 5.into()],
-                    vec![3.into(), 3.into(), 4.into(), 27.into(), 39.into(), 0.into()],
                     vec![
-                        9.into(),
-                        27.into(),
-                        12.into(),
-                        39.into(),
-                        44.into(),
-                        44.into(),
+                        from_const(3),
+                        from_const(9),
+                        from_const(3),
+                        from_const(12),
+                        from_const(5),
+                        from_const(5),
+                    ],
+                    vec![
+                        from_const(3),
+                        from_const(3),
+                        from_const(4),
+                        from_const(27),
+                        from_const(39),
+                        from_const(0),
+                    ],
+                    vec![
+                        from_const(9),
+                        from_const(27),
+                        from_const(12),
+                        from_const(39),
+                        from_const(44),
+                        from_const(44),
                     ],
                 ),
                 DEFAULT_BLOWUP_LOG2,
@@ -2018,7 +2163,13 @@ mod tests {
         let verifier_circuit =
             verifier_circuit.to_compressed::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
         let public_inputs = verifier_circuit.verify::<Sha2Hash<Scalar>>(&proof).unwrap();
-        assert_eq!(*public_inputs.get(&Wire::LeftIn(gate)).unwrap(), 5.into());
-        assert_eq!(*public_inputs.get(&Wire::Out(gate)).unwrap(), 44.into());
+        assert_eq!(
+            *public_inputs.get(&Wire::LeftIn(gate)).unwrap(),
+            from_const(5)
+        );
+        assert_eq!(
+            *public_inputs.get(&Wire::Out(gate)).unwrap(),
+            from_const(44)
+        );
     }
 }

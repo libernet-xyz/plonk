@@ -1,7 +1,6 @@
 use crate::circuit::{Wire, WireOrUnconstrained, padded_size};
-use crate::utils;
-use ff::Field;
 use starkom_bluesky::Scalar;
+use starkom_ff::Field;
 
 #[derive(Debug, Clone)]
 pub struct Witness {
@@ -247,9 +246,9 @@ impl Witness {
 
     pub(crate) fn blind_row(&mut self) {
         let gate = self.pop_gate();
-        self.set(Wire::LeftIn(gate), utils::get_random_scalar());
-        self.set(Wire::RightIn(gate), utils::get_random_scalar());
-        self.set(Wire::Out(gate), utils::get_random_scalar());
+        self.set(Wire::LeftIn(gate), Scalar::random_default());
+        self.set(Wire::RightIn(gate), Scalar::random_default());
+        self.set(Wire::Out(gate), Scalar::random_default());
     }
 
     pub(crate) fn blind(&mut self) {
@@ -263,94 +262,98 @@ impl Witness {
 mod tests {
     use super::*;
 
+    const fn from_const(value: u64) -> Scalar {
+        Scalar::from_const(value)
+    }
+
     #[test]
     fn test_one_row_initial_state() {
         let witness = Witness::new(1);
         assert_eq!(witness.size(), 1);
-        assert_eq!(witness.get(Wire::LeftIn(0)), 0.into());
-        assert_eq!(witness.get(Wire::RightIn(0)), 0.into());
-        assert_eq!(witness.get(Wire::Out(0)), 0.into());
+        assert_eq!(witness.get(Wire::LeftIn(0)), from_const(0));
+        assert_eq!(witness.get(Wire::RightIn(0)), from_const(0));
+        assert_eq!(witness.get(Wire::Out(0)), from_const(0));
     }
 
     #[test]
     fn test_two_rows_initial_state() {
         let witness = Witness::new(2);
         assert_eq!(witness.size(), 2);
-        assert_eq!(witness.get(Wire::LeftIn(0)), 0.into());
-        assert_eq!(witness.get(Wire::RightIn(0)), 0.into());
-        assert_eq!(witness.get(Wire::Out(0)), 0.into());
-        assert_eq!(witness.get(Wire::LeftIn(1)), 0.into());
-        assert_eq!(witness.get(Wire::RightIn(1)), 0.into());
-        assert_eq!(witness.get(Wire::Out(1)), 0.into());
+        assert_eq!(witness.get(Wire::LeftIn(0)), from_const(0));
+        assert_eq!(witness.get(Wire::RightIn(0)), from_const(0));
+        assert_eq!(witness.get(Wire::Out(0)), from_const(0));
+        assert_eq!(witness.get(Wire::LeftIn(1)), from_const(0));
+        assert_eq!(witness.get(Wire::RightIn(1)), from_const(0));
+        assert_eq!(witness.get(Wire::Out(1)), from_const(0));
     }
 
     #[test]
     fn test_one_row_update() {
         let mut witness = Witness::new(1);
-        witness.set(Wire::LeftIn(0), 12.into());
-        witness.set(Wire::RightIn(0), 34.into());
-        witness.set(Wire::Out(0), 56.into());
+        witness.set(Wire::LeftIn(0), from_const(12));
+        witness.set(Wire::RightIn(0), from_const(34));
+        witness.set(Wire::Out(0), from_const(56));
         assert_eq!(witness.size(), 1);
-        assert_eq!(witness.get(Wire::LeftIn(0)), 12.into());
-        assert_eq!(witness.get(Wire::RightIn(0)), 34.into());
-        assert_eq!(witness.get(Wire::Out(0)), 56.into());
+        assert_eq!(witness.get(Wire::LeftIn(0)), from_const(12));
+        assert_eq!(witness.get(Wire::RightIn(0)), from_const(34));
+        assert_eq!(witness.get(Wire::Out(0)), from_const(56));
     }
 
     #[test]
     fn test_two_rows_update() {
         let mut witness = Witness::new(2);
-        witness.set(Wire::LeftIn(0), 65.into());
-        witness.set(Wire::RightIn(0), 43.into());
-        witness.set(Wire::Out(0), 21.into());
-        witness.set(Wire::LeftIn(1), 12.into());
-        witness.set(Wire::RightIn(1), 34.into());
-        witness.set(Wire::Out(1), 56.into());
+        witness.set(Wire::LeftIn(0), from_const(65));
+        witness.set(Wire::RightIn(0), from_const(43));
+        witness.set(Wire::Out(0), from_const(21));
+        witness.set(Wire::LeftIn(1), from_const(12));
+        witness.set(Wire::RightIn(1), from_const(34));
+        witness.set(Wire::Out(1), from_const(56));
         assert_eq!(witness.size(), 2);
-        assert_eq!(witness.get(Wire::LeftIn(0)), 65.into());
-        assert_eq!(witness.get(Wire::RightIn(0)), 43.into());
-        assert_eq!(witness.get(Wire::Out(0)), 21.into());
-        assert_eq!(witness.get(Wire::LeftIn(1)), 12.into());
-        assert_eq!(witness.get(Wire::RightIn(1)), 34.into());
-        assert_eq!(witness.get(Wire::Out(1)), 56.into());
+        assert_eq!(witness.get(Wire::LeftIn(0)), from_const(65));
+        assert_eq!(witness.get(Wire::RightIn(0)), from_const(43));
+        assert_eq!(witness.get(Wire::Out(0)), from_const(21));
+        assert_eq!(witness.get(Wire::LeftIn(1)), from_const(12));
+        assert_eq!(witness.get(Wire::RightIn(1)), from_const(34));
+        assert_eq!(witness.get(Wire::Out(1)), from_const(56));
     }
 
     #[test]
     fn test_copy_within_same_row() {
         let mut witness = Witness::new(1);
-        witness.set(Wire::LeftIn(0), 12.into());
-        witness.set(Wire::RightIn(0), 34.into());
+        witness.set(Wire::LeftIn(0), from_const(12));
+        witness.set(Wire::RightIn(0), from_const(34));
         assert_eq!(
             witness.copy(Wire::RightIn(0).into(), Wire::Out(0)),
-            34.into()
+            from_const(34)
         );
         assert_eq!(witness.size(), 1);
-        assert_eq!(witness.get(Wire::LeftIn(0)), 12.into());
-        assert_eq!(witness.get(Wire::RightIn(0)), 34.into());
-        assert_eq!(witness.get(Wire::Out(0)), 34.into());
+        assert_eq!(witness.get(Wire::LeftIn(0)), from_const(12));
+        assert_eq!(witness.get(Wire::RightIn(0)), from_const(34));
+        assert_eq!(witness.get(Wire::Out(0)), from_const(34));
     }
 
     #[test]
     fn test_copy_across_rows() {
         let mut witness = Witness::new(2);
-        witness.set(Wire::LeftIn(0), 12.into());
-        witness.set(Wire::RightIn(0), 34.into());
-        witness.set(Wire::Out(0), 56.into());
+        witness.set(Wire::LeftIn(0), from_const(12));
+        witness.set(Wire::RightIn(0), from_const(34));
+        witness.set(Wire::Out(0), from_const(56));
         assert_eq!(
             witness.copy(Wire::RightIn(0).into(), Wire::LeftIn(1)),
-            34.into()
+            from_const(34)
         );
         assert_eq!(
             witness.copy(Wire::LeftIn(0).into(), Wire::RightIn(1)),
-            12.into()
+            from_const(12)
         );
-        witness.set(Wire::Out(1), 56.into());
+        witness.set(Wire::Out(1), from_const(56));
         assert_eq!(witness.size(), 2);
-        assert_eq!(witness.get(Wire::LeftIn(0)), 12.into());
-        assert_eq!(witness.get(Wire::RightIn(0)), 34.into());
-        assert_eq!(witness.get(Wire::Out(0)), 56.into());
-        assert_eq!(witness.get(Wire::LeftIn(1)), 34.into());
-        assert_eq!(witness.get(Wire::RightIn(1)), 12.into());
-        assert_eq!(witness.get(Wire::Out(1)), 56.into());
+        assert_eq!(witness.get(Wire::LeftIn(0)), from_const(12));
+        assert_eq!(witness.get(Wire::RightIn(0)), from_const(34));
+        assert_eq!(witness.get(Wire::Out(0)), from_const(56));
+        assert_eq!(witness.get(Wire::LeftIn(1)), from_const(34));
+        assert_eq!(witness.get(Wire::RightIn(1)), from_const(12));
+        assert_eq!(witness.get(Wire::Out(1)), from_const(56));
     }
 
     fn test_assert_constant_impl(value: u64) {
@@ -682,7 +685,7 @@ mod tests {
         witness.pop_gate();
         witness.set(Wire::LeftIn(0), input.into());
         assert_eq!(
-            witness.poly2(12.into(), 34.into(), 56.into(), input.into()),
+            witness.poly2(from_const(12), from_const(34), from_const(56), input.into()),
             Wire::Out(1)
         );
         assert_eq!(witness.get(Wire::LeftIn(1)), input.into());
@@ -692,8 +695,8 @@ mod tests {
 
     #[test]
     fn test_poly2() {
-        test_poly2_impl(42.into(), 22652.into());
-        test_poly2_impl(43.into(), 23706.into());
+        test_poly2_impl(from_const(42), from_const(22652));
+        test_poly2_impl(from_const(43), from_const(23706));
     }
 
     fn test_assert_bit_impl(input: Scalar) {
@@ -707,8 +710,8 @@ mod tests {
 
     #[test]
     fn test_assert_bit() {
-        test_assert_bit_impl(0.into());
-        test_assert_bit_impl(1.into());
+        test_assert_bit_impl(from_const(0));
+        test_assert_bit_impl(from_const(1));
     }
 
     fn test_assert_trit_impl(input: Scalar) {
@@ -722,9 +725,9 @@ mod tests {
 
     #[test]
     fn test_assert_trit() {
-        test_assert_trit_impl(0.into());
-        test_assert_trit_impl(1.into());
-        test_assert_trit_impl(2.into());
+        test_assert_trit_impl(from_const(0));
+        test_assert_trit_impl(from_const(1));
+        test_assert_trit_impl(from_const(2));
     }
 
     fn test_not_impl(input: Scalar, output: Scalar) {
@@ -739,8 +742,8 @@ mod tests {
 
     #[test]
     fn test_not() {
-        test_not_impl(0.into(), 1.into());
-        test_not_impl(1.into(), 0.into());
+        test_not_impl(from_const(0), from_const(1));
+        test_not_impl(from_const(1), from_const(0));
     }
 
     fn test_and_impl(lhs: u64, rhs: u64, out: u64) {
