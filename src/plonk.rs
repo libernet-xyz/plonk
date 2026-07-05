@@ -1,10 +1,11 @@
+use crate::Constraint;
 use anyhow::Result;
 use starkom_bluesky::Scalar;
 use starkom_ff::Field;
 use starkom_pcs::{self as pcs, hash::Hash};
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 use std::marker::PhantomData;
-use std::ops::{Add, BitXor, Div, Mul, Neg, Sub};
+use std::ops::{Index, IndexMut};
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
 
@@ -12,342 +13,6 @@ type Polynomial = starkom_poly::Polynomial<Scalar>;
 ///
 /// Used with the underlying PCS to compute low-degree extensions.
 pub const OPTIONS_DEFAULT_BLOWUP_LOG2: usize = 3;
-
-/// Represents a PLONK constraint as a sum of monomials.
-///
-/// Each monomial is in the form `coeff * var0^exp0 * var1^exp1 * ...`, where `coeff` is a constant
-/// scalar, the `var` variables are witness columns, and the `exp` variables are constant exponents.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Constraint {
-    /// The outer map represents the monomials in this constraint, while the inner maps represent
-    /// the variables (ie. witness columns) in each monomial.
-    ///
-    /// The keys of the inner map are column indices and the values are exponents to which the
-    /// corresponding variable is raised.
-    ///
-    /// The values of the outer map are the constant coefficients of each monomial.
-    monomials: BTreeMap<BTreeMap<usize, Scalar>, Scalar>,
-}
-
-impl Constraint {
-    /// Multiplies two monomials.
-    ///
-    /// The two monomials have the same layout as the inner maps of [`Self::monomials`]. Note that
-    /// the coefficients are missing, they must be handled by the caller.
-    fn multiply_variables(
-        lhs: BTreeMap<usize, Scalar>,
-        rhs: BTreeMap<usize, Scalar>,
-    ) -> BTreeMap<usize, Scalar> {
-        let mut result = lhs;
-        for (column_index, exponent) in rhs {
-            match result.get_mut(&column_index) {
-                Some(preexisting_exponent) => {
-                    *preexisting_exponent += exponent;
-                }
-                None => {
-                    result.insert(column_index, exponent);
-                }
-            }
-        }
-        result
-            .into_iter()
-            .filter(|(_, exponent)| *exponent != Scalar::ZERO)
-            .collect()
-    }
-
-    /// Returns a textual representation of the constraint formula.
-    pub fn to_str(&self) -> String {
-        self.monomials
-            .iter()
-            .map(|(variables, &coefficient)| {
-                (coefficient != Scalar::ZERO)
-                    .then(|| coefficient.to_str_radix(10, 0, false))
-                    .into_iter()
-                    .chain(
-                        variables
-                            .iter()
-                            .map(|(&column_index, &exponent)| match exponent {
-                                Scalar::ONE => format!("w[{}]", column_index),
-                                exponent => format!(
-                                    "w[{}] ^ {}",
-                                    column_index,
-                                    exponent.to_str_radix(10, 0, false)
-                                ),
-                            }),
-                    )
-                    .collect::<Vec<String>>()
-                    .join(" * ")
-            })
-            .collect::<Vec<String>>()
-            .join(" + ")
-    }
-
-    /// Evaluates the constraint using the provided variable substitution.
-    ///
-    /// NOTE: this function panics if one or more variables are missing from the substitution.
-    ///
-    /// NOTE: this algorithm is intentionally not constant-time because all constraint shapes are
-    /// publicly known, so our timing doesn't reveal anything sensitive. Besides, this function is
-    /// used by the verifier code, where we don't have anything to leak and we want to maximize
-    /// performance.
-    pub fn evaluate(&self, substitution: BTreeMap<usize, Scalar>) -> Scalar {
-        let mut result = Scalar::ZERO;
-        for (variables, coefficient) in &self.monomials {
-            let mut value = *coefficient;
-            if value == Scalar::ZERO {
-                continue;
-            }
-            for (column_index, &exponent) in variables {
-                let variable = substitution[column_index];
-                match exponent {
-                    Scalar::ZERO => {}
-                    Scalar::ONE => {
-                        value *= variable;
-                    }
-                    exponent => {
-                        value *= variable.pow_vartime(exponent);
-                    }
-                }
-            }
-            result += value;
-        }
-        result
-    }
-}
-
-impl Add for Constraint {
-    type Output = Constraint;
-
-    fn add(mut self, rhs: Self) -> Self::Output {
-        for (variables, coefficient) in rhs.monomials {
-            match self.monomials.get_mut(&variables) {
-                Some(preexisting_coefficient) => {
-                    *preexisting_coefficient += coefficient;
-                }
-                None => {
-                    self.monomials.insert(variables, coefficient);
-                }
-            }
-        }
-        self.monomials = self
-            .monomials
-            .into_iter()
-            .filter(|(_, coefficient)| *coefficient != Scalar::ZERO)
-            .collect();
-        self
-    }
-}
-
-impl Add<Scalar> for Constraint {
-    type Output = Constraint;
-
-    fn add(mut self, rhs: Scalar) -> Self::Output {
-        self.monomials.insert(BTreeMap::default(), rhs);
-        self
-    }
-}
-
-impl Sub for Constraint {
-    type Output = Constraint;
-
-    fn sub(mut self, rhs: Self) -> Self::Output {
-        for (variables, coefficient) in rhs.monomials {
-            match self.monomials.get_mut(&variables) {
-                Some(preexisting_coefficient) => {
-                    *preexisting_coefficient -= coefficient;
-                }
-                None => {
-                    self.monomials.insert(variables, coefficient);
-                }
-            }
-        }
-        self.monomials = self
-            .monomials
-            .into_iter()
-            .filter(|(_, coefficient)| *coefficient != Scalar::ZERO)
-            .collect();
-        self
-    }
-}
-
-impl Sub<Scalar> for Constraint {
-    type Output = Constraint;
-
-    fn sub(mut self, rhs: Scalar) -> Self::Output {
-        self.monomials.insert(BTreeMap::default(), -rhs);
-        self
-    }
-}
-
-impl Neg for Constraint {
-    type Output = Constraint;
-
-    fn neg(mut self) -> Self::Output {
-        for (_, coefficient) in &mut self.monomials {
-            *coefficient = coefficient.neg();
-        }
-        self
-    }
-}
-
-impl Mul for Constraint {
-    type Output = Constraint;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        let mut monomials = BTreeMap::default();
-        for (lhs_variables, lhs_coefficient) in self.monomials {
-            if lhs_coefficient != Scalar::ZERO {
-                for (rhs_variables, &rhs_coefficient) in &rhs.monomials {
-                    if rhs_coefficient != Scalar::ZERO {
-                        let variables =
-                            Self::multiply_variables(lhs_variables.clone(), rhs_variables.clone());
-                        let coefficient = lhs_coefficient * rhs_coefficient;
-                        match monomials.get_mut(&variables) {
-                            Some(preexisting_coefficient) => {
-                                *preexisting_coefficient += coefficient
-                            }
-                            None => {
-                                monomials.insert(variables, coefficient);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Constraint { monomials }
-    }
-}
-
-impl Mul<Scalar> for Constraint {
-    type Output = Constraint;
-
-    fn mul(mut self, rhs: Scalar) -> Self::Output {
-        if rhs == Scalar::ZERO {
-            return Constraint {
-                monomials: BTreeMap::default(),
-            };
-        }
-        for (_, coefficient) in &mut self.monomials {
-            *coefficient *= rhs;
-        }
-        self
-    }
-}
-
-impl BitXor<Scalar> for Constraint {
-    type Output = Constraint;
-
-    /// We use the XOR operator to actually implement exponentiation. For example, if `x` is a
-    /// `Constraint` instance (representing a single variable) then `x ^ 5` means x raised to 5.
-    fn bitxor(self, rhs: Scalar) -> Self::Output {
-        if rhs == Scalar::ZERO {
-            return Constraint {
-                monomials: BTreeMap::from([(BTreeMap::default(), Scalar::ONE)]),
-            };
-        }
-        if rhs == Scalar::ONE {
-            return self;
-        }
-        match self.monomials.len() {
-            0 => Constraint {
-                monomials: BTreeMap::default(),
-            },
-            1 => Constraint {
-                monomials: self
-                    .monomials
-                    .into_iter()
-                    .map(|(variables, coefficient)| {
-                        (
-                            variables
-                                .into_iter()
-                                .map(|(column_index, exponent)| (column_index, exponent * rhs))
-                                .collect(),
-                            coefficient.pow_vartime(rhs),
-                        )
-                    })
-                    .collect(),
-            },
-            _ => panic!("raising a sum to a power is forbidden, try to simplify your constraint"),
-        }
-    }
-}
-
-impl BitXor<isize> for Constraint {
-    type Output = Constraint;
-
-    /// We use the XOR operator to actually implement exponentiation. For example, if `x` is a
-    /// `Constraint` instance (representing a single variable) then `x ^ 5` means x raised to 5.
-    ///
-    /// This implementation allows negative exponents too, resulting in modular inversion. For
-    /// example, `x ^ -1` correctly yields the modular inverse of `x` (internally it raises to
-    /// `p - 2` = [`Scalar::MAX`] - 1), `x ^ -2` correctly yields the square of the modular inverse
-    /// (internally raises to `(p - 2) * 2`), and so on.
-    ///
-    /// WARNING: inverting more than once will yield unexpected results due to the fact that the
-    /// exponent -1 (which conventionally indicates modular inversion) actually maps to the field
-    /// element that's congruent to -2. So for instance `(x ^ -1) ^ -1` will actually yield `x ^ 4`
-    /// rather than `x ^ 1`.
-    fn bitxor(self, rhs: isize) -> Self::Output {
-        match rhs {
-            0 => Constraint {
-                monomials: BTreeMap::from([(BTreeMap::default(), Scalar::ONE)]),
-            },
-            1 => self,
-            rhs => {
-                let abs = rhs.unsigned_abs() as u64;
-                let scalar = if rhs < 0 {
-                    (Scalar::MAX - Scalar::ONE) * Scalar::from(abs)
-                } else {
-                    Scalar::from(abs)
-                };
-                self.bitxor(scalar)
-            }
-        }
-    }
-}
-
-impl Div for Constraint {
-    type Output = Constraint;
-
-    /// Multiplies the LHS by the inverse of the RHS, which must have exactly one monomial.
-    ///
-    /// WARNING: if the monomial of the RHS contains inverted variables (e.g. `x ^ -1`) this
-    /// division will yield unexpected results due to the fact that the exponent -1 (which
-    /// conventionally indicates modular inversion) actually maps to the field element that's
-    /// congruent to -2. So for instance `x / (y ^ -1)` will actually yield `x / (y ^ 4)` rather
-    /// than `x * y`.
-    fn div(self, rhs: Self) -> Self::Output {
-        match rhs.monomials.len() {
-            0 => panic!("division by zero"),
-            1 => Constraint {
-                monomials: self
-                    .monomials
-                    .into_iter()
-                    .map(|(variables, coefficient)| {
-                        (
-                            variables
-                                .into_iter()
-                                .map(|(column_index, exponent)| {
-                                    (column_index, exponent * (Scalar::MAX - Scalar::ONE))
-                                })
-                                .collect(),
-                            coefficient.invert_vartime().unwrap(),
-                        )
-                    })
-                    .collect(),
-            },
-            _ => panic!("dividing by a polynomial is forbidden, try to simplify your constraint"),
-        }
-    }
-}
-
-impl Div<Scalar> for Constraint {
-    type Output = Constraint;
-
-    fn div(self, rhs: Scalar) -> Self::Output {
-        self.mul(rhs.invert_vartime().unwrap())
-    }
-}
 
 /// A "wire" is a termination of a gate, identified by a row index and a column index.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -474,12 +139,7 @@ impl CircuitBuilder {
     /// multiplication (`*`), and exponentiation by a constant (`^` followed by a constant).
     pub fn var(&mut self, column_index: usize) -> Constraint {
         self.num_columns = std::cmp::max(self.num_columns, column_index + 1);
-        Constraint {
-            monomials: BTreeMap::from([(
-                BTreeMap::from([(column_index, Scalar::ONE)]),
-                Scalar::ONE,
-            )]),
-        }
+        Constraint::make_var(column_index)
     }
 
     /// Adds a gate to the circuit.
@@ -530,13 +190,33 @@ pub struct Witness {
 
 impl Witness {
     /// Reads a witness cell.
-    pub fn get(&self, row: usize, column: usize) -> Scalar {
-        self.data[column][row]
+    pub fn get(&self, wire: Wire) -> Scalar {
+        self.data[wire.column][wire.row]
     }
 
     /// Updates a witness cell.
-    pub fn set(&mut self, value: Scalar, row: usize, column: usize) {
-        self.data[column][row] = value;
+    pub fn set(&mut self, wire: Wire, value: Scalar) {
+        self.data[wire.column][wire.row] = value;
+    }
+
+    pub fn copy(&mut self, wire1: Wire, wire2: Wire) -> Scalar {
+        let value = self.data[wire1.column][wire1.row];
+        self.data[wire2.column][wire2.row] = value;
+        value
+    }
+}
+
+impl Index<Wire> for Witness {
+    type Output = Scalar;
+
+    fn index(&self, index: Wire) -> &Self::Output {
+        &self.data[index.column][index.row]
+    }
+}
+
+impl IndexMut<Wire> for Witness {
+    fn index_mut(&mut self, index: Wire) -> &mut Self::Output {
+        &mut self.data[index.column][index.row]
     }
 }
 

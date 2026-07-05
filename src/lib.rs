@@ -3,6 +3,8 @@
 
 #![doc = include_str!("../README.md")]
 
+mod constraint;
 mod plonk;
 
+pub use constraint::*;
 pub use plonk::*;
