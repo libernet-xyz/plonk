@@ -517,5 +517,21 @@ mod tests {
         assert_eq!(constraint.to_str(), "w[0] + -1 * w[1]");
     }
 
+    #[test]
+    fn test_optimize_sum_3() {
+        let w0 = make_var(0);
+        let w1 = make_var(1);
+        let constraint = w0.clone() + w1 * -from_const(1) + w0 * -from_const(1);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            -from_const(34)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            -from_const(12)
+        );
+        assert_eq!(constraint.to_str(), "-1 * w[1]");
+    }
+
     // TODO
 }
