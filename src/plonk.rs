@@ -1,7 +1,7 @@
 use crate::Constraint;
 use crate::utils;
 use crate::wires::{Wire, WirePartitioner};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use starkom_bluesky::Scalar;
 use starkom_ff::Field;
 use starkom_pcs::{self as pcs, hash::Hash};
@@ -12,10 +12,10 @@ use std::sync::LazyLock;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
 
-/// Default blowup factor in logarithmic form.
+/// Default blowup factor (16) in logarithmic form.
 ///
 /// Used with the underlying PCS to compute low-degree extensions.
-pub const OPTIONS_DEFAULT_BLOWUP_LOG2: usize = 3;
+pub const OPTIONS_DEFAULT_BLOWUP_LOG2: usize = 4;
 
 /// Number of extra rows that are implicitly added to all circuits and witnesses for blinding.
 ///
@@ -28,10 +28,17 @@ pub const OPTIONS_DEFAULT_BLOWUP_LOG2: usize = 3;
 /// contains the witness columns in its definition).
 pub const NUM_BLINDING_ROWS: usize = 3;
 
+const COMMIT_INDEX_CIRCUIT: usize = 0;
+const COMMIT_INDEX_WITNESS: usize = 1;
+const COMMIT_INDEX_PERMUTATION_ARGUMENT: usize = 2;
+const COMMIT_INDEX_QUOTIENT: usize = 3;
+const NUM_COMMIT_INDICES: usize = 4;
+
 /// Domain separator tag used for the main Fiat-Shamir challenge.
 static DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/plonk/challenge"));
 
-fn padded_size(n: usize) -> usize {
+fn padded_size(mut n: usize) -> usize {
+    n += NUM_BLINDING_ROWS;
     std::cmp::max(2, n.next_power_of_two())
 }
 
@@ -120,6 +127,7 @@ impl CircuitBuilder {
     pub fn build(self) -> Circuit {
         let degree_bound = padded_size(self.num_rows);
         Circuit {
+            num_rows: self.num_rows,
             degree_bound,
             num_columns: self.num_columns,
             gates: self
@@ -141,6 +149,9 @@ impl CircuitBuilder {
 
 #[derive(Debug, Clone)]
 pub struct Witness {
+    /// The number of witness rows *not* including the blinding rows.
+    num_rows: usize,
+
     /// Witness table cells, indexed column-first.
     ///
     /// The column-first indexing allows quickly interpolating polynomials for the columns.
@@ -148,21 +159,52 @@ pub struct Witness {
 }
 
 impl Witness {
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    pub fn degree_bound(&self) -> usize {
+        padded_size(self.num_rows)
+    }
+
+    pub fn num_columns(&self) -> usize {
+        self.data.len()
+    }
+
     /// Reads a witness cell.
     pub fn get(&self, wire: Wire) -> Scalar {
-        self.data[wire.column()][wire.row()]
+        let row = wire.row();
+        assert!(row < self.num_rows);
+        self.data[wire.column()][row]
     }
 
     /// Updates a witness cell.
     pub fn set(&mut self, wire: Wire, value: Scalar) {
-        self.data[wire.column()][wire.row()] = value;
+        let row = wire.row();
+        assert!(row < self.num_rows);
+        self.data[wire.column()][row] = value;
     }
 
     /// Copies a witness cell to another.
     pub fn copy(&mut self, src_wire: Wire, dst_wire: Wire) -> Scalar {
-        let value = self.data[src_wire.column()][src_wire.row()];
-        self.data[dst_wire.column()][dst_wire.row()] = value;
+        let src_row = src_wire.row();
+        let dst_row = dst_wire.row();
+        assert!(src_row < self.num_rows);
+        assert!(dst_row < self.num_rows);
+        let value = self.data[src_wire.column()][src_row];
+        self.data[dst_wire.column()][dst_row] = value;
         value
+    }
+
+    /// Adds blinding rows to the polynomial.
+    ///
+    /// This is for internal use, [`Circuit::prove`] calls it automatically.
+    fn blind(&mut self) {
+        for column in &mut self.data {
+            for i in 0..NUM_BLINDING_ROWS {
+                column[self.num_rows - i - 1] = Scalar::random_default();
+            }
+        }
     }
 }
 
@@ -182,14 +224,20 @@ impl IndexMut<Wire> for Witness {
 
 #[derive(Debug, Clone)]
 pub struct Proof<H: Hash<Scalar>> {
-    inner: pcs::Proof<H>,
-    public_inputs: BTreeMap<Wire, Scalar>,
+    commitment: pcs::Commitment,
+    inner_proof: pcs::Proof<H>,
 }
 
 /// A PLONK circuit.
 #[derive(Debug, Clone)]
 pub struct Circuit {
-    /// Number of witness rows (including the blinding rows) padded to the next power of 2.
+    /// The raw number of rows of the circuit.
+    ///
+    /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
+    /// padded to the next power of 2.
+    num_rows: usize,
+
+    /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
     degree_bound: usize,
 
     /// Number of witness columns.
@@ -207,6 +255,10 @@ pub struct Circuit {
 }
 
 impl Circuit {
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
     pub fn degree_bound(&self) -> usize {
         self.degree_bound
     }
@@ -218,15 +270,105 @@ impl Circuit {
     /// Makes an empty [`Witness`] objects suitable for use with this circuit.
     pub fn make_witness(&self) -> Witness {
         Witness {
+            num_rows: self.num_rows,
             data: vec![vec![Scalar::ZERO; self.degree_bound]; self.num_columns],
         }
     }
 
     /// Proves correctness for the given witness, or returns an error in case of a constraint
     /// violation.
-    pub fn prove<H: Hash<Scalar>>(&self, witness: Witness, options: Options) -> Result<Proof<H>> {
-        // TODO
-        todo!()
+    pub fn prove<H: Hash<Scalar>>(
+        &self,
+        mut witness: Witness,
+        options: Options,
+    ) -> Result<Proof<H>> {
+        witness.blind();
+        if witness.degree_bound() != self.degree_bound {
+            return Err(anyhow!(
+                "incorrect witness size (got {}, want {})",
+                witness.degree_bound(),
+                self.degree_bound
+            ));
+        }
+
+        let selectors = self
+            .gates
+            .iter()
+            .map(|(_, selector)| selector.clone())
+            .collect();
+
+        let mut committer =
+            pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, selectors);
+
+        let columns: Vec<Polynomial> = witness
+            .data
+            .into_iter()
+            .map(|data| Polynomial::encode2(data))
+            .collect();
+
+        committer.add_batch(columns);
+
+        // TODO: prove wire constraints.
+
+        let xi = H::hash_two(
+            *DST,
+            committer.root_hash(COMMIT_INDEX_WITNESS), // TODO: change this to COMMIT_INDEX_QUOTIENT
+            Scalar::ZERO,
+        );
+
+        let omega = Polynomial::domain_element2(1, self.degree_bound);
+
+        let (commitment, prover) = committer.commit(BTreeSet::from_iter(
+            [xi, xi * omega]
+                .into_iter()
+                .chain(self.public_gates.iter().map(|&row| omega.pow_small(row))),
+        ));
+        let inner_proof = prover.prove(&commitment);
+
+        Ok(Proof {
+            commitment,
+            inner_proof,
+        })
+    }
+
+    pub fn to_compressed<H: Hash<Scalar>>(self, options: Options) -> CompressedCircuit<H> {
+        let selectors = self
+            .gates
+            .into_iter()
+            .map(|(_, selector)| selector)
+            .collect();
+        let committer = pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, selectors);
+        CompressedCircuit {
+            num_rows: self.num_rows,
+            degree_bound: self.degree_bound,
+            num_columns: self.num_columns,
+            options,
+            public_gates: self.public_gates,
+            circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
+            _data: Default::default(),
+        }
+    }
+
+    pub fn as_compressed<H: Hash<Scalar>>(&self, options: Options) -> CompressedCircuit<H> {
+        let selectors = self
+            .gates
+            .iter()
+            .map(|(_, selector)| selector.clone())
+            .collect();
+        let committer = pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, selectors);
+        CompressedCircuit {
+            num_rows: self.num_rows,
+            degree_bound: self.degree_bound,
+            num_columns: self.num_columns,
+            options,
+            public_gates: self.public_gates.clone(),
+            circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
+            _data: Default::default(),
+        }
+    }
+
+    pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>, options: Options) -> Result<()> {
+        self.as_compressed::<H>(options).verify(proof)
     }
 }
 
@@ -236,36 +378,131 @@ impl Circuit {
 /// allows full verification of a proof for the circuit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompressedCircuit<H: Hash<Scalar>> {
-    /// Number of witness rows.
+    /// The raw number of rows of the circuit.
+    ///
+    /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
+    /// padded to the next power of 2.
     num_rows: usize,
+
+    /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
+    degree_bound: usize,
 
     /// Number of witness columns.
     num_columns: usize,
 
-    /// Polynomial commitment for the circuit.
-    commitment: pcs::Commitment,
+    /// Proving options used to commit to this circuit (in [`Circuit::as_compressed`] or
+    /// [`Circuit::to_compressed`]).
+    options: Options,
+
+    public_gates: BTreeSet<usize>,
+
+    /// Merkle root of the circuit selectors.
+    circuit_commitment: Scalar,
 
     _data: PhantomData<H>,
 }
 
 impl<H: Hash<Scalar>> CompressedCircuit<H> {
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    pub fn degree_bound(&self) -> usize {
+        self.degree_bound
+    }
+
+    pub fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
     pub fn verify(&self, proof: &Proof<H>) -> Result<()> {
-        // TODO
-        todo!()
+        let commitment = &proof.commitment;
+        let inner_proof = &proof.inner_proof;
+
+        // if commitment.tree_roots().len() != NUM_COMMIT_INDICES {
+        //     return Err(anyhow!(
+        //         "wrong number of Merkle roots (got {}, want {})",
+        //         commitment.tree_roots().len(),
+        //         NUM_COMMIT_INDICES
+        //     ));
+        // }
+        if commitment.tree_roots()[COMMIT_INDEX_CIRCUIT] != self.circuit_commitment {
+            return Err(anyhow!(
+                "wrong circuit commitment (got {}, want {})",
+                commitment.tree_roots()[COMMIT_INDEX_CIRCUIT],
+                self.circuit_commitment
+            ));
+        }
+
+        if inner_proof.degree_bound() != self.degree_bound {
+            return Err(anyhow!(
+                "wrong degree bound (got {}, want {})",
+                inner_proof.degree_bound(),
+                self.degree_bound
+            ));
+        }
+        if inner_proof.blowup_log2() != self.options.blowup_log2 {
+            return Err(anyhow!(
+                "blowup factor mismatch (got {}, want {})",
+                1usize << inner_proof.blowup_log2(),
+                1usize << self.options.blowup_log2
+            ));
+        }
+        // if inner_proof.num_polys() != 15 {
+        //     return Err(anyhow!(
+        //         "incorrect number of committed polynomials (got {}, want 15)",
+        //         inner_proof.num_polys()
+        //     ));
+        // }
+
+        let omega = Polynomial::domain_element2(1, self.degree_bound);
+
+        let xi = H::hash_two(
+            *DST,
+            commitment.tree_roots()[COMMIT_INDEX_WITNESS], // TODO: change this to COMMIT_INDEX_QUOTIENT
+            Scalar::ZERO,
+        );
+
+        let points = inner_proof.points();
+        if !points.contains_key(&xi) {
+            return Err(anyhow!(
+                "the proof doesn't have an opening for the Fiat-Shamir challenge value"
+            ));
+        }
+        if !points.contains_key(&(xi * omega)) {
+            return Err(anyhow!(
+                "the proof doesn't have an opening for the shifted Fiat-Shamir challenge value"
+            ));
+        }
+        for &gate in &self.public_gates {
+            let z = omega.pow_small(gate);
+            if !points.contains_key(&z) {
+                return Err(anyhow!(
+                    "the proof doesn't have an opening for public gate {gate}"
+                ));
+            }
+        }
+
+        inner_proof.verify(&commitment)?;
+
+        // TODO: algebraic check
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starkom_bluesky::from_const;
+    use starkom_pcs::hash::{Poseidon2Hash, Sha2Hash};
 
     #[inline]
     fn wire(row: usize, column: usize) -> Wire {
         Wire::new(row, column)
     }
 
-    #[test]
-    fn test_vitalik_circuit() {
+    fn test_vitalik_circuit_impl<H: Hash<Scalar>>(blowup_log2: usize) {
         let mut builder = CircuitBuilder::default();
         let r0 = builder.var(0);
         let r1 = builder.var(1);
@@ -278,7 +515,53 @@ mod tests {
         builder.connect(wire(result, 2), wire(nop, 0));
         builder.declare_public_gates([nop]);
         let circuit = builder.build();
-        // TODO
+        assert_eq!(circuit.num_rows(), 3);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 3);
+        let mut witness = circuit.make_witness();
+        let x = from_const(3);
+        witness.set(wire(square, 0), x);
+        witness.set(wire(square, 1), x.square());
+        witness.copy(wire(square, 0), wire(result, 0));
+        witness.copy(wire(square, 1), wire(result, 1));
+        witness.set(wire(result, 2), x.cube() + x + from_const(5));
+        witness.copy(wire(result, 2), wire(nop, 0));
+        let proof = circuit
+            .prove::<H>(witness, Options { blowup_log2 })
+            .unwrap();
+        circuit
+            .verify::<H>(&proof, Options { blowup_log2 })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_vitalik_circuit_sha2_blowup_2() {
+        test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_poseidon2_blowup_2() {
+        test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_sha2_blowup_4() {
+        test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_poseidon2_blowup_4() {
+        test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_sha2_blowup_8() {
+        test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(3);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_poseidon2_blowup_8() {
+        test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(3);
     }
 
     // TODO
