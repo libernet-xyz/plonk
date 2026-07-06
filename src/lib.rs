@@ -3,9 +3,11 @@
 
 #![doc = include_str!("../README.md")]
 
-mod constraint;
+mod expr;
 mod plonk;
+mod utils;
 mod wires;
 
-pub use constraint::*;
+pub use expr::*;
 pub use plonk::*;
+pub use wires::*;

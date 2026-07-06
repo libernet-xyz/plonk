@@ -1,4 +1,5 @@
 use crate::Constraint;
+use crate::utils;
 use crate::wires::{Wire, WirePartitioner};
 use anyhow::Result;
 use starkom_bluesky::Scalar;
@@ -7,6 +8,7 @@ use starkom_pcs::{self as pcs, hash::Hash};
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
+use std::sync::LazyLock;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
 
@@ -14,6 +16,24 @@ type Polynomial = starkom_poly::Polynomial<Scalar>;
 ///
 /// Used with the underlying PCS to compute low-degree extensions.
 pub const OPTIONS_DEFAULT_BLOWUP_LOG2: usize = 3;
+
+/// Number of extra rows that are implicitly added to all circuits and witnesses for blinding.
+///
+/// Blinding rows are appended at the end using NOP gates and random scalars in the witness.
+///
+/// The reason why PLONK requires 3 of them is that they must be strictly more than the number of
+/// off-domain locations opened in the underlying polynomial commitment scheme, and PLONK requires
+/// opening two such locations: the Fiat-Shamir challenge xi and the shifted point xi*omega (the
+/// latter is for the coordinate pair accumulator polynomial of the permutation argument, which
+/// contains the witness columns in its definition).
+pub const NUM_BLINDING_ROWS: usize = 3;
+
+/// Domain separator tag used for the main Fiat-Shamir challenge.
+static DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/plonk/challenge"));
+
+fn padded_size(n: usize) -> usize {
+    std::cmp::max(2, n.next_power_of_two())
+}
 
 /// Circuit compilation & proving options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,8 +118,24 @@ impl CircuitBuilder {
 
     /// Compiles the circuit built so far into a [`Circuit`] object.
     pub fn build(self) -> Circuit {
-        // TODO
-        todo!()
+        let degree_bound = padded_size(self.num_rows);
+        Circuit {
+            degree_bound,
+            num_columns: self.num_columns,
+            gates: self
+                .gates
+                .into_iter()
+                .map(|(constraint, rows)| {
+                    let mut data = vec![Scalar::ZERO; degree_bound];
+                    for row in rows {
+                        data[row] = Scalar::ONE;
+                    }
+                    (constraint, Polynomial::encode2(data))
+                })
+                .collect(),
+            sigma: vec![], // TODO
+            public_gates: self.public_gates,
+        }
     }
 }
 
@@ -153,8 +189,8 @@ pub struct Proof<H: Hash<Scalar>> {
 /// A PLONK circuit.
 #[derive(Debug, Clone)]
 pub struct Circuit {
-    /// Number of witness rows.
-    num_rows: usize,
+    /// Number of witness rows (including the blinding rows) padded to the next power of 2.
+    degree_bound: usize,
 
     /// Number of witness columns.
     num_columns: usize,
@@ -165,13 +201,24 @@ pub struct Circuit {
 
     /// Sigma polynomials of the permutation argument, one for every witness column.
     sigma: Vec<Polynomial>,
+
+    /// List of gates that are revealed in the proofs. Each element is a row index.
+    public_gates: BTreeSet<usize>,
 }
 
 impl Circuit {
+    pub fn degree_bound(&self) -> usize {
+        self.degree_bound
+    }
+
+    pub fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
     /// Makes an empty [`Witness`] objects suitable for use with this circuit.
     pub fn make_witness(&self) -> Witness {
         Witness {
-            data: vec![vec![Scalar::ZERO; self.num_rows]; self.num_columns],
+            data: vec![vec![Scalar::ZERO; self.degree_bound]; self.num_columns],
         }
     }
 
@@ -211,6 +258,28 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[inline]
+    fn wire(row: usize, column: usize) -> Wire {
+        Wire::new(row, column)
+    }
+
+    #[test]
+    fn test_vitalik_circuit() {
+        let mut builder = CircuitBuilder::default();
+        let r0 = builder.var(0);
+        let r1 = builder.var(1);
+        let r2 = builder.var(2);
+        let square = builder.add_gate((r0.clone() ^ 2) - r1.clone());
+        let result = builder.add_gate(r0.clone() * r1.clone() + r0 + 5 - r2);
+        builder.connect(wire(square, 0), wire(result, 0));
+        builder.connect(wire(square, 1), wire(result, 1));
+        let nop = builder.add_gate(Constraint::default());
+        builder.connect(wire(result, 2), wire(nop, 0));
+        builder.declare_public_gates([nop]);
+        let circuit = builder.build();
+        // TODO
+    }
 
     // TODO
 }

@@ -555,6 +555,8 @@ name = "starkom-plonk"
 version = "3.0.0"
 dependencies = [
  "anyhow",
+ "primitive-types",
+ "sha3",
  "starkom-bluesky",
  "starkom-ff",
  "starkom-pcs",

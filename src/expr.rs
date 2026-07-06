@@ -54,6 +54,15 @@ impl Constraint {
             .collect()
     }
 
+    fn isize_to_scalar(value: isize) -> Scalar {
+        let abs = value.unsigned_abs();
+        if value < 0 {
+            -Scalar::try_from(abs).unwrap()
+        } else {
+            Scalar::try_from(abs).unwrap()
+        }
+    }
+
     fn is_pseudo_negative(&value: &Scalar) -> bool {
         let half_range = Scalar::MAX * Scalar::TWO_INV;
         value > half_range
@@ -71,7 +80,7 @@ impl Constraint {
     }
 
     /// Returns a textual representation of the constraint formula.
-    pub fn to_str(&self) -> String {
+    pub fn to_string(&self) -> String {
         if self.monomials.is_empty() {
             return "0".into();
         }
@@ -186,6 +195,14 @@ impl Add<Scalar> for Constraint {
     }
 }
 
+impl Add<isize> for Constraint {
+    type Output = Constraint;
+
+    fn add(self, rhs: isize) -> Self::Output {
+        self.add(Self::isize_to_scalar(rhs))
+    }
+}
+
 impl Sub for Constraint {
     type Output = Constraint;
 
@@ -223,6 +240,14 @@ impl Sub<Scalar> for Constraint {
             }
         }
         self
+    }
+}
+
+impl Sub<isize> for Constraint {
+    type Output = Constraint;
+
+    fn sub(self, rhs: isize) -> Self::Output {
+        self.sub(Self::isize_to_scalar(rhs))
     }
 }
 
@@ -278,6 +303,14 @@ impl Mul<Scalar> for Constraint {
             *coefficient *= rhs;
         }
         self
+    }
+}
+
+impl Mul<isize> for Constraint {
+    type Output = Constraint;
+
+    fn mul(self, rhs: isize) -> Self::Output {
+        self.mul(Self::isize_to_scalar(rhs))
     }
 }
 
@@ -374,7 +407,7 @@ mod tests {
             constraint.evaluate(&[from_const(12), from_const(34)]),
             from_const(0)
         );
-        assert_eq!(constraint.to_str(), "0");
+        assert_eq!(constraint.to_string(), "0");
     }
 
     fn test_constant_impl(value: Scalar) {
@@ -388,7 +421,7 @@ mod tests {
             constraint.evaluate(&[from_const(12), from_const(34)]),
             value
         );
-        assert_eq!(constraint.to_str(), value.to_str_radix(10, 0, false));
+        assert_eq!(constraint.to_string(), value.to_str_radix(10, 0, false));
     }
 
     #[test]
@@ -406,7 +439,7 @@ mod tests {
             constraint.evaluate(&[from_const(56), from_const(78)]),
             from_const(56)
         );
-        assert_eq!(constraint.to_str(), "w[0]");
+        assert_eq!(constraint.to_string(), "w[0]");
     }
 
     #[test]
@@ -424,7 +457,7 @@ mod tests {
             constraint.evaluate(&[from_const(56), from_const(78)]),
             from_const(78)
         );
-        assert_eq!(constraint.to_str(), "w[1]");
+        assert_eq!(constraint.to_string(), "w[1]");
     }
 
     #[test]
@@ -438,7 +471,7 @@ mod tests {
             constraint.evaluate(&[from_const(56), from_const(78), from_const(90)]),
             from_const(90)
         );
-        assert_eq!(constraint.to_str(), "w[2]");
+        assert_eq!(constraint.to_string(), "w[2]");
     }
 
     #[test]
@@ -456,7 +489,7 @@ mod tests {
             constraint.evaluate(&[from_const(56), from_const(78)]),
             from_const(134)
         );
-        assert_eq!(constraint.to_str(), "w[0] + w[1]");
+        assert_eq!(constraint.to_string(), "w[0] + w[1]");
     }
 
     #[test]
@@ -474,7 +507,7 @@ mod tests {
             constraint.evaluate(&[from_const(56), from_const(78)]),
             from_const(134)
         );
-        assert_eq!(constraint.to_str(), "w[0] + w[1]");
+        assert_eq!(constraint.to_string(), "w[0] + w[1]");
     }
 
     #[test]
@@ -492,7 +525,7 @@ mod tests {
             constraint.evaluate(&[from_const(34), from_const(56), from_const(12)]),
             from_const(68)
         );
-        assert_eq!(constraint.to_str(), "w[1] + w[2]");
+        assert_eq!(constraint.to_string(), "w[1] + w[2]");
     }
 
     #[test]
@@ -510,7 +543,7 @@ mod tests {
             constraint.evaluate(&[from_const(34), from_const(56), from_const(78)]),
             from_const(168)
         );
-        assert_eq!(constraint.to_str(), "w[0] + w[1] + w[2]");
+        assert_eq!(constraint.to_string(), "w[0] + w[1] + w[2]");
     }
 
     #[test]
@@ -518,7 +551,7 @@ mod tests {
         let constraint = make_var(0) + from_const(12);
         assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(46));
         assert_eq!(constraint.evaluate(&[from_const(56)]), from_const(68));
-        assert_eq!(constraint.to_str(), "12 + w[0]");
+        assert_eq!(constraint.to_string(), "12 + w[0]");
     }
 
     #[test]
@@ -526,7 +559,7 @@ mod tests {
         let constraint = make_var(0) + from_const(34);
         assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(46));
         assert_eq!(constraint.evaluate(&[from_const(56)]), from_const(90));
-        assert_eq!(constraint.to_str(), "34 + w[0]");
+        assert_eq!(constraint.to_string(), "34 + w[0]");
     }
 
     #[test]
@@ -534,7 +567,7 @@ mod tests {
         let constraint = make_var(0) + from_const(34) + from_const(56);
         assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(102));
         assert_eq!(constraint.evaluate(&[from_const(78)]), from_const(168));
-        assert_eq!(constraint.to_str(), "90 + w[0]");
+        assert_eq!(constraint.to_string(), "90 + w[0]");
     }
 
     #[test]
@@ -542,7 +575,7 @@ mod tests {
         let constraint = make_var(0) + make_var(0) * -from_const(1);
         assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(0));
         assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(0));
-        assert_eq!(constraint.to_str(), "0");
+        assert_eq!(constraint.to_string(), "0");
     }
 
     #[test]
@@ -556,7 +589,7 @@ mod tests {
             constraint.evaluate(&[from_const(34), from_const(12)]),
             from_const(22)
         );
-        assert_eq!(constraint.to_str(), "w[0] + -1 * w[1]");
+        assert_eq!(constraint.to_string(), "w[0] + -1 * w[1]");
     }
 
     #[test]
@@ -572,7 +605,7 @@ mod tests {
             constraint.evaluate(&[from_const(34), from_const(12)]),
             -from_const(12)
         );
-        assert_eq!(constraint.to_str(), "-1 * w[1]");
+        assert_eq!(constraint.to_string(), "-1 * w[1]");
     }
 
     // TODO
