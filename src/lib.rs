@@ -5,6 +5,7 @@
 
 mod constraint;
 mod plonk;
+mod wires;
 
 pub use constraint::*;
 pub use plonk::*;

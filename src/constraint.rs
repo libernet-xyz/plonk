@@ -173,7 +173,15 @@ impl Add<Scalar> for Constraint {
     type Output = Constraint;
 
     fn add(mut self, rhs: Scalar) -> Self::Output {
-        self.monomials.insert(BTreeMap::default(), rhs);
+        let variables = BTreeMap::default();
+        match self.monomials.get_mut(&variables) {
+            Some(coefficient) => {
+                *coefficient += rhs;
+            }
+            None => {
+                self.monomials.insert(variables, rhs);
+            }
+        }
         self
     }
 }
@@ -205,7 +213,15 @@ impl Sub<Scalar> for Constraint {
     type Output = Constraint;
 
     fn sub(mut self, rhs: Scalar) -> Self::Output {
-        self.monomials.insert(BTreeMap::default(), -rhs);
+        let variables = BTreeMap::default();
+        match self.monomials.get_mut(&variables) {
+            Some(coefficient) => {
+                *coefficient -= rhs;
+            }
+            None => {
+                self.monomials.insert(variables, -rhs);
+            }
+        }
         self
     }
 }
@@ -480,6 +496,24 @@ mod tests {
     }
 
     #[test]
+    fn test_another_sum() {
+        let constraint = make_var(0) + make_var(1) + make_var(2);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34), from_const(56)]),
+            from_const(102)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(56), from_const(34)]),
+            from_const(102)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(56), from_const(78)]),
+            from_const(168)
+        );
+        assert_eq!(constraint.to_str(), "w[0] + w[1] + w[2]");
+    }
+
+    #[test]
     fn test_add_scalar_1() {
         let constraint = make_var(0) + from_const(12);
         assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(46));
@@ -493,6 +527,14 @@ mod tests {
         assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(46));
         assert_eq!(constraint.evaluate(&[from_const(56)]), from_const(90));
         assert_eq!(constraint.to_str(), "34 + w[0]");
+    }
+
+    #[test]
+    fn test_add_another_scalar() {
+        let constraint = make_var(0) + from_const(34) + from_const(56);
+        assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(102));
+        assert_eq!(constraint.evaluate(&[from_const(78)]), from_const(168));
+        assert_eq!(constraint.to_str(), "90 + w[0]");
     }
 
     #[test]

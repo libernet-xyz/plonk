@@ -1,9 +1,10 @@
 use crate::Constraint;
+use crate::wires::{Wire, WirePartitioner};
 use anyhow::Result;
 use starkom_bluesky::Scalar;
 use starkom_ff::Field;
 use starkom_pcs::{self as pcs, hash::Hash};
-use std::collections::{BTreeMap, BTreeSet, btree_map};
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
@@ -13,84 +14,6 @@ type Polynomial = starkom_poly::Polynomial<Scalar>;
 ///
 /// Used with the underlying PCS to compute low-degree extensions.
 pub const OPTIONS_DEFAULT_BLOWUP_LOG2: usize = 3;
-
-/// A "wire" is a termination of a gate, identified by a row index and a column index.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Wire {
-    row: usize,
-    column: usize,
-}
-
-#[derive(Debug, Clone)]
-struct NodeIterator<'a> {
-    inner: btree_map::Iter<'a, usize, BTreeSet<Wire>>,
-}
-
-impl<'a> Iterator for NodeIterator<'a> {
-    type Item = &'a BTreeSet<Wire>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, node)| node)
-    }
-}
-
-/// Keeps all the wires of a circuit organized in partitions, i.e. sets of interconnected wires.
-///
-/// Since all the wires in a partition are connected to each other, in this context a partition
-/// represents a node of the circuit, so we call partitions "nodes".
-///
-/// This data structure allows determining the subsets of the sigma polynomials to permute.
-#[derive(Debug, Default, Clone)]
-struct WirePartitioning {
-    /// Next available node ID.
-    next_id: usize,
-
-    /// Keys are incremental node IDs, values are nodes.
-    nodes: BTreeMap<usize, BTreeSet<Wire>>,
-
-    /// Keys are wires, values are the ID of the node that wire is connected to.
-    ///
-    /// If a wire is not found here it's implied that it belongs to a partition containing only
-    /// that wire, i.e. it's unconstrained.
-    node_by_wire: BTreeMap<Wire, usize>,
-}
-
-impl WirePartitioning {
-    pub(crate) fn connect(&mut self, wire1: Wire, wire2: Wire) {
-        if let Some(node_id1) = self.node_by_wire.get(&wire1) {
-            if let Some(node_id2) = self.node_by_wire.get(&wire2) {
-                if *node_id1 != *node_id2 {
-                    let mut node2 = self.nodes.remove(&node_id2).unwrap();
-                    let node1 = self.nodes.get_mut(node_id1).unwrap();
-                    node1.append(&mut node2);
-                    self.node_by_wire.insert(wire2, *node_id1);
-                }
-            } else {
-                let node = self.nodes.get_mut(node_id1).unwrap();
-                node.insert(wire2);
-                self.node_by_wire.insert(wire2, *node_id1);
-            }
-        } else {
-            if let Some(node_id) = self.node_by_wire.get(&wire2) {
-                let node = self.nodes.get_mut(node_id).unwrap();
-                node.insert(wire1);
-                self.node_by_wire.insert(wire1, *node_id);
-            } else {
-                let id = self.next_id;
-                self.next_id += 1;
-                self.nodes.insert(id, BTreeSet::from([wire1, wire2]));
-                self.node_by_wire.insert(wire1, id);
-                self.node_by_wire.insert(wire2, id);
-            }
-        }
-    }
-
-    pub(crate) fn iter_nodes(&self) -> NodeIterator<'_> {
-        NodeIterator {
-            inner: self.nodes.iter(),
-        }
-    }
-}
 
 /// Circuit compilation & proving options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +48,7 @@ pub struct CircuitBuilder {
     gates: BTreeMap<Constraint, Vec<usize>>,
 
     /// Wire partitioning inferred from the connections made with [`Self::connect`].
-    wires: WirePartitioning,
+    wires: WirePartitioner,
 
     /// List of gates that are revealed in the proofs. Each element is a row index.
     public_gates: BTreeSet<usize>,
@@ -191,17 +114,18 @@ pub struct Witness {
 impl Witness {
     /// Reads a witness cell.
     pub fn get(&self, wire: Wire) -> Scalar {
-        self.data[wire.column][wire.row]
+        self.data[wire.column()][wire.row()]
     }
 
     /// Updates a witness cell.
     pub fn set(&mut self, wire: Wire, value: Scalar) {
-        self.data[wire.column][wire.row] = value;
+        self.data[wire.column()][wire.row()] = value;
     }
 
-    pub fn copy(&mut self, wire1: Wire, wire2: Wire) -> Scalar {
-        let value = self.data[wire1.column][wire1.row];
-        self.data[wire2.column][wire2.row] = value;
+    /// Copies a witness cell to another.
+    pub fn copy(&mut self, src_wire: Wire, dst_wire: Wire) -> Scalar {
+        let value = self.data[src_wire.column()][src_wire.row()];
+        self.data[dst_wire.column()][dst_wire.row()] = value;
         value
     }
 }
@@ -210,13 +134,13 @@ impl Index<Wire> for Witness {
     type Output = Scalar;
 
     fn index(&self, index: Wire) -> &Self::Output {
-        &self.data[index.column][index.row]
+        &self.data[index.column()][index.row()]
     }
 }
 
 impl IndexMut<Wire> for Witness {
     fn index_mut(&mut self, index: Wire) -> &mut Self::Output {
-        &mut self.data[index.column][index.row]
+        &mut self.data[index.column()][index.row()]
     }
 }
 
