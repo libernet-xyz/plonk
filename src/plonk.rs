@@ -616,11 +616,20 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
                 .collect()
         };
 
-        let gate_constraint: Scalar = selectors
-            .into_iter()
-            .zip(constraints.into_iter())
-            .map(|(selector, constraint)| selector * constraint)
-            .sum::<Scalar>();
+        let gate_constraint: Scalar = {
+            let delta = H::hash_two(
+                *DST,
+                commitment.tree_roots()[COMMIT_INDEX_WITNESS],
+                FIAT_SHAMIR_INDEX_DELTA,
+            );
+            let mut result = Scalar::ZERO;
+            let mut pow = Scalar::ONE;
+            for (selector, constraint) in selectors.into_iter().zip(constraints.into_iter()) {
+                result += selector * constraint * pow;
+                pow *= delta;
+            }
+            result
+        };
 
         // TODO: recover wire constraints when they're available.
 
