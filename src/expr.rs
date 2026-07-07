@@ -303,7 +303,7 @@ impl Sub for Constraint {
                     *preexisting_coefficient -= coefficient;
                 }
                 None => {
-                    self.monomials.insert(variables, coefficient);
+                    self.monomials.insert(variables, -coefficient);
                 }
             }
         }

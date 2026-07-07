@@ -244,7 +244,7 @@ impl Witness {
     fn blind(&mut self) {
         for column in &mut self.data {
             for i in 0..NUM_BLINDING_ROWS {
-                column[self.num_rows - i - 1] = Scalar::random_default();
+                column[self.num_rows + i] = Scalar::random_default();
             }
         }
     }
@@ -370,7 +370,7 @@ impl Circuit {
 
         let quotient = gate_constraint.divide_by_zero(self.degree_bound)?;
 
-        committer.add_batch(vec![gate_constraint, quotient]);
+        committer.add_batch(vec![quotient]);
 
         let xi = H::hash_two(
             *DST,
