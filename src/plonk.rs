@@ -32,7 +32,8 @@ const COMMIT_INDEX_CIRCUIT: usize = 0;
 const COMMIT_INDEX_WITNESS: usize = 1;
 const COMMIT_INDEX_PERMUTATION_ARGUMENT: usize = 2;
 const COMMIT_INDEX_QUOTIENT: usize = 3;
-const NUM_COMMIT_INDICES: usize = 4;
+
+const NUM_COMMIT_INDICES: usize = 2; // TODO: update
 
 /// Domain separator tag used for the main Fiat-Shamir challenge.
 static DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/plonk/challenge"));
@@ -243,9 +244,10 @@ pub struct Circuit {
     /// Number of witness columns.
     num_columns: usize,
 
-    /// Gates of the circuit indexed by their respective constraints. The values of the map are
-    /// selectors that activate on the rows where the gate was used.
-    gates: BTreeMap<Constraint, Polynomial>,
+    /// Gates used in the circuit: the first component of each pair is the gate constraint and the
+    /// second component is the selector / Lagrange basis polynomial that activates on the rows
+    /// where that gate was used.
+    gates: Vec<(Constraint, Polynomial)>,
 
     /// Sigma polynomials of the permutation argument, one for every witness column.
     sigma: Vec<Polynomial>,
@@ -332,17 +334,14 @@ impl Circuit {
     }
 
     pub fn to_compressed<H: Hash<Scalar>>(self, options: Options) -> CompressedCircuit<H> {
-        let selectors = self
-            .gates
-            .into_iter()
-            .map(|(_, selector)| selector)
-            .collect();
+        let (gates, selectors) = self.gates.into_iter().unzip();
         let committer = pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, selectors);
         CompressedCircuit {
             num_rows: self.num_rows,
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
             options,
+            gates,
             public_gates: self.public_gates,
             circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
             _data: Default::default(),
@@ -350,17 +349,18 @@ impl Circuit {
     }
 
     pub fn as_compressed<H: Hash<Scalar>>(&self, options: Options) -> CompressedCircuit<H> {
-        let selectors = self
+        let (gates, selectors) = self
             .gates
             .iter()
-            .map(|(_, selector)| selector.clone())
-            .collect();
+            .map(|(constraint, selector)| (constraint.clone(), selector.clone()))
+            .unzip();
         let committer = pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, selectors);
         CompressedCircuit {
             num_rows: self.num_rows,
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
             options,
+            gates,
             public_gates: self.public_gates.clone(),
             circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
             _data: Default::default(),
@@ -374,8 +374,8 @@ impl Circuit {
 
 /// A PLONK circuit in committed form.
 ///
-/// Having logarithmic size this struct is very small compared to the original circuit, but it still
-/// allows full verification of a proof for the circuit.
+/// This struct is much smaller than the original circuit but still allows full verification of a
+/// proof for the circuit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompressedCircuit<H: Hash<Scalar>> {
     /// The raw number of rows of the circuit.
@@ -394,6 +394,10 @@ pub struct CompressedCircuit<H: Hash<Scalar>> {
     /// [`Circuit::to_compressed`]).
     options: Options,
 
+    /// Gates used in the original circuit.
+    gates: Vec<Constraint>,
+
+    /// List of gates that are revealed in the proofs.
     public_gates: BTreeSet<usize>,
 
     /// Merkle root of the circuit selectors.
@@ -419,13 +423,13 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         let commitment = &proof.commitment;
         let inner_proof = &proof.inner_proof;
 
-        // if commitment.tree_roots().len() != NUM_COMMIT_INDICES {
-        //     return Err(anyhow!(
-        //         "wrong number of Merkle roots (got {}, want {})",
-        //         commitment.tree_roots().len(),
-        //         NUM_COMMIT_INDICES
-        //     ));
-        // }
+        if commitment.tree_roots().len() != NUM_COMMIT_INDICES {
+            return Err(anyhow!(
+                "wrong number of Merkle roots (got {}, want {})",
+                commitment.tree_roots().len(),
+                NUM_COMMIT_INDICES
+            ));
+        }
         if commitment.tree_roots()[COMMIT_INDEX_CIRCUIT] != self.circuit_commitment {
             return Err(anyhow!(
                 "wrong circuit commitment (got {}, want {})",
@@ -448,12 +452,15 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
                 1usize << self.options.blowup_log2
             ));
         }
-        // if inner_proof.num_polys() != 15 {
-        //     return Err(anyhow!(
-        //         "incorrect number of committed polynomials (got {}, want 15)",
-        //         inner_proof.num_polys()
-        //     ));
-        // }
+
+        let expected_polynomials = self.gates.len() + self.num_columns;
+        if inner_proof.num_polys() != expected_polynomials {
+            return Err(anyhow!(
+                "incorrect number of committed polynomials (got {}, want {})",
+                inner_proof.num_polys(),
+                expected_polynomials,
+            ));
+        }
 
         let omega = Polynomial::domain_element2(1, self.degree_bound);
 
@@ -485,7 +492,30 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
 
         inner_proof.verify(&commitment)?;
 
-        // TODO: algebraic check
+        let selectors: Vec<Scalar> = self
+            .gates
+            .iter()
+            .enumerate()
+            .map(|(i, _)| points[&xi][i])
+            .collect();
+
+        let constraints: Vec<Scalar> = {
+            let variables: Vec<Scalar> = (0..self.num_columns)
+                .map(|i| points[&xi][selectors.len() + i])
+                .collect();
+            self.gates
+                .iter()
+                .map(|constraint| constraint.evaluate(variables.as_slice()))
+                .collect()
+        };
+
+        let gate_constraint: Scalar = selectors
+            .into_iter()
+            .zip(constraints.into_iter())
+            .map(|(selector, constraint)| selector * constraint)
+            .sum::<Scalar>();
+
+        // TODO
 
         Ok(())
     }
@@ -502,7 +532,7 @@ mod tests {
         Wire::new(row, column)
     }
 
-    fn test_vitalik_circuit_impl<H: Hash<Scalar>>(blowup_log2: usize) {
+    fn test_vitalik_circuit_impl<H: Hash<Scalar>>(blowup_log2: usize) -> Result<()> {
         let mut builder = CircuitBuilder::default();
         let r0 = builder.var(0);
         let r1 = builder.var(1);
@@ -526,42 +556,39 @@ mod tests {
         witness.copy(wire(square, 1), wire(result, 1));
         witness.set(wire(result, 2), x.cube() + x + from_const(5));
         witness.copy(wire(result, 2), wire(nop, 0));
-        let proof = circuit
-            .prove::<H>(witness, Options { blowup_log2 })
-            .unwrap();
-        circuit
-            .verify::<H>(&proof, Options { blowup_log2 })
-            .unwrap();
+        let proof = circuit.prove::<H>(witness, Options { blowup_log2 })?;
+        circuit.verify::<H>(&proof, Options { blowup_log2 })?;
+        Ok(())
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_2() {
-        test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1);
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_2() {
-        test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(1);
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(1).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_4() {
-        test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(2);
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(2).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_4() {
-        test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(2);
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(2).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_8() {
-        test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(3);
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(3).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_8() {
-        test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(3);
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(3).is_ok());
     }
 
     // TODO
