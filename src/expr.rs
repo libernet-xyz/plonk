@@ -1,13 +1,16 @@
 use starkom_bluesky::Scalar;
 use starkom_ff::{Field, PrimeField};
 use std::collections::BTreeMap;
+use std::fmt::{Debug, Display};
 use std::ops::{Add, BitXor, Div, Mul, Neg, Sub};
+
+type Polynomial = starkom_poly::Polynomial<Scalar>;
 
 /// Represents a PLONK constraint as a sum of monomials.
 ///
 /// Each monomial is in the form `coeff * var0^exp0 * var1^exp1 * ...`, where `coeff` is a constant
 /// scalar, the `var` variables are witness columns, and the `exp` variables are constant exponents.
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Constraint {
     /// The outer map represents the monomials in this constraint, while the inner maps represent
     /// the variables (ie. witness columns) in each monomial.
@@ -33,9 +36,9 @@ impl Constraint {
     ///
     /// The two monomials have the same layout as the inner maps of [`Self::monomials`]. Note that
     /// the coefficients are missing, they must be handled by the caller.
-    fn multiply_variables(
+    fn multiply_variables<I: IntoIterator<Item = (usize, isize)>>(
         lhs: BTreeMap<usize, isize>,
-        rhs: BTreeMap<usize, isize>,
+        rhs: I,
     ) -> BTreeMap<usize, isize> {
         let mut result = lhs;
         for (column_index, exponent) in rhs {
@@ -110,6 +113,51 @@ impl Constraint {
             .join(" + ")
     }
 
+    fn get_next_inverted_variable(&self) -> Option<(usize, isize)> {
+        for (variables, _) in &self.monomials {
+            for (&column_index, &exponent) in variables {
+                if exponent < 0 {
+                    return Some((column_index, exponent));
+                }
+            }
+        }
+        None
+    }
+
+    /// Normalizes the constraint to a form where all exponents are positive.
+    ///
+    /// For example, `x * y^-1 + y == 0` gets normalized to `x + y^2 == 0`.
+    ///
+    /// The normalized form is suitable for use with [`Self::compose`], which doesn't work with
+    /// negative exponents.
+    ///
+    /// WARNING: the normalized form is always more permissive than the original form because the
+    /// latter disallows 0 for any variables with negative exponents. Make sure your circuit is not
+    /// underconstrained because of that.
+    pub fn normalize(mut self) -> Self {
+        while let Some((column_index, exponent)) = self.get_next_inverted_variable() {
+            self.monomials = self
+                .monomials
+                .into_iter()
+                .map(|(variables, coefficient)| {
+                    (
+                        Self::multiply_variables(variables, [(column_index, -exponent)]),
+                        coefficient,
+                    )
+                })
+                .collect();
+        }
+        self
+    }
+
+    /// Indicates whether this constraint is in normal form as per [`Self::normalize`].
+    ///
+    /// Returns true iff all variables have positive exponents, false if there are negative
+    /// exponents.
+    pub fn is_normal(&self) -> bool {
+        self.get_next_inverted_variable().is_none()
+    }
+
     /// Evaluates the constraint using the provided variable substitution.
     ///
     /// The elements of the `substitution` array correspond to the witness column; the array assigns
@@ -126,8 +174,8 @@ impl Constraint {
     /// performance.
     pub fn evaluate(&self, substitution: &[Scalar]) -> Scalar {
         let mut result = Scalar::ZERO;
-        for (variables, coefficient) in &self.monomials {
-            let mut value = *coefficient;
+        for (variables, &coefficient) in &self.monomials {
+            let mut value = coefficient;
             if value == Scalar::ZERO {
                 continue;
             }
@@ -152,6 +200,48 @@ impl Constraint {
             result += value;
         }
         result
+    }
+
+    pub fn compose(&self, substitution: &[Polynomial]) -> Polynomial {
+        let mut result = Polynomial::default();
+        for (variables, &coefficient) in &self.monomials {
+            if coefficient == Scalar::ZERO {
+                continue;
+            }
+            let mut monomial = Polynomial::constant(coefficient);
+            for (&column_index, &exponent) in variables {
+                let variable = &substitution[column_index];
+                match exponent {
+                    0 => {}
+                    1 => {
+                        monomial *= variable.clone();
+                    }
+                    exponent => {
+                        assert!(
+                            exponent > 0,
+                            "the constraint must be normalized before composition"
+                        );
+                        for _ in 0..exponent {
+                            monomial *= variable.clone();
+                        }
+                    }
+                }
+            }
+            result += monomial;
+        }
+        result
+    }
+}
+
+impl Debug for Constraint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Constraint({})", self)
+    }
+}
+
+impl Display for Constraint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_string())
     }
 }
 
@@ -271,8 +361,12 @@ impl Mul for Constraint {
             if lhs_coefficient != Scalar::ZERO {
                 for (rhs_variables, &rhs_coefficient) in &rhs.monomials {
                     if rhs_coefficient != Scalar::ZERO {
-                        let variables =
-                            Self::multiply_variables(lhs_variables.clone(), rhs_variables.clone());
+                        let variables = Self::multiply_variables(
+                            lhs_variables.clone(),
+                            rhs_variables
+                                .iter()
+                                .map(|(&column_index, &exponent)| (column_index, exponent)),
+                        );
                         let coefficient = lhs_coefficient * rhs_coefficient;
                         match monomials.get_mut(&variables) {
                             Some(preexisting_coefficient) => {

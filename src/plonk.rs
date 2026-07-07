@@ -31,9 +31,15 @@ pub const NUM_BLINDING_ROWS: usize = 3;
 const COMMIT_INDEX_CIRCUIT: usize = 0;
 const COMMIT_INDEX_WITNESS: usize = 1;
 const COMMIT_INDEX_PERMUTATION_ARGUMENT: usize = 2;
-const COMMIT_INDEX_QUOTIENT: usize = 3;
 
-const NUM_COMMIT_INDICES: usize = 2; // TODO: update
+const COMMIT_INDEX_QUOTIENT: usize = 2; // TODO: update
+const NUM_COMMIT_INDICES: usize = 3; // TODO: update
+
+const FIAT_SHAMIR_INDEX_ALPHA: Scalar = Scalar::from_const(0);
+const FIAT_SHAMIR_INDEX_BETA: Scalar = Scalar::from_const(1);
+const FIAT_SHAMIR_INDEX_GAMMA: Scalar = Scalar::from_const(2);
+const FIAT_SHAMIR_INDEX_DELTA: Scalar = Scalar::from_const(3);
+const FIAT_SHAMIR_INDEX_XI: Scalar = Scalar::from_const(4);
 
 /// Domain separator tag used for the main Fiat-Shamir challenge.
 static DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/plonk/challenge"));
@@ -45,12 +51,37 @@ fn padded_size(mut n: usize) -> usize {
 
 /// Circuit compilation & proving options.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Options {
+pub struct CompilationOptions {
+    /// Normalizes all constraints using [`Constraint::normalize`].
+    ///
+    /// When disabled, proving errors out if there are negative exponents rather than attempting
+    /// normalization.
+    ///
+    /// Normalization is carried out inside [`CircuitBuilder::build`].
+    ///
+    /// WARNING: normalized constraints may be more permissive than their original form because a
+    /// negative exponent requires the variable to be different from zero. Starkom does not allow
+    /// proving with negative exponents, so enable this flag only if your circuit is correctly
+    /// constrained even when those variables are zero.
+    pub normalize_constraints: bool,
+}
+
+impl Default for CompilationOptions {
+    fn default() -> Self {
+        Self {
+            normalize_constraints: false,
+        }
+    }
+}
+
+/// Circuit compilation & proving options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvingOptions {
     /// Log2 of the blowup factor used to compute the low-degree extensions for the underlying PCS.
     pub blowup_log2: usize,
 }
 
-impl Default for Options {
+impl Default for ProvingOptions {
     fn default() -> Self {
         Self {
             blowup_log2: OPTIONS_DEFAULT_BLOWUP_LOG2,
@@ -125,26 +156,36 @@ impl CircuitBuilder {
     }
 
     /// Compiles the circuit built so far into a [`Circuit`] object.
-    pub fn build(self) -> Circuit {
+    pub fn build(self, options: CompilationOptions) -> Result<Circuit> {
         let degree_bound = padded_size(self.num_rows);
-        Circuit {
+
+        let gates = self
+            .gates
+            .into_iter()
+            .map(|(mut constraint, rows)| {
+                if !constraint.is_normal() {
+                    if options.normalize_constraints {
+                        constraint = constraint.normalize();
+                    } else {
+                        return Err(anyhow!("constraint `{}` is not in normal form", constraint));
+                    }
+                }
+                let mut data = vec![Scalar::ZERO; degree_bound];
+                for row in rows {
+                    data[row] = Scalar::ONE;
+                }
+                Ok((constraint, Polynomial::encode2(data)))
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(Circuit {
             num_rows: self.num_rows,
             degree_bound,
             num_columns: self.num_columns,
-            gates: self
-                .gates
-                .into_iter()
-                .map(|(constraint, rows)| {
-                    let mut data = vec![Scalar::ZERO; degree_bound];
-                    for row in rows {
-                        data[row] = Scalar::ONE;
-                    }
-                    (constraint, Polynomial::encode2(data))
-                })
-                .collect(),
+            gates,
             sigma: vec![], // TODO
             public_gates: self.public_gates,
-        }
+        })
     }
 }
 
@@ -282,7 +323,7 @@ impl Circuit {
     pub fn prove<H: Hash<Scalar>>(
         &self,
         mut witness: Witness,
-        options: Options,
+        options: ProvingOptions,
     ) -> Result<Proof<H>> {
         witness.blind();
         if witness.degree_bound() != self.degree_bound {
@@ -308,14 +349,33 @@ impl Circuit {
             .map(|data| Polynomial::encode2(data))
             .collect();
 
-        committer.add_batch(columns);
+        committer.add_batch(columns.clone());
+
+        let gate_constraint = {
+            let delta = H::hash_two(
+                *DST,
+                committer.root_hash(COMMIT_INDEX_WITNESS),
+                FIAT_SHAMIR_INDEX_DELTA,
+            );
+            let mut gate_constraint = Polynomial::default();
+            let mut pow = Scalar::ONE;
+            for (constraint, selector) in &self.gates {
+                gate_constraint += selector.clone() * constraint.compose(columns.as_slice()) * pow;
+                pow *= delta;
+            }
+            gate_constraint
+        };
 
         // TODO: prove wire constraints.
 
+        let quotient = gate_constraint.divide_by_zero(self.degree_bound)?;
+
+        committer.add_batch(vec![gate_constraint, quotient]);
+
         let xi = H::hash_two(
             *DST,
-            committer.root_hash(COMMIT_INDEX_WITNESS), // TODO: change this to COMMIT_INDEX_QUOTIENT
-            Scalar::ZERO,
+            committer.root_hash(COMMIT_INDEX_QUOTIENT),
+            FIAT_SHAMIR_INDEX_XI,
         );
 
         let omega = Polynomial::domain_element2(1, self.degree_bound);
@@ -333,7 +393,7 @@ impl Circuit {
         })
     }
 
-    pub fn to_compressed<H: Hash<Scalar>>(self, options: Options) -> CompressedCircuit<H> {
+    pub fn to_compressed<H: Hash<Scalar>>(self, options: ProvingOptions) -> CompressedCircuit<H> {
         let (gates, selectors) = self.gates.into_iter().unzip();
         let committer = pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, selectors);
         CompressedCircuit {
@@ -348,7 +408,7 @@ impl Circuit {
         }
     }
 
-    pub fn as_compressed<H: Hash<Scalar>>(&self, options: Options) -> CompressedCircuit<H> {
+    pub fn as_compressed<H: Hash<Scalar>>(&self, options: ProvingOptions) -> CompressedCircuit<H> {
         let (gates, selectors) = self
             .gates
             .iter()
@@ -367,7 +427,7 @@ impl Circuit {
         }
     }
 
-    pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>, options: Options) -> Result<()> {
+    pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>, options: ProvingOptions) -> Result<()> {
         self.as_compressed::<H>(options).verify(proof)
     }
 }
@@ -392,7 +452,7 @@ pub struct CompressedCircuit<H: Hash<Scalar>> {
 
     /// Proving options used to commit to this circuit (in [`Circuit::as_compressed`] or
     /// [`Circuit::to_compressed`]).
-    options: Options,
+    options: ProvingOptions,
 
     /// Gates used in the original circuit.
     gates: Vec<Constraint>,
@@ -466,19 +526,19 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
 
         let xi = H::hash_two(
             *DST,
-            commitment.tree_roots()[COMMIT_INDEX_WITNESS], // TODO: change this to COMMIT_INDEX_QUOTIENT
-            Scalar::ZERO,
+            commitment.tree_roots()[COMMIT_INDEX_QUOTIENT],
+            FIAT_SHAMIR_INDEX_XI,
         );
 
         let points = inner_proof.points();
         if !points.contains_key(&xi) {
             return Err(anyhow!(
-                "the proof doesn't have an opening for the Fiat-Shamir challenge value"
+                "the proof doesn't have an opening for the main Fiat-Shamir challenge"
             ));
         }
         if !points.contains_key(&(xi * omega)) {
             return Err(anyhow!(
-                "the proof doesn't have an opening for the shifted Fiat-Shamir challenge value"
+                "the proof doesn't have an opening for the shifted Fiat-Shamir challenge"
             ));
         }
         for &gate in &self.public_gates {
@@ -532,6 +592,8 @@ mod tests {
         Wire::new(row, column)
     }
 
+    // This function tests the circuit from Vitalik's PLONK tutorial,
+    // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
     fn test_vitalik_circuit_impl<H: Hash<Scalar>>(blowup_log2: usize) -> Result<()> {
         let mut builder = CircuitBuilder::default();
         let r0 = builder.var(0);
@@ -544,7 +606,9 @@ mod tests {
         let nop = builder.add_gate(Constraint::default());
         builder.connect(wire(result, 2), wire(nop, 0));
         builder.declare_public_gates([nop]);
-        let circuit = builder.build();
+        let circuit = builder.build(CompilationOptions {
+            normalize_constraints: false,
+        })?;
         assert_eq!(circuit.num_rows(), 3);
         assert_eq!(circuit.degree_bound(), 8);
         assert_eq!(circuit.num_columns(), 3);
@@ -556,13 +620,14 @@ mod tests {
         witness.copy(wire(square, 1), wire(result, 1));
         witness.set(wire(result, 2), x.cube() + x + from_const(5));
         witness.copy(wire(result, 2), wire(nop, 0));
-        let proof = circuit.prove::<H>(witness, Options { blowup_log2 })?;
-        circuit.verify::<H>(&proof, Options { blowup_log2 })?;
+        let proof = circuit.prove::<H>(witness, ProvingOptions { blowup_log2 })?;
+        circuit.verify::<H>(&proof, ProvingOptions { blowup_log2 })?;
         Ok(())
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_2() {
+        test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).unwrap();
         assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).is_ok());
     }
 
