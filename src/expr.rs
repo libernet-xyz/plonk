@@ -158,6 +158,27 @@ impl Constraint {
         self.get_next_inverted_variable().is_none()
     }
 
+    /// Calculates the degree of the constraint.
+    ///
+    /// REQUIRES: the constraint must be in [normal form](`Self::normalize`).
+    pub fn get_degree(&self) -> usize {
+        let mut degree = 0;
+        for (variables, &coefficient) in &self.monomials {
+            assert_ne!(coefficient, Scalar::ZERO);
+            degree = std::cmp::max(
+                degree,
+                variables
+                    .iter()
+                    .map(|(_, &exponent)| {
+                        assert!(exponent > 0, "the constraint is not in normal form");
+                        exponent as usize
+                    })
+                    .sum(),
+            );
+        }
+        degree
+    }
+
     /// Evaluates the constraint using the provided variable substitution.
     ///
     /// The elements of the `substitution` array correspond to the witness column; the array assigns

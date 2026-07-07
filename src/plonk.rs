@@ -318,6 +318,40 @@ impl Circuit {
         }
     }
 
+    /// Calculates the degree bound of the PLONK quotient, typically much higher than
+    /// [`Self::degree_bound()`] because the constraint equations involve several polynomial
+    /// multiplications such as the gate selectors by the gate constraints combined with the witness
+    /// columns.
+    ///
+    /// This function is used to calculate exactly how many chunks the quotient needs to be split
+    /// into before getting committed.
+    ///
+    /// The algorithm assumes that all gate selectors have degree<N, where N is the general
+    /// [degree bound](`Self::degree_bound`) of the circuit.
+    fn get_quotient_degree_bound(&self) -> usize {
+        (self.degree_bound - 1)
+            * (1 + self
+                .gates
+                .iter()
+                .map(|(constraint, _)| constraint.get_degree())
+                .max()
+                .unwrap_or(0))
+            + 1
+    }
+
+    /// Splits the quotient polynomial in chunks so that it can be batch-committed even if its
+    /// degree is much higher than the bound configured in the underlying PCS.
+    fn split_quotient(&self, quotient: Polynomial) -> Vec<Polynomial> {
+        let degree_bound = self.get_quotient_degree_bound();
+        let mut coefficients = quotient.take();
+        assert!(coefficients.len() <= degree_bound);
+        coefficients.resize(degree_bound, Scalar::ZERO);
+        coefficients
+            .chunks(self.degree_bound)
+            .map(|coefficients| Polynomial::with_coefficients(coefficients.to_vec()))
+            .collect()
+    }
+
     /// Proves correctness for the given witness, or returns an error in case of a constraint
     /// violation.
     pub fn prove<H: Hash<Scalar>>(
@@ -369,8 +403,7 @@ impl Circuit {
         // TODO: prove wire constraints.
 
         let quotient = gate_constraint.divide_by_zero(self.degree_bound)?;
-
-        committer.add_batch(vec![quotient]);
+        committer.add_batch(self.split_quotient(quotient));
 
         let xi = H::hash_two(
             *DST,
@@ -479,6 +512,18 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         self.num_columns
     }
 
+    /// Calculates the number of chunks the quotient was split into.
+    ///
+    /// See [`Circuit::get_quotient_degree_bound`] for details.
+    fn get_num_quotient_chunks(&self) -> usize {
+        1 + self
+            .gates
+            .iter()
+            .map(|constraint| constraint.get_degree())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn verify(&self, proof: &Proof<H>) -> Result<()> {
         let commitment = &proof.commitment;
         let inner_proof = &proof.inner_proof;
@@ -513,7 +558,8 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             ));
         }
 
-        let expected_polynomials = self.gates.len() + self.num_columns;
+        let num_quotient_chunks = self.get_num_quotient_chunks();
+        let expected_polynomials = self.gates.len() + self.num_columns + num_quotient_chunks;
         if inner_proof.num_polys() != expected_polynomials {
             return Err(anyhow!(
                 "incorrect number of committed polynomials (got {}, want {})",
@@ -560,8 +606,9 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             .collect();
 
         let constraints: Vec<Scalar> = {
+            let offset = self.gates.len();
             let variables: Vec<Scalar> = (0..self.num_columns)
-                .map(|i| points[&xi][selectors.len() + i])
+                .map(|i| points[&xi][offset + i])
                 .collect();
             self.gates
                 .iter()
@@ -575,7 +622,18 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             .map(|(selector, constraint)| selector * constraint)
             .sum::<Scalar>();
 
-        // TODO
+        // TODO: recover wire constraints when they're available.
+
+        let quotient: Scalar = {
+            let offset = self.gates.len() + self.num_columns;
+            (0..num_quotient_chunks)
+                .map(|i| points[&xi][offset + i] * xi.pow_small(i * self.degree_bound))
+                .sum()
+        };
+        let zero = xi.pow_small(self.degree_bound) - Scalar::ONE;
+        if gate_constraint != quotient * zero {
+            return Err(anyhow!("constraint violation"));
+        }
 
         Ok(())
     }
