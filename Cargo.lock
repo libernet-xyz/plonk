@@ -536,9 +536,9 @@ dependencies = [
 
 [[package]]
 name = "starkom-pcs"
-version = "2.0.1"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38d4d6f2fa400d99d61435161ea1077cdd46e18b57707c3e01087ece2d2ce5f8"
+checksum = "c4548eafc600d616167e128c03128000d3651b4060ff43db656c9d56c98ba6d5"
 dependencies = [
  "anyhow",
  "primitive-types",

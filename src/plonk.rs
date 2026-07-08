@@ -299,7 +299,7 @@ impl IndexMut<Wire> for Witness {
 /// The API in the implementation mostly mirrors that of the underlying PCS proof.
 #[derive(Debug, Clone)]
 pub struct Proof<H: Hash<Scalar>> {
-    commitment: pcs::Commitment,
+    commitment: pcs::Commitment<H>,
     inner_proof: pcs::Proof<H>,
 }
 
@@ -445,11 +445,7 @@ impl Circuit {
         committer.add_batch(columns.clone());
 
         let gate_constraint = {
-            let delta = H::hash_two(
-                *DST,
-                committer.root_hash(COMMIT_INDEX_WITNESS),
-                FIAT_SHAMIR_INDEX_DELTA,
-            );
+            let delta = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_DELTA);
             let mut gate_constraint = Polynomial::default();
             let mut pow = Scalar::ONE;
             for (constraint, selector) in &self.gates {
@@ -464,11 +460,7 @@ impl Circuit {
         let quotient = gate_constraint.divide_by_zero(self.degree_bound)?;
         committer.add_batch(self.split_quotient(quotient));
 
-        let xi = H::hash_two(
-            *DST,
-            committer.root_hash(COMMIT_INDEX_QUOTIENT),
-            FIAT_SHAMIR_INDEX_XI,
-        );
+        let xi = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_XI);
 
         let omega = Polynomial::domain_element2(1, self.degree_bound);
 
@@ -646,7 +638,7 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
 
         let xi = H::hash_two(
             *DST,
-            commitment.tree_roots()[COMMIT_INDEX_QUOTIENT],
+            commitment.transcript_hash(COMMIT_INDEX_QUOTIENT + 1),
             FIAT_SHAMIR_INDEX_XI,
         );
 
@@ -692,7 +684,7 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
 
             let delta = H::hash_two(
                 *DST,
-                commitment.tree_roots()[COMMIT_INDEX_WITNESS],
+                commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
                 FIAT_SHAMIR_INDEX_DELTA,
             );
             let mut result = Scalar::ZERO;
