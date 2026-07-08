@@ -264,10 +264,38 @@ impl IndexMut<Wire> for Witness {
     }
 }
 
+/// A PLONK proof.
+///
+/// The API in the implementation mostly mirrors that of the underlying PCS proof.
 #[derive(Debug, Clone)]
 pub struct Proof<H: Hash<Scalar>> {
     commitment: pcs::Commitment,
     inner_proof: pcs::Proof<H>,
+}
+
+impl<H: Hash<Scalar>> Proof<H> {
+    /// Returns the proven degree bound.
+    pub fn degree_bound(&self) -> usize {
+        self.inner_proof.degree_bound()
+    }
+
+    /// Returns the base-2 logarithm of the blowup factor used in the proof.
+    pub fn blowup_log2(&self) -> usize {
+        self.inner_proof.blowup_log2()
+    }
+
+    /// Returns the size of the extended evaluation domain.
+    pub fn extended_domain_size(&self) -> usize {
+        self.inner_proof.extended_domain_size()
+    }
+
+    /// Returns the number of committed polynomials.
+    ///
+    /// These include the circuit selectors and sigma polynomials, the witness columns, and the
+    /// chunks of the grand quotient.
+    pub fn num_polys(&self) -> usize {
+        self.inner_proof.num_polys()
+    }
 }
 
 /// A PLONK circuit.
@@ -688,13 +716,18 @@ mod tests {
         witness.set(wire(result, 2), x.cube() + x + from_const(5));
         witness.copy(wire(result, 2), wire(nop, 0));
         let proof = circuit.prove::<H>(witness, ProvingOptions { blowup_log2 })?;
+        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(
+            proof.extended_domain_size(),
+            circuit.degree_bound() << blowup_log2
+        );
         circuit.verify::<H>(&proof, ProvingOptions { blowup_log2 })?;
         Ok(())
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_2() {
-        test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).unwrap();
         assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).is_ok());
     }
 
