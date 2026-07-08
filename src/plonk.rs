@@ -32,9 +32,8 @@ pub const NUM_BLINDING_ROWS: usize = 3;
 const COMMIT_INDEX_CIRCUIT: usize = 0;
 const COMMIT_INDEX_WITNESS: usize = 1;
 const COMMIT_INDEX_PERMUTATION_ARGUMENT: usize = 2;
-
-const COMMIT_INDEX_QUOTIENT: usize = 2; // TODO: update
-const NUM_COMMIT_INDICES: usize = 3; // TODO: update
+const COMMIT_INDEX_QUOTIENT: usize = 3;
+const NUM_COMMIT_INDICES: usize = 4;
 
 const FIAT_SHAMIR_INDEX_ALPHA: Scalar = Scalar::from_const(0);
 const FIAT_SHAMIR_INDEX_BETA: Scalar = Scalar::from_const(1);
@@ -179,7 +178,7 @@ impl CircuitBuilder {
             })
             .collect::<Result<_>>()?;
 
-        let sigma = {
+        let sigma_values: Vec<Vec<Scalar>> = {
             let mut sigma = vec![Scalar::ZERO; degree_bound * self.num_columns];
             let omega = Polynomial::domain_element2(1, degree_bound);
             let mut k = Scalar::ONE;
@@ -204,9 +203,14 @@ impl CircuitBuilder {
             }
             sigma
                 .chunks_exact(degree_bound)
-                .map(|chunk| Polynomial::encode2(chunk.to_vec()))
+                .map(|chunk| chunk.to_vec())
                 .collect()
         };
+
+        let sigma = sigma_values
+            .iter()
+            .map(|chunk| Polynomial::encode2(chunk.to_vec()))
+            .collect();
 
         Ok(Circuit {
             num_rows: self.num_rows,
@@ -214,6 +218,7 @@ impl CircuitBuilder {
             num_columns: self.num_columns,
             gates,
             sigma,
+            sigma_values,
             public_gates: self.public_gates,
         })
     }
@@ -351,6 +356,11 @@ pub struct Circuit {
     /// Sigma polynomials of the permutation argument, one for every witness column.
     sigma: Vec<Polynomial>,
 
+    /// The [sigma polynomials](`Self::sigma`) expressed on the value domain.
+    ///
+    /// The layout is analogous to [`Self::sigma`] itself: the values are indexed column-first.
+    sigma_values: Vec<Vec<Scalar>>,
+
     /// List of gates that are revealed in the proofs. Each element is a row index.
     public_gates: BTreeSet<usize>,
 }
@@ -374,6 +384,74 @@ impl Circuit {
             num_rows: self.num_rows,
             data: vec![vec![Scalar::ZERO; self.degree_bound]; self.num_columns],
         }
+    }
+
+    /// Builds the three polynomials used in the permutation argument. The components of the
+    /// returned tuple are, respectively: the coordinate pair accumulator, the fixpoint constraint,
+    /// and the recurrence constraint.
+    fn build_permutation_argument(
+        &self,
+        witness: &Witness,
+        columns: &[Polynomial],
+        beta: Scalar,
+        gamma: Scalar,
+    ) -> Result<(Polynomial, Polynomial, Polynomial)> {
+        let omega = Polynomial::domain_element2(1, self.degree_bound);
+
+        let accumulator = {
+            let mut accumulator = vec![Scalar::ZERO; self.degree_bound + 1];
+
+            accumulator[0] = Scalar::ONE;
+            for i in 0..self.degree_bound {
+                let mut omega_pow = Scalar::ONE;
+                let mut generator_pow = Scalar::ONE;
+                accumulator[i + 1] = accumulator[i];
+                for j in 0..self.num_columns {
+                    accumulator[i + 1] *=
+                        witness.data[j][i] + beta * generator_pow * omega_pow + gamma;
+                    accumulator[i + 1] *=
+                        (witness.data[j][i] + beta * self.sigma_values[j][i] + gamma)
+                            .invert_unwrap();
+                    omega_pow *= omega;
+                    generator_pow *= Scalar::MULTIPLICATIVE_GENERATOR;
+                }
+            }
+
+            if accumulator.pop().unwrap() != Scalar::ONE {
+                return Err(anyhow!("permutation accumulator wraparound check failed"));
+            }
+
+            Polynomial::encode2(accumulator)
+        };
+
+        let shifted = {
+            let mut coefficients = accumulator.clone().take();
+            let mut x = Scalar::ONE;
+            for coefficient in coefficients.iter_mut() {
+                *coefficient *= x;
+                x *= omega;
+            }
+            Polynomial::with_coefficients(coefficients)
+        };
+
+        let recurrence_constraint = {
+            let mut lhs = shifted;
+            for (column, sigma) in columns.iter().zip(self.sigma.iter()) {
+                lhs *= column.clone() + sigma.clone() * beta + gamma;
+            }
+            let mut rhs = accumulator.clone();
+            let mut pow = Scalar::ONE;
+            for column in columns {
+                rhs *= column.clone() + Polynomial::with_coefficients(vec![gamma, beta * pow]);
+                pow *= omega;
+            }
+            lhs - rhs
+        };
+
+        let fixpoint_constraint =
+            (accumulator.clone() - Scalar::ONE) * Polynomial::lagrange0(self.degree_bound).clone();
+
+        Ok((accumulator, fixpoint_constraint, recurrence_constraint))
     }
 
     /// Calculates the degree bound of the PLONK quotient, typically much higher than
@@ -438,8 +516,8 @@ impl Circuit {
 
         let columns: Vec<Polynomial> = witness
             .data
-            .into_iter()
-            .map(|data| Polynomial::encode2(data))
+            .iter()
+            .map(|data| Polynomial::encode2(data.clone()))
             .collect();
 
         committer.add_batch(columns.clone());
@@ -455,9 +533,23 @@ impl Circuit {
             gate_constraint
         };
 
-        // TODO: prove wire constraints.
+        let (
+            permutation_accumulator,
+            permutation_fixpoint_constraint,
+            permutation_recurrence_constraint,
+        ) = {
+            let beta = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_BETA);
+            let gamma = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_GAMMA);
+            self.build_permutation_argument(&witness, columns.as_slice(), beta, gamma)?
+        };
+        committer.add_batch(vec![permutation_accumulator]);
 
-        let quotient = gate_constraint.divide_by_zero(self.degree_bound)?;
+        let alpha = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_ALPHA);
+
+        let quotient = (gate_constraint
+            + permutation_fixpoint_constraint * alpha
+            + permutation_recurrence_constraint * alpha.square())
+        .divide_by_zero(self.degree_bound)?;
         committer.add_batch(self.split_quotient(quotient));
 
         let xi = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_XI);
@@ -585,6 +677,11 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             .unwrap_or(0)
     }
 
+    fn lagrange0(x: Scalar, n: usize) -> Scalar {
+        (x.pow_small(n) - Scalar::ONE)
+            * (Scalar::from(n as u64) * (x - Scalar::ONE)).invert_unwrap()
+    }
+
     pub fn verify(&self, proof: &Proof<H>) -> Result<()> {
         let commitment = &proof.commitment;
         let inner_proof = &proof.inner_proof;
@@ -622,9 +719,13 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         let num_gate_selectors = self.gates.len();
         let num_sigma_polynomials = self.num_columns;
         let num_witness_columns = self.num_columns;
+        let num_permutation_accumulator_polynomial = 1usize;
         let num_quotient_chunks = self.get_num_quotient_chunks();
-        let expected_polynomials =
-            num_gate_selectors + num_sigma_polynomials + num_witness_columns + num_quotient_chunks;
+        let expected_polynomials = num_gate_selectors
+            + num_sigma_polynomials
+            + num_witness_columns
+            + num_permutation_accumulator_polynomial
+            + num_quotient_chunks;
 
         if inner_proof.num_polys() != expected_polynomials {
             return Err(anyhow!(
@@ -664,6 +765,19 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
 
         inner_proof.verify(&commitment)?;
 
+        let sigma: Vec<Scalar> = {
+            let offset = num_gate_selectors;
+            (0..self.num_columns)
+                .map(|i| points[&xi][offset + i])
+                .collect()
+        };
+        let variables: Vec<Scalar> = {
+            let offset = num_gate_selectors + num_sigma_polynomials;
+            (0..self.num_columns)
+                .map(|i| points[&xi][offset + i])
+                .collect()
+        };
+
         let gate_constraint: Scalar = {
             let selectors: Vec<Scalar> = self
                 .gates
@@ -671,17 +785,11 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
                 .enumerate()
                 .map(|(i, _)| points[&xi][i])
                 .collect();
-            let constraints: Vec<Scalar> = {
-                let offset = num_gate_selectors + num_sigma_polynomials;
-                let variables: Vec<Scalar> = (0..self.num_columns)
-                    .map(|i| points[&xi][offset + i])
-                    .collect();
-                self.gates
-                    .iter()
-                    .map(|constraint| constraint.evaluate(variables.as_slice()))
-                    .collect()
-            };
-
+            let constraints: Vec<Scalar> = self
+                .gates
+                .iter()
+                .map(|constraint| constraint.evaluate(variables.as_slice()))
+                .collect();
             let delta = H::hash_two(
                 *DST,
                 commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
@@ -696,16 +804,61 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             result
         };
 
-        // TODO: recover wire constraints when they're available.
+        let (permutation_accumulator, shifted_permutation_accumulator) = {
+            let offset = num_gate_selectors + num_sigma_polynomials + num_witness_columns;
+            (points[&xi][offset], points[&(xi * omega)][offset])
+        };
+
+        let beta = H::hash_two(
+            *DST,
+            commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
+            FIAT_SHAMIR_INDEX_BETA,
+        );
+        let gamma = H::hash_two(
+            *DST,
+            commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
+            FIAT_SHAMIR_INDEX_GAMMA,
+        );
+
+        let (permutation_numerator, permutation_denominator) = {
+            let mut numerator = Scalar::ONE;
+            let mut denominator = Scalar::ONE;
+            let mut generator_pow = Scalar::ONE;
+            for (&variable, &sigma) in variables.iter().zip(sigma.iter()) {
+                numerator *= variable + beta * generator_pow * xi + gamma;
+                denominator *= variable + beta * sigma + gamma;
+                generator_pow *= Scalar::MULTIPLICATIVE_GENERATOR;
+            }
+            (numerator, denominator)
+        };
 
         let quotient: Scalar = {
-            let offset = num_gate_selectors + num_sigma_polynomials + num_witness_columns;
+            let offset = num_gate_selectors
+                + num_sigma_polynomials
+                + num_witness_columns
+                + num_permutation_accumulator_polynomial;
             (0..num_quotient_chunks)
                 .map(|i| points[&xi][offset + i] * xi.pow_small(i * self.degree_bound))
                 .sum()
         };
         let zero = xi.pow_small(self.degree_bound) - Scalar::ONE;
-        if gate_constraint != quotient * zero {
+
+        let alpha = H::hash_two(
+            *DST,
+            commitment.transcript_hash(COMMIT_INDEX_PERMUTATION_ARGUMENT + 1),
+            FIAT_SHAMIR_INDEX_ALPHA,
+        );
+
+        let permutation_recurrence_constraint = shifted_permutation_accumulator
+            * permutation_denominator
+            - permutation_accumulator * permutation_numerator;
+        let permutation_fixpoint_constraint = (permutation_accumulator - Scalar::from_const(1))
+            * Self::lagrange0(xi, self.degree_bound);
+
+        let full_constraint = gate_constraint
+            + alpha * permutation_fixpoint_constraint
+            + alpha.square() * permutation_recurrence_constraint;
+        if full_constraint != quotient * zero {
             return Err(anyhow!("constraint violation"));
         }
 
