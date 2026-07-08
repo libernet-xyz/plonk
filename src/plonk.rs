@@ -402,8 +402,8 @@ impl Circuit {
             let mut accumulator = vec![Scalar::ZERO; self.degree_bound + 1];
 
             accumulator[0] = Scalar::ONE;
+            let mut omega_pow = Scalar::ONE;
             for i in 0..self.degree_bound {
-                let mut omega_pow = Scalar::ONE;
                 let mut generator_pow = Scalar::ONE;
                 accumulator[i + 1] = accumulator[i];
                 for j in 0..self.num_columns {
@@ -412,9 +412,9 @@ impl Circuit {
                     accumulator[i + 1] *=
                         (witness.data[j][i] + beta * self.sigma_values[j][i] + gamma)
                             .invert_unwrap();
-                    omega_pow *= omega;
                     generator_pow *= Scalar::MULTIPLICATIVE_GENERATOR;
                 }
+                omega_pow *= omega;
             }
 
             if accumulator.pop().unwrap() != Scalar::ONE {
@@ -443,7 +443,7 @@ impl Circuit {
             let mut pow = Scalar::ONE;
             for column in columns {
                 rhs *= column.clone() + Polynomial::with_coefficients(vec![gamma, beta * pow]);
-                pow *= omega;
+                pow *= Scalar::MULTIPLICATIVE_GENERATOR;
             }
             lhs - rhs
         };
