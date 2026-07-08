@@ -4,6 +4,7 @@ use crate::wires::{Wire, WirePartitioner};
 use anyhow::{Result, anyhow};
 use starkom_bluesky::Scalar;
 use starkom_ff::Field;
+use starkom_ff::PrimeField;
 use starkom_pcs::{self as pcs, hash::Hash};
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
@@ -178,12 +179,41 @@ impl CircuitBuilder {
             })
             .collect::<Result<_>>()?;
 
+        let sigma = {
+            let mut sigma = vec![Scalar::ZERO; degree_bound * self.num_columns];
+            let omega = Polynomial::domain_element2(1, degree_bound);
+            let mut k = Scalar::ONE;
+            for i in 0..self.num_columns {
+                let offset = i * degree_bound;
+                sigma[offset] = k;
+                for j in 1..degree_bound {
+                    sigma[offset + j] = sigma[offset + j - 1] * omega;
+                }
+                k *= Scalar::MULTIPLICATIVE_GENERATOR;
+            }
+            for node in self.wires.iter_nodes() {
+                let indices: Vec<usize> = node
+                    .iter()
+                    .map(|wire| wire.column() * degree_bound + wire.row())
+                    .collect();
+                let mut permuted: Vec<Scalar> = indices.iter().map(|&i| sigma[i]).collect();
+                permuted.rotate_left(1);
+                for i in 0..indices.len() {
+                    sigma[indices[i]] = permuted[i];
+                }
+            }
+            sigma
+                .chunks_exact(degree_bound)
+                .map(|chunk| Polynomial::encode2(chunk.to_vec()))
+                .collect()
+        };
+
         Ok(Circuit {
             num_rows: self.num_rows,
             degree_bound,
             num_columns: self.num_columns,
             gates,
-            sigma: vec![], // TODO
+            sigma,
             public_gates: self.public_gates,
         })
     }
@@ -396,14 +426,15 @@ impl Circuit {
             ));
         }
 
-        let selectors = self
+        let circuit_polynomials = self
             .gates
             .iter()
             .map(|(_, selector)| selector.clone())
+            .chain(self.sigma.iter().cloned())
             .collect();
 
         let mut committer =
-            pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, selectors);
+            pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, circuit_polynomials);
 
         let columns: Vec<Polynomial> = witness
             .data
@@ -455,8 +486,13 @@ impl Circuit {
     }
 
     pub fn to_compressed<H: Hash<Scalar>>(self, options: ProvingOptions) -> CompressedCircuit<H> {
-        let (gates, selectors) = self.gates.into_iter().unzip();
-        let committer = pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, selectors);
+        let (gates, selectors): (Vec<Constraint>, Vec<Polynomial>) = self.gates.into_iter().unzip();
+        let sigma = self.sigma;
+        let committer = pcs::Committer::<H>::new(
+            self.degree_bound,
+            options.blowup_log2,
+            selectors.into_iter().chain(sigma.into_iter()).collect(),
+        );
         CompressedCircuit {
             num_rows: self.num_rows,
             degree_bound: self.degree_bound,
@@ -470,12 +506,17 @@ impl Circuit {
     }
 
     pub fn as_compressed<H: Hash<Scalar>>(&self, options: ProvingOptions) -> CompressedCircuit<H> {
-        let (gates, selectors) = self
+        let (gates, selectors): (Vec<Constraint>, Vec<Polynomial>) = self
             .gates
             .iter()
             .map(|(constraint, selector)| (constraint.clone(), selector.clone()))
             .unzip();
-        let committer = pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, selectors);
+        let sigma = self.sigma.clone();
+        let committer = pcs::Committer::<H>::new(
+            self.degree_bound,
+            options.blowup_log2,
+            selectors.into_iter().chain(sigma.into_iter()).collect(),
+        );
         CompressedCircuit {
             num_rows: self.num_rows,
             degree_bound: self.degree_bound,
@@ -586,8 +627,13 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             ));
         }
 
+        let num_gate_selectors = self.gates.len();
+        let num_sigma_polynomials = self.num_columns;
+        let num_witness_columns = self.num_columns;
         let num_quotient_chunks = self.get_num_quotient_chunks();
-        let expected_polynomials = self.gates.len() + self.num_columns + num_quotient_chunks;
+        let expected_polynomials =
+            num_gate_selectors + num_sigma_polynomials + num_witness_columns + num_quotient_chunks;
+
         if inner_proof.num_polys() != expected_polynomials {
             return Err(anyhow!(
                 "incorrect number of committed polynomials (got {}, want {})",
@@ -626,25 +672,24 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
 
         inner_proof.verify(&commitment)?;
 
-        let selectors: Vec<Scalar> = self
-            .gates
-            .iter()
-            .enumerate()
-            .map(|(i, _)| points[&xi][i])
-            .collect();
-
-        let constraints: Vec<Scalar> = {
-            let offset = self.gates.len();
-            let variables: Vec<Scalar> = (0..self.num_columns)
-                .map(|i| points[&xi][offset + i])
-                .collect();
-            self.gates
-                .iter()
-                .map(|constraint| constraint.evaluate(variables.as_slice()))
-                .collect()
-        };
-
         let gate_constraint: Scalar = {
+            let selectors: Vec<Scalar> = self
+                .gates
+                .iter()
+                .enumerate()
+                .map(|(i, _)| points[&xi][i])
+                .collect();
+            let constraints: Vec<Scalar> = {
+                let offset = num_gate_selectors + num_sigma_polynomials;
+                let variables: Vec<Scalar> = (0..self.num_columns)
+                    .map(|i| points[&xi][offset + i])
+                    .collect();
+                self.gates
+                    .iter()
+                    .map(|constraint| constraint.evaluate(variables.as_slice()))
+                    .collect()
+            };
+
             let delta = H::hash_two(
                 *DST,
                 commitment.tree_roots()[COMMIT_INDEX_WITNESS],
@@ -662,7 +707,7 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         // TODO: recover wire constraints when they're available.
 
         let quotient: Scalar = {
-            let offset = self.gates.len() + self.num_columns;
+            let offset = num_gate_selectors + num_sigma_polynomials + num_witness_columns;
             (0..num_quotient_chunks)
                 .map(|i| points[&xi][offset + i] * xi.pow_small(i * self.degree_bound))
                 .sum()
@@ -728,6 +773,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_2() {
+        test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).unwrap();
         assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).is_ok());
     }
 
