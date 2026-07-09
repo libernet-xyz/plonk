@@ -526,7 +526,10 @@ impl MulAssign for Constraint {
                 }
             }
         }
-        self.monomials = monomials;
+        self.monomials = monomials
+            .into_iter()
+            .filter(|(_, coefficient)| *coefficient != Scalar::ZERO)
+            .collect();
     }
 }
 
@@ -943,6 +946,376 @@ mod tests {
             from_const(134)
         );
         assert_eq!(constraint.to_string(), "w0 + w1");
+    }
+
+    #[test]
+    fn test_sub_1() {
+        let constraint = make_var(0) - make_var(1);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            -from_const(22)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            from_const(22)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            -from_const(22)
+        );
+        assert_eq!(constraint.to_string(), "w0 + -1 * w1");
+    }
+
+    #[test]
+    fn test_sub_2() {
+        let constraint = make_var(1) - make_var(0);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            from_const(22)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            -from_const(22)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            from_const(22)
+        );
+        assert_eq!(constraint.to_string(), "-1 * w0 + w1");
+    }
+
+    #[test]
+    fn test_sub_3() {
+        let constraint = make_var(1) - make_var(2);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34), from_const(56)]),
+            -from_const(22)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(56), from_const(34)]),
+            from_const(22)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(56), from_const(12)]),
+            from_const(44)
+        );
+        assert_eq!(constraint.to_string(), "w1 + -1 * w2");
+    }
+
+    #[test]
+    fn test_another_sub() {
+        let constraint = make_var(0) - make_var(1) - make_var(2);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34), from_const(56)]),
+            -from_const(78)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(56), from_const(34)]),
+            -from_const(78)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(56), from_const(78)]),
+            -from_const(100)
+        );
+        assert_eq!(constraint.to_string(), "w0 + -1 * w1 + -1 * w2");
+    }
+
+    #[test]
+    fn test_sub_scalar_1() {
+        let constraint = make_var(0) - from_const(12);
+        assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(22));
+        assert_eq!(constraint.evaluate(&[from_const(56)]), from_const(44));
+        assert_eq!(constraint.to_string(), "-12 + w0");
+    }
+
+    #[test]
+    fn test_sub_scalar_2() {
+        let constraint = make_var(0) - from_const(34);
+        assert_eq!(constraint.evaluate(&[from_const(12)]), -from_const(22));
+        assert_eq!(constraint.evaluate(&[from_const(56)]), from_const(22));
+        assert_eq!(constraint.to_string(), "-34 + w0");
+    }
+
+    #[test]
+    fn test_sub_another_scalar() {
+        let constraint = make_var(0) - from_const(34) - from_const(56);
+        assert_eq!(constraint.evaluate(&[from_const(12)]), -from_const(78));
+        assert_eq!(constraint.evaluate(&[from_const(78)]), -from_const(12));
+        assert_eq!(constraint.to_string(), "-90 + w0");
+    }
+
+    #[test]
+    fn test_optimize_sub_1() {
+        let constraint = make_var(0) - make_var(0);
+        assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(0));
+        assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(0));
+        assert_eq!(constraint.to_string(), "0");
+    }
+
+    #[test]
+    fn test_optimize_sub_2() {
+        let w0 = make_var(0);
+        let w1 = make_var(1);
+        let constraint = w0.clone() - w1 - w0;
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            -from_const(34)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            -from_const(12)
+        );
+        assert_eq!(constraint.to_string(), "-1 * w1");
+    }
+
+    #[test]
+    fn test_compound_sub_1() {
+        let mut constraint = make_var(0);
+        constraint -= make_var(1);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            -from_const(22)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            from_const(22)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            -from_const(22)
+        );
+        assert_eq!(constraint.to_string(), "w0 + -1 * w1");
+    }
+
+    #[test]
+    fn test_compound_sub_2() {
+        let mut constraint = make_var(1);
+        constraint -= make_var(0);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            from_const(22)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            -from_const(22)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            from_const(22)
+        );
+        assert_eq!(constraint.to_string(), "-1 * w0 + w1");
+    }
+
+    #[test]
+    fn test_neg_1() {
+        let constraint = -make_var(0);
+        assert_eq!(constraint.evaluate(&[from_const(12)]), -from_const(12));
+        assert_eq!(constraint.evaluate(&[from_const(34)]), -from_const(34));
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            -from_const(56)
+        );
+        assert_eq!(constraint.to_string(), "-1 * w0");
+    }
+
+    #[test]
+    fn test_neg_double() {
+        let constraint = -(-make_var(0));
+        assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(12));
+        assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(34));
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            from_const(56)
+        );
+        assert_eq!(constraint.to_string(), "w0");
+    }
+
+    #[test]
+    fn test_neg_sum() {
+        let constraint = -(make_var(0) + make_var(1));
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            -from_const(46)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            -from_const(46)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            -from_const(134)
+        );
+        assert_eq!(constraint.to_string(), "-1 * w0 + -1 * w1");
+    }
+
+    #[test]
+    fn test_neg_scalar() {
+        let constraint = -(make_var(0) + from_const(12));
+        assert_eq!(constraint.evaluate(&[from_const(34)]), -from_const(46));
+        assert_eq!(constraint.evaluate(&[from_const(56)]), -from_const(68));
+        assert_eq!(constraint.to_string(), "-12 + -1 * w0");
+    }
+
+    #[test]
+    fn test_mul_1() {
+        let constraint = make_var(0) * make_var(1);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            from_const(408)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            from_const(408)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            from_const(4368)
+        );
+        assert_eq!(constraint.to_string(), "w0 * w1");
+    }
+
+    #[test]
+    fn test_mul_2() {
+        let constraint = make_var(1) * make_var(0);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            from_const(408)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            from_const(408)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            from_const(4368)
+        );
+        assert_eq!(constraint.to_string(), "w0 * w1");
+    }
+
+    #[test]
+    fn test_mul_3() {
+        let constraint = make_var(1) * make_var(2);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34), from_const(56)]),
+            from_const(1904)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(56), from_const(34)]),
+            from_const(1904)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(56), from_const(12)]),
+            from_const(672)
+        );
+        assert_eq!(constraint.to_string(), "w1 * w2");
+    }
+
+    #[test]
+    fn test_another_mul() {
+        let constraint = make_var(0) * make_var(1) * make_var(2);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34), from_const(56)]),
+            from_const(22848)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(56), from_const(34)]),
+            from_const(22848)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(56), from_const(78)]),
+            from_const(148512)
+        );
+        assert_eq!(constraint.to_string(), "w0 * w1 * w2");
+    }
+
+    #[test]
+    fn test_mul_scalar_1() {
+        let constraint = make_var(0) * from_const(12);
+        assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(408));
+        assert_eq!(constraint.evaluate(&[from_const(56)]), from_const(672));
+        assert_eq!(constraint.to_string(), "12 * w0");
+    }
+
+    #[test]
+    fn test_mul_scalar_2() {
+        let constraint = make_var(0) * from_const(34);
+        assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(408));
+        assert_eq!(constraint.evaluate(&[from_const(56)]), from_const(1904));
+        assert_eq!(constraint.to_string(), "34 * w0");
+    }
+
+    #[test]
+    fn test_mul_another_scalar() {
+        let constraint = make_var(0) * from_const(34) * from_const(56);
+        assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(22848));
+        assert_eq!(constraint.evaluate(&[from_const(78)]), from_const(148512));
+        assert_eq!(constraint.to_string(), "1904 * w0");
+    }
+
+    #[test]
+    fn test_mul_by_zero() {
+        let constraint = make_var(0) * from_const(0);
+        assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(0));
+        assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(0));
+        assert_eq!(constraint.to_string(), "0");
+    }
+
+    #[test]
+    fn test_optimize_mul() {
+        let w0 = make_var(0);
+        let w1 = make_var(1);
+        let constraint = (w0.clone() + w1.clone()) * (w0 - w1);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            -from_const(1012)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            from_const(1012)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            -from_const(2948)
+        );
+        assert_eq!(constraint.to_string(), "w0 ^ 2 + -1 * w1 ^ 2");
+    }
+
+    #[test]
+    fn test_compound_mul_1() {
+        let mut constraint = make_var(0);
+        constraint *= make_var(1);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            from_const(408)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            from_const(408)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            from_const(4368)
+        );
+        assert_eq!(constraint.to_string(), "w0 * w1");
+    }
+
+    #[test]
+    fn test_compound_mul_2() {
+        let mut constraint = make_var(1);
+        constraint *= make_var(0);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            from_const(408)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            from_const(408)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            from_const(4368)
+        );
+        assert_eq!(constraint.to_string(), "w0 * w1");
     }
 
     // TODO
