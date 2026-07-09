@@ -146,6 +146,13 @@ impl CircuitBuilder {
         row
     }
 
+    /// Adds a gate from a parsed constraint expression, panicking if parsing fails.
+    ///
+    /// Equivalent to `builder.add_gate(expr.parse().unwrap())`.
+    pub fn parse_and_add_gate(&mut self, expr: &'static str) -> usize {
+        self.add_gate(expr.parse().unwrap())
+    }
+
     /// Connects two [`Wire`]s of the circuit.
     pub fn connect(&mut self, wire1: Wire, wire2: Wire) {
         self.wires.connect(wire1, wire2);
@@ -958,8 +965,8 @@ mod tests {
     #[test]
     fn test_vitalik_circuit_with_expressions() {
         let mut builder = CircuitBuilder::default();
-        let square = builder.add_gate("w1 == w0 ^ 2".parse().unwrap());
-        let result = builder.add_gate("w2 == w0 * w1 + w0 + 5".parse().unwrap());
+        let square = builder.parse_and_add_gate("w1 == w0 ^ 2");
+        let result = builder.parse_and_add_gate("w2 == w0 * w1 + w0 + 5");
         builder.connect(wire(square, 0), wire(result, 0));
         builder.connect(wire(square, 1), wire(result, 1));
         let nop = builder.add_gate(Constraint::nop());
