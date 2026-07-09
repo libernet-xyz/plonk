@@ -195,7 +195,7 @@ impl Constraint {
 
     /// Returns the first variable with negative exponent, or `None` if there isn't one.
     ///
-    /// Used by [`Self::normalize`] to find variables to normalize.
+    /// Used by [`Self::canonicalize`] to find variables to multiply.
     fn get_next_inverted_variable(&self) -> Option<(usize, isize)> {
         for (variables, _) in &self.monomials {
             for (&column_index, &exponent) in variables {
@@ -207,17 +207,17 @@ impl Constraint {
         None
     }
 
-    /// Normalizes the constraint to a form where all exponents are positive.
+    /// Converts the constraint to a form where all exponents are positive.
     ///
     /// For example, `x * y^-1 + y == 0` becomes `x + y^2 == 0`.
     ///
-    /// The normalized form is suitable for use with [`Self::compose`], which doesn't work with
+    /// This canonical form is suitable for use with [`Self::compose`], which doesn't work with
     /// negative exponents.
     ///
-    /// WARNING: the normalized form is always more permissive than the original form because the
+    /// WARNING: the canonical form is always more permissive than the original form because the
     /// latter disallows 0 for any variables with negative exponents. Make sure your circuit is not
     /// underconstrained because of that.
-    pub fn normalize(mut self) -> Self {
+    pub fn canonicalize(mut self) -> Self {
         while let Some((column_index, exponent)) = self.get_next_inverted_variable() {
             self.monomials = self
                 .monomials
@@ -233,17 +233,17 @@ impl Constraint {
         self
     }
 
-    /// Indicates whether this constraint is in normal form as per [`Self::normalize`].
+    /// Indicates whether this constraint is in canonical form as per [`Self::canonicalize`].
     ///
     /// Returns true iff all variables have positive exponents, false if there are negative
     /// exponents.
-    pub fn is_normal(&self) -> bool {
+    pub fn is_canonical(&self) -> bool {
         self.get_next_inverted_variable().is_none()
     }
 
     /// Calculates the degree of the constraint.
     ///
-    /// REQUIRES: the constraint must be in [normal form](`Self::normalize`).
+    /// REQUIRES: the constraint must be in [canonical form](`Self::canonicalize`).
     pub fn get_degree(&self) -> usize {
         let mut degree = 0;
         for (variables, &coefficient) in &self.monomials {
@@ -253,7 +253,7 @@ impl Constraint {
                 variables
                     .iter()
                     .map(|(_, &exponent)| {
-                        assert!(exponent > 0, "the constraint is not in normal form");
+                        assert!(exponent > 0, "the constraint is not in canonical form");
                         exponent as usize
                     })
                     .sum(),
@@ -323,7 +323,7 @@ impl Constraint {
                     exponent => {
                         assert!(
                             exponent > 0,
-                            "the constraint must be normalized before composition"
+                            "the constraint must be canonicalized before composition"
                         );
                         for _ in 0..exponent {
                             monomial *= variable.clone();

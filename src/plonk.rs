@@ -52,24 +52,24 @@ fn padded_size(mut n: usize) -> usize {
 /// Circuit compilation & proving options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompilationOptions {
-    /// Normalizes all constraints using [`Constraint::normalize`].
+    /// Converts all constraints to canonical form using [`Constraint::canonicalize`].
     ///
-    /// When disabled, proving errors out if there are negative exponents rather than attempting
-    /// normalization.
+    /// When disabled, proving errors out rather than attempting canonicalization if there are
+    /// negative exponents.
     ///
-    /// Normalization is carried out inside [`CircuitBuilder::build`].
+    /// Canonicalization is carried out inside [`CircuitBuilder::build`].
     ///
-    /// WARNING: normalized constraints may be more permissive than their original form because a
+    /// WARNING: canonicalized constraints may be more permissive than their original form because a
     /// negative exponent requires the variable to be different from zero. Starkom does not allow
     /// proving with negative exponents, so enable this flag only if your circuit is correctly
     /// constrained even when those variables are zero.
-    pub normalize_constraints: bool,
+    pub canonicalize_constraints: bool,
 }
 
 impl Default for CompilationOptions {
     fn default() -> Self {
         Self {
-            normalize_constraints: false,
+            canonicalize_constraints: false,
         }
     }
 }
@@ -188,11 +188,14 @@ impl CircuitBuilder {
             .gates
             .into_iter()
             .map(|(mut constraint, rows)| {
-                if !constraint.is_normal() {
-                    if options.normalize_constraints {
-                        constraint = constraint.normalize();
+                if !constraint.is_canonical() {
+                    if options.canonicalize_constraints {
+                        constraint = constraint.canonicalize();
                     } else {
-                        return Err(anyhow!("constraint `{}` is not in normal form", constraint));
+                        return Err(anyhow!(
+                            "constraint `{}` is not in canonical form",
+                            constraint
+                        ));
                     }
                 }
                 let mut data = vec![Scalar::ZERO; degree_bound];
@@ -917,7 +920,7 @@ mod tests {
         builder.connect(wire(result, 2), wire(nop, 0));
         builder.declare_public_gates([nop]);
         let circuit = builder.build(CompilationOptions {
-            normalize_constraints: false,
+            canonicalize_constraints: false,
         })?;
         assert_eq!(circuit.num_rows(), 3);
         assert_eq!(circuit.degree_bound(), 8);
@@ -985,7 +988,7 @@ mod tests {
         builder.declare_public_gates([nop]);
         let circuit = builder
             .build(CompilationOptions {
-                normalize_constraints: false,
+                canonicalize_constraints: false,
             })
             .unwrap();
         assert_eq!(circuit.num_rows(), 3);
