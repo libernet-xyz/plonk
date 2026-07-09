@@ -1,8 +1,14 @@
+use crate::lexer;
+use crate::parser;
+use anyhow::Result;
 use starkom_bluesky::Scalar;
 use starkom_ff::{Field, PrimeField};
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display};
-use std::ops::{Add, BitXor, Div, Mul, Neg, Sub};
+use std::ops::{
+    Add, AddAssign, BitXor, BitXorAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign,
+};
+use std::str::FromStr;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
 
@@ -23,6 +29,13 @@ pub struct Constraint {
 }
 
 impl Constraint {
+    /// Makes a `Constraint` whose expression is a constant value.
+    pub(crate) fn make_const(value: Scalar) -> Self {
+        Constraint {
+            monomials: BTreeMap::from([(BTreeMap::default(), value)]),
+        }
+    }
+
     /// Makes a `Constraint` whose expression is a single variable reference.
     ///
     /// `column_index` is the index of the witness column the variable refers to.
@@ -30,6 +43,16 @@ impl Constraint {
         Constraint {
             monomials: BTreeMap::from([(BTreeMap::from([(column_index, 1)]), Scalar::ONE)]),
         }
+    }
+
+    /// Makes a NOP constraint, ie. one that simply constrains `0 == 0`.
+    ///
+    /// This type of gate can be used for revealing specific wires. Our engine also uses it
+    /// internally to add blinding rows.
+    ///
+    /// The returned constraint is exactly the same as `Constraint::default()`.
+    pub fn nop() -> Self {
+        Self::default()
     }
 
     /// Multiplies two monomials.
@@ -113,6 +136,17 @@ impl Constraint {
             .join(" + ")
     }
 
+    /// Indicates whether this constraint expression can be raised to a power.
+    ///
+    /// Raising can only be done when the expression is not a sum, otherwise our exponentiation
+    /// algorithm panics.
+    pub fn can_raise(&self) -> bool {
+        self.monomials.len() < 2
+    }
+
+    /// Returns the first variable with negative exponent, or `None` if there isn't one.
+    ///
+    /// Used by [`Self::normalize`] to find variables to normalize.
     fn get_next_inverted_variable(&self) -> Option<(usize, isize)> {
         for (variables, _) in &self.monomials {
             for (&column_index, &exponent) in variables {
@@ -126,7 +160,7 @@ impl Constraint {
 
     /// Normalizes the constraint to a form where all exponents are positive.
     ///
-    /// For example, `x * y^-1 + y == 0` gets normalized to `x + y^2 == 0`.
+    /// For example, `x * y^-1 + y == 0` becomes `x + y^2 == 0`.
     ///
     /// The normalized form is suitable for use with [`Self::compose`], which doesn't work with
     /// negative exponents.
@@ -266,10 +300,17 @@ impl Display for Constraint {
     }
 }
 
-impl Add for Constraint {
-    type Output = Constraint;
+impl FromStr for Constraint {
+    type Err = anyhow::Error;
 
-    fn add(mut self, rhs: Self) -> Self::Output {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let tokens = lexer::tokenize(s)?;
+        parser::parse(tokens.as_slice())
+    }
+}
+
+impl AddAssign for Constraint {
+    fn add_assign(&mut self, rhs: Self) {
         for (variables, coefficient) in rhs.monomials {
             match self.monomials.get_mut(&variables) {
                 Some(preexisting_coefficient) => {
@@ -280,19 +321,15 @@ impl Add for Constraint {
                 }
             }
         }
-        self.monomials = self
-            .monomials
+        self.monomials = std::mem::take(&mut self.monomials)
             .into_iter()
             .filter(|(_, coefficient)| *coefficient != Scalar::ZERO)
             .collect();
-        self
     }
 }
 
-impl Add<Scalar> for Constraint {
-    type Output = Constraint;
-
-    fn add(mut self, rhs: Scalar) -> Self::Output {
+impl AddAssign<Scalar> for Constraint {
+    fn add_assign(&mut self, rhs: Scalar) {
         let variables = BTreeMap::default();
         match self.monomials.get_mut(&variables) {
             Some(coefficient) => {
@@ -302,6 +339,29 @@ impl Add<Scalar> for Constraint {
                 self.monomials.insert(variables, rhs);
             }
         }
+    }
+}
+
+impl AddAssign<isize> for Constraint {
+    fn add_assign(&mut self, rhs: isize) {
+        *self += Self::isize_to_scalar(rhs);
+    }
+}
+
+impl Add for Constraint {
+    type Output = Constraint;
+
+    fn add(mut self, rhs: Self) -> Self::Output {
+        self += rhs;
+        self
+    }
+}
+
+impl Add<Scalar> for Constraint {
+    type Output = Constraint;
+
+    fn add(mut self, rhs: Scalar) -> Self::Output {
+        self += rhs;
         self
     }
 }
@@ -314,10 +374,8 @@ impl Add<isize> for Constraint {
     }
 }
 
-impl Sub for Constraint {
-    type Output = Constraint;
-
-    fn sub(mut self, rhs: Self) -> Self::Output {
+impl SubAssign for Constraint {
+    fn sub_assign(&mut self, rhs: Self) {
         for (variables, coefficient) in rhs.monomials {
             match self.monomials.get_mut(&variables) {
                 Some(preexisting_coefficient) => {
@@ -328,19 +386,15 @@ impl Sub for Constraint {
                 }
             }
         }
-        self.monomials = self
-            .monomials
+        self.monomials = std::mem::take(&mut self.monomials)
             .into_iter()
             .filter(|(_, coefficient)| *coefficient != Scalar::ZERO)
             .collect();
-        self
     }
 }
 
-impl Sub<Scalar> for Constraint {
-    type Output = Constraint;
-
-    fn sub(mut self, rhs: Scalar) -> Self::Output {
+impl SubAssign<Scalar> for Constraint {
+    fn sub_assign(&mut self, rhs: Scalar) {
         let variables = BTreeMap::default();
         match self.monomials.get_mut(&variables) {
             Some(coefficient) => {
@@ -350,6 +404,29 @@ impl Sub<Scalar> for Constraint {
                 self.monomials.insert(variables, -rhs);
             }
         }
+    }
+}
+
+impl SubAssign<isize> for Constraint {
+    fn sub_assign(&mut self, rhs: isize) {
+        *self -= Self::isize_to_scalar(rhs);
+    }
+}
+
+impl Sub for Constraint {
+    type Output = Constraint;
+
+    fn sub(mut self, rhs: Self) -> Self::Output {
+        self -= rhs;
+        self
+    }
+}
+
+impl Sub<Scalar> for Constraint {
+    type Output = Constraint;
+
+    fn sub(mut self, rhs: Scalar) -> Self::Output {
+        self -= rhs;
         self
     }
 }
@@ -357,8 +434,9 @@ impl Sub<Scalar> for Constraint {
 impl Sub<isize> for Constraint {
     type Output = Constraint;
 
-    fn sub(self, rhs: isize) -> Self::Output {
-        self.sub(Self::isize_to_scalar(rhs))
+    fn sub(mut self, rhs: isize) -> Self::Output {
+        self -= rhs;
+        self
     }
 }
 
@@ -373,12 +451,10 @@ impl Neg for Constraint {
     }
 }
 
-impl Mul for Constraint {
-    type Output = Constraint;
-
-    fn mul(self, rhs: Self) -> Self::Output {
+impl MulAssign for Constraint {
+    fn mul_assign(&mut self, rhs: Self) {
         let mut monomials = BTreeMap::default();
-        for (lhs_variables, lhs_coefficient) in self.monomials {
+        for (lhs_variables, lhs_coefficient) in std::mem::take(&mut self.monomials) {
             if lhs_coefficient != Scalar::ZERO {
                 for (rhs_variables, &rhs_coefficient) in &rhs.monomials {
                     if rhs_coefficient != Scalar::ZERO {
@@ -401,7 +477,34 @@ impl Mul for Constraint {
                 }
             }
         }
-        Constraint { monomials }
+        self.monomials = monomials;
+    }
+}
+
+impl MulAssign<Scalar> for Constraint {
+    fn mul_assign(&mut self, rhs: Scalar) {
+        if rhs != Scalar::ZERO {
+            for (_, coefficient) in &mut self.monomials {
+                *coefficient *= rhs;
+            }
+        } else {
+            self.monomials = BTreeMap::default();
+        }
+    }
+}
+
+impl MulAssign<isize> for Constraint {
+    fn mul_assign(&mut self, rhs: isize) {
+        *self *= Self::isize_to_scalar(rhs);
+    }
+}
+
+impl Mul for Constraint {
+    type Output = Constraint;
+
+    fn mul(mut self, rhs: Self) -> Self::Output {
+        self *= rhs;
+        self
     }
 }
 
@@ -409,14 +512,7 @@ impl Mul<Scalar> for Constraint {
     type Output = Constraint;
 
     fn mul(mut self, rhs: Scalar) -> Self::Output {
-        if rhs == Scalar::ZERO {
-            return Constraint {
-                monomials: BTreeMap::default(),
-            };
-        }
-        for (_, coefficient) in &mut self.monomials {
-            *coefficient *= rhs;
-        }
+        self *= rhs;
         self
     }
 }
@@ -424,14 +520,13 @@ impl Mul<Scalar> for Constraint {
 impl Mul<isize> for Constraint {
     type Output = Constraint;
 
-    fn mul(self, rhs: isize) -> Self::Output {
-        self.mul(Self::isize_to_scalar(rhs))
+    fn mul(mut self, rhs: isize) -> Self::Output {
+        self *= rhs;
+        self
     }
 }
 
-impl BitXor<isize> for Constraint {
-    type Output = Constraint;
-
+impl BitXorAssign<isize> for Constraint {
     /// We use the XOR operator to actually implement exponentiation. For example, if `x` is a
     /// `Constraint` instance (representing a single variable) then `x ^ 5` means x raised to 5.
     ///
@@ -442,19 +537,16 @@ impl BitXor<isize> for Constraint {
     /// That's counterintuitive but unfortunately Rust doesn't provide a proper power operation, and
     /// exponentiation is often necessary when defining PLONK constraints. Make sure to always
     /// parenthesize accordingly, eg. `x + (y ^ 2)`.
-    fn bitxor(self, rhs: isize) -> Self::Output {
+    fn bitxor_assign(&mut self, rhs: isize) {
         match rhs {
-            0 => Constraint {
-                monomials: BTreeMap::from([(BTreeMap::default(), Scalar::ONE)]),
-            },
-            1 => self,
+            0 => {
+                self.monomials = BTreeMap::from([(BTreeMap::default(), Scalar::ONE)]);
+            }
+            1 => {}
             _ => match self.monomials.len() {
-                0 => Constraint {
-                    monomials: BTreeMap::default(),
-                },
-                1 => Constraint {
-                    monomials: self
-                        .monomials
+                0 => {}
+                1 => {
+                    self.monomials = std::mem::take(&mut self.monomials)
                         .into_iter()
                         .map(|(variables, coefficient)| {
                             (
@@ -471,8 +563,8 @@ impl BitXor<isize> for Constraint {
                                 },
                             )
                         })
-                        .collect(),
-                },
+                        .collect();
+                }
                 _ => {
                     panic!("raising a sum to a power is forbidden, try to simplify your constraint")
                 }
@@ -481,24 +573,62 @@ impl BitXor<isize> for Constraint {
     }
 }
 
+impl BitXor<isize> for Constraint {
+    type Output = Constraint;
+
+    fn bitxor(mut self, rhs: isize) -> Self::Output {
+        self ^= rhs;
+        self
+    }
+}
+
+impl DivAssign for Constraint {
+    /// Multiplies the LHS by the inverse of the RHS, which must have exactly one monomial.
+    fn div_assign(&mut self, rhs: Self) {
+        match rhs.monomials.len() {
+            0 => panic!("division by zero"),
+            1 => *self *= rhs.bitxor(-1),
+            _ => panic!("dividing by a polynomial is forbidden, try to simplify your constraint"),
+        }
+    }
+}
+
+impl DivAssign<Scalar> for Constraint {
+    fn div_assign(&mut self, rhs: Scalar) {
+        *self *= rhs.invert_vartime().unwrap();
+    }
+}
+
+impl DivAssign<isize> for Constraint {
+    fn div_assign(&mut self, rhs: isize) {
+        *self /= Self::isize_to_scalar(rhs);
+    }
+}
+
 impl Div for Constraint {
     type Output = Constraint;
 
-    /// Multiplies the LHS by the inverse of the RHS, which must have exactly one monomial.
-    fn div(self, rhs: Self) -> Self::Output {
-        match rhs.monomials.len() {
-            0 => panic!("division by zero"),
-            1 => self.mul(rhs.bitxor(-1)),
-            _ => panic!("dividing by a polynomial is forbidden, try to simplify your constraint"),
-        }
+    fn div(mut self, rhs: Self) -> Self::Output {
+        self /= rhs;
+        self
     }
 }
 
 impl Div<Scalar> for Constraint {
     type Output = Constraint;
 
-    fn div(self, rhs: Scalar) -> Self::Output {
-        self.mul(rhs.invert_vartime().unwrap())
+    fn div(mut self, rhs: Scalar) -> Self::Output {
+        self /= rhs;
+        self
+    }
+}
+
+impl Div<isize> for Constraint {
+    type Output = Constraint;
+
+    fn div(mut self, rhs: isize) -> Self::Output {
+        self /= rhs;
+        self
     }
 }
 
@@ -514,7 +644,8 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        let constraint = Constraint::default();
+        let constraint = Constraint::nop();
+        assert_eq!(constraint, Constraint::default());
         assert_eq!(constraint.evaluate(&[]), from_const(0));
         assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(0));
         assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(0));

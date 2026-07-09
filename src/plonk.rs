@@ -918,7 +918,6 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_2() {
-        test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).unwrap();
         assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).is_ok());
     }
 
@@ -947,5 +946,43 @@ mod tests {
         assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(3).is_ok());
     }
 
-    // TODO
+    const DEFAULT_BLOWUP_LOG2: usize = 1;
+
+    #[test]
+    fn test_vitalik_circuit_with_expressions() {
+        let mut builder = CircuitBuilder::default();
+        let square = builder.add_gate("w1 == w0 ^ 2".parse().unwrap());
+        let result = builder.add_gate("w2 == w0 * w1 + w0 + 5".parse().unwrap());
+        builder.connect(wire(square, 0), wire(result, 0));
+        builder.connect(wire(square, 1), wire(result, 1));
+        let nop = builder.add_gate(Constraint::nop());
+        builder.connect(wire(result, 2), wire(nop, 0));
+        builder.declare_public_gates([nop]);
+        let circuit = builder
+            .build(CompilationOptions {
+                normalize_constraints: false,
+            })
+            .unwrap();
+        assert_eq!(circuit.num_rows(), 3);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 3);
+        let mut witness = circuit.make_witness();
+        let x = from_const(3);
+        witness.set(wire(square, 0), x);
+        witness.set(wire(square, 1), x.square());
+        witness.copy(wire(square, 0), wire(result, 0));
+        witness.copy(wire(square, 1), wire(result, 1));
+        witness.set(wire(result, 2), x.cube() + x + from_const(5));
+        witness.copy(wire(result, 2), wire(nop, 0));
+        let blowup_log2 = DEFAULT_BLOWUP_LOG2;
+        let options = ProvingOptions { blowup_log2 };
+        let proof = circuit.prove(witness, options.clone()).unwrap();
+        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(
+            proof.extended_domain_size(),
+            circuit.degree_bound() << blowup_log2
+        );
+        assert!(circuit.verify::<Sha2Hash<Scalar>>(&proof, options).is_ok());
+    }
 }

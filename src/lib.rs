@@ -4,6 +4,8 @@
 #![doc = include_str!("../README.md")]
 
 mod expr;
+mod lexer;
+mod parser;
 mod plonk;
 mod utils;
 mod wires;
