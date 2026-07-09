@@ -29,8 +29,8 @@ pub struct Constraint {
 }
 
 impl Constraint {
-    /// Makes a `Constraint` whose expression is a constant value.
-    pub(crate) fn make_const(value: Scalar) -> Self {
+    /// Makes a [`Constraint`] whose expression is a constant value.
+    pub fn make_const(value: Scalar) -> Self {
         if value != Scalar::ZERO {
             Constraint {
                 monomials: BTreeMap::from([(BTreeMap::default(), value)]),
@@ -905,6 +905,44 @@ mod tests {
             -from_const(12)
         );
         assert_eq!(constraint.to_string(), "-1 * w1");
+    }
+
+    #[test]
+    fn test_compound_sum_1() {
+        let mut constraint = make_var(0);
+        constraint += make_var(1);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            from_const(46)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            from_const(46)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            from_const(134)
+        );
+        assert_eq!(constraint.to_string(), "w0 + w1");
+    }
+
+    #[test]
+    fn test_compound_sum_2() {
+        let mut constraint = make_var(1);
+        constraint += make_var(0);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            from_const(46)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(12)]),
+            from_const(46)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(78)]),
+            from_const(134)
+        );
+        assert_eq!(constraint.to_string(), "w0 + w1");
     }
 
     // TODO

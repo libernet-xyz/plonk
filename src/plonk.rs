@@ -119,11 +119,22 @@ impl CircuitBuilder {
     /// These variables can be combined with Rust operators to construct gate constraints. Supported
     /// operations on variables are: addition (`+`), subtraction (binary `-`), negation (unary `-`),
     /// multiplication (`*`), and exponentiation by a constant (`^` followed by a constant).
-    pub fn var(&mut self, column_index: usize) -> Constraint {
+    pub fn var(&self, column_index: usize) -> Constraint {
         Constraint::make_var(column_index)
     }
 
-    /// Adds a gate to the circuit.
+    /// Convenience method to construct a constant constraint expression on the fly.
+    #[inline]
+    pub fn make_const(&self, value: Scalar) -> Constraint {
+        Constraint::make_const(value)
+    }
+
+    /// Adds a gate with the specified [`Constraint`] to the circuit.
+    ///
+    /// Constraints are polynomial expressions that are implicitly equalled to 0, e.g.
+    /// `w0 ^ 3 + w0 - 30 == 0`. All variables within constraint expressions are named `w` followed
+    /// by a number and represent witness columns: `w0` refers to the 0-th witness column, `w1` to
+    /// the first, and so on.
     pub fn add_gate(&mut self, constraint: Constraint) -> usize {
         self.num_columns = std::cmp::max(
             self.num_columns,

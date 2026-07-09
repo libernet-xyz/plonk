@@ -81,8 +81,8 @@ impl<'a> Lexer<'a> {
 
     fn tokenize(mut self) -> Result<Vec<Token>> {
         let mut tokens = vec![];
+        self.consume_whitespace();
         while !self.input.is_empty() {
-            self.consume_whitespace();
             if let Some(captures) = self.consume_prefix(&*REGEX_IDENTIFIER) {
                 tokens.push(Token::Variable(captures[0].to_string()));
             } else if let Some(captures) = self.consume_prefix(&*REGEX_NUMBER_8) {
@@ -96,6 +96,7 @@ impl<'a> Lexer<'a> {
             } else {
                 tokens.push(self.consume_symbol()?);
             }
+            self.consume_whitespace();
         }
         tokens.push(Token::EndOfInput);
         Ok(tokens)
@@ -136,5 +137,206 @@ mod tests {
         );
     }
 
-    // TODO
+    #[test]
+    fn test_empty_input() {
+        assert_eq!(tokenize(""), vec![Token::EndOfInput]);
+    }
+
+    #[test]
+    fn test_whitespace_only() {
+        assert_eq!(tokenize("   \t\n  "), vec![Token::EndOfInput]);
+    }
+
+    #[test]
+    fn test_whitespace_is_optional_between_symbols() {
+        assert_eq!(
+            tokenize("1+2*3-4/5^6==7"),
+            vec![
+                Token::Number(Scalar::from_const(1)),
+                Token::Plus,
+                Token::Number(Scalar::from_const(2)),
+                Token::Multiply,
+                Token::Number(Scalar::from_const(3)),
+                Token::Minus,
+                Token::Number(Scalar::from_const(4)),
+                Token::Divide,
+                Token::Number(Scalar::from_const(5)),
+                Token::Power,
+                Token::Number(Scalar::from_const(6)),
+                Token::Equal,
+                Token::Number(Scalar::from_const(7)),
+                Token::EndOfInput
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mixed_whitespace_between_tokens() {
+        assert_eq!(
+            tokenize("1 \t+\n2"),
+            vec![
+                Token::Number(Scalar::from_const(1)),
+                Token::Plus,
+                Token::Number(Scalar::from_const(2)),
+                Token::EndOfInput
+            ]
+        );
+    }
+
+    #[test]
+    fn test_decimal_zero() {
+        assert_eq!(
+            tokenize("0"),
+            vec![Token::Number(Scalar::from_const(0)), Token::EndOfInput]
+        );
+    }
+
+    #[test]
+    fn test_decimal_number() {
+        assert_eq!(
+            tokenize("123456789"),
+            vec![
+                Token::Number(Scalar::from_const(123456789)),
+                Token::EndOfInput
+            ]
+        );
+    }
+
+    #[test]
+    fn test_octal_number() {
+        assert_eq!(
+            tokenize("017"),
+            vec![Token::Number(Scalar::from_const(15)), Token::EndOfInput]
+        );
+    }
+
+    #[test]
+    fn test_octal_number_with_leading_zeros() {
+        assert_eq!(
+            tokenize("007"),
+            vec![Token::Number(Scalar::from_const(7)), Token::EndOfInput]
+        );
+    }
+
+    #[test]
+    fn test_binary_number_lowercase_prefix() {
+        assert_eq!(
+            tokenize("0b1010"),
+            vec![Token::Number(Scalar::from_const(10)), Token::EndOfInput]
+        );
+    }
+
+    #[test]
+    fn test_binary_number_uppercase_prefix() {
+        assert_eq!(
+            tokenize("0B1010"),
+            vec![Token::Number(Scalar::from_const(10)), Token::EndOfInput]
+        );
+    }
+
+    #[test]
+    fn test_hexadecimal_number_lowercase_prefix() {
+        assert_eq!(
+            tokenize("0xff"),
+            vec![Token::Number(Scalar::from_const(255)), Token::EndOfInput]
+        );
+    }
+
+    #[test]
+    fn test_hexadecimal_number_uppercase_prefix() {
+        assert_eq!(
+            tokenize("0XFF"),
+            vec![Token::Number(Scalar::from_const(255)), Token::EndOfInput]
+        );
+    }
+
+    #[test]
+    fn test_variable_names() {
+        assert_eq!(
+            tokenize("_underscore CamelCase snake_case42"),
+            vec![
+                Token::Variable("_underscore".to_string()),
+                Token::Variable("CamelCase".to_string()),
+                Token::Variable("snake_case42".to_string()),
+                Token::EndOfInput
+            ]
+        );
+    }
+
+    #[test]
+    fn test_all_symbols() {
+        assert_eq!(
+            tokenize("+ - * / ^ == ( )"),
+            vec![
+                Token::Plus,
+                Token::Minus,
+                Token::Multiply,
+                Token::Divide,
+                Token::Power,
+                Token::Equal,
+                Token::LeftBracket,
+                Token::RightBracket,
+                Token::EndOfInput
+            ]
+        );
+    }
+
+    #[test]
+    fn test_nested_brackets() {
+        assert_eq!(
+            tokenize("((1 + 2))"),
+            vec![
+                Token::LeftBracket,
+                Token::LeftBracket,
+                Token::Number(Scalar::from_const(1)),
+                Token::Plus,
+                Token::Number(Scalar::from_const(2)),
+                Token::RightBracket,
+                Token::RightBracket,
+                Token::EndOfInput
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unary_minus_is_a_separate_token_from_the_number() {
+        assert_eq!(
+            tokenize("-5"),
+            vec![
+                Token::Minus,
+                Token::Number(Scalar::from_const(5)),
+                Token::EndOfInput
+            ]
+        );
+    }
+
+    #[test]
+    fn test_invalid_octal_digit_is_a_syntax_error() {
+        assert!(super::tokenize("08").is_err());
+    }
+
+    #[test]
+    fn test_digit_immediately_followed_by_letter_is_a_syntax_error() {
+        assert!(super::tokenize("5x").is_err());
+    }
+
+    #[test]
+    fn test_incomplete_hexadecimal_prefix_is_a_syntax_error() {
+        assert!(super::tokenize("0x").is_err());
+    }
+
+    #[test]
+    fn test_incomplete_binary_prefix_is_a_syntax_error() {
+        assert!(super::tokenize("0b").is_err());
+    }
+
+    #[test]
+    fn test_unknown_character_is_a_syntax_error() {
+        assert!(super::tokenize("$").is_err());
+    }
+
+    #[test]
+    fn test_single_equal_sign_is_a_syntax_error() {
+        assert!(super::tokenize("1=2").is_err());
+    }
 }
