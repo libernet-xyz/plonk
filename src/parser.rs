@@ -3,11 +3,12 @@ use crate::lexer::Token;
 use anyhow::{Result, anyhow};
 use regex::Regex;
 use starkom_bluesky::Scalar;
-use starkom_ff::Field256;
+use starkom_ff::{Field, Field256};
 use std::sync::LazyLock;
 
 static REGEX_VARIABLE_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^w(\d+)$").unwrap());
 
+/// A recursive descent parser for Starkom's expression syntax.
 #[derive(Debug, Clone)]
 struct Parser<'a> {
     tokens: &'a [Token],
@@ -77,14 +78,32 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn is_pseudo_negative(value: &Scalar) -> bool {
+        const HALF_RANGE: LazyLock<Scalar> = LazyLock::new(|| {
+            "0x7ffffffffffffffffffffffffffffffe0673ddf29e9b5547c00000000000000"
+                .parse()
+                .unwrap()
+        });
+        *value > *HALF_RANGE
+    }
+
     fn parse_exponent(&mut self) -> Result<isize> {
-        match self.parse_leaf()?.get_value_if_constant() {
+        match self.parse_unary_expression()?.get_value_if_constant() {
             Some(value) => {
                 const MAX: Scalar = Scalar::from_const(isize::MAX as u64);
-                if value > MAX {
-                    Err(anyhow!("exponent {} is out of range", value))
+                if Self::is_pseudo_negative(&value) {
+                    let abs = (Scalar::MAX - value + Scalar::ONE).try_to_u128().unwrap() as i128;
+                    if abs > -(isize::MIN as i128) {
+                        Err(anyhow!("exponent {} is out of range", value))
+                    } else {
+                        Ok(-abs as isize)
+                    }
                 } else {
-                    Ok(value.try_to_u64().unwrap() as isize)
+                    if value > MAX {
+                        Err(anyhow!("exponent {} is out of range", value))
+                    } else {
+                        Ok(value.try_to_u64().unwrap() as isize)
+                    }
                 }
             }
             None => Err(anyhow!("exponents may not contain variables")),
@@ -161,13 +180,140 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Parses a (tokenized) expression in Starkom's expression syntax.
 pub(crate) fn parse(tokens: &[Token]) -> Result<Constraint> {
     Parser::new(tokens).parse()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::Constraint;
+    use crate::lexer;
+    use starkom_bluesky::Scalar;
 
-    // TODO
+    fn parse(s: &'static str) -> Constraint {
+        let tokens = lexer::tokenize(s).unwrap();
+        super::parse(tokens.as_slice()).unwrap()
+    }
+
+    #[inline(always)]
+    fn nop() -> Constraint {
+        Constraint::nop()
+    }
+
+    fn make_const(value: u64) -> Constraint {
+        Constraint::make_const(Scalar::from_const(value))
+    }
+
+    #[inline(always)]
+    fn var(column_index: usize) -> Constraint {
+        Constraint::make_var(column_index)
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(parse("0 == 0"), make_const(0));
+        assert_eq!(parse("12 == 0"), make_const(12));
+        assert_eq!(parse("56 == 34"), make_const(22));
+    }
+
+    #[test]
+    fn test_variables() {
+        assert_eq!(parse("w0 == 0"), var(0));
+        assert_eq!(parse("w1 == 0"), var(1));
+        assert_eq!(parse("w2 == 0"), var(2));
+    }
+
+    #[test]
+    fn test_unary() {
+        assert_eq!(parse("-w0 == 0"), -var(0));
+        assert_eq!(parse("--w0 == 0"), var(0));
+        assert_eq!(parse("---w0 == 0"), -var(0));
+        assert_eq!(parse("+w0 == 0"), var(0));
+        assert_eq!(parse("++w0 == 0"), var(0));
+        assert_eq!(parse("+-w0 == 0"), -var(0));
+        assert_eq!(parse("-+w0 == 0"), -var(0));
+        assert_eq!(parse("-++w0 == 0"), -var(0));
+        assert_eq!(parse("+-+w0 == 0"), -var(0));
+        assert_eq!(parse("++-w0 == 0"), -var(0));
+        assert_eq!(parse("+-+-+w0 == 0"), var(0));
+        assert_eq!(parse("-+-+-w0 == 0"), -var(0));
+    }
+
+    #[test]
+    fn test_sum() {
+        assert_eq!(parse("w0 + w0 == 0"), var(0) * 2);
+        assert_eq!(parse("w0 + w1 == 0"), var(0) + var(1));
+        assert_eq!(parse("w1 + w0 == 0"), var(0) + var(1));
+        assert_eq!(parse("w0 + 42 == 0"), var(0) + make_const(42));
+        assert_eq!(parse("42 + w0 == 0"), var(0) + make_const(42));
+        assert_eq!(parse("w0 + w1 + w2 == 0"), var(0) + var(1) + var(2));
+        assert_eq!(parse("w2 + w2 + w3 == 0"), var(2) * 2 + var(3));
+        assert_eq!(parse("w3 + w2 + w3 == 0"), var(3) * 2 + var(2));
+        assert_eq!(parse("w4 + w4 + w4 == 0"), var(4) * 3);
+    }
+
+    #[test]
+    fn test_subtraction() {
+        assert_eq!(parse("w0 - w0 == 0"), nop());
+        assert_eq!(parse("w0 - w1 == 0"), var(0) - var(1));
+        assert_eq!(parse("w1 - w0 == 0"), var(1) - var(0));
+        assert_eq!(parse("w0 - 42 == 0"), var(0) - make_const(42));
+        assert_eq!(parse("42 - w0 == 0"), make_const(42) - var(0));
+        assert_eq!(parse("w0 - w1 - w2 == 0"), var(0) - var(1) - var(2));
+        assert_eq!(parse("w2 - w2 - w3 == 0"), -var(3));
+        assert_eq!(parse("w3 - w2 - w3 == 0"), -var(2));
+        assert_eq!(parse("w4 - w4 - w4 == 0"), -var(4));
+    }
+
+    #[test]
+    fn test_product() {
+        assert_eq!(parse("w0 * w0 == 0"), var(0) ^ 2);
+        assert_eq!(parse("w0 * w1 == 0"), var(0) * var(1));
+        assert_eq!(parse("w1 * w0 == 0"), var(0) * var(1));
+        assert_eq!(parse("w0 * 42 == 0"), var(0) * make_const(42));
+        assert_eq!(parse("42 * w0 == 0"), var(0) * make_const(42));
+        assert_eq!(parse("w0 * w1 * w2 == 0"), var(0) * var(1) * var(2));
+        assert_eq!(parse("w2 * w2 * w3 == 0"), (var(2) ^ 2) * var(3));
+        assert_eq!(parse("w3 * w2 * w3 == 0"), (var(3) ^ 2) * var(2));
+        assert_eq!(parse("w4 * w4 * w4 == 0"), var(4) ^ 3);
+    }
+
+    #[test]
+    fn test_power() {
+        assert_eq!(parse("w0 ^ 0 == 0"), make_const(1));
+        assert_eq!(parse("w0 ^ 1 == 0"), var(0));
+        assert_eq!(parse("w0 ^ 2 == 0"), var(0) ^ 2);
+        assert_eq!(parse("w0 ^ +0 == 0"), make_const(1));
+        assert_eq!(parse("w0 ^ +1 == 0"), var(0));
+        assert_eq!(parse("w0 ^ +2 == 0"), var(0) ^ 2);
+        assert_eq!(parse("w0 ^ -0 == 0"), make_const(1));
+        assert_eq!(parse("w0 ^ -1 == 0"), var(0) ^ -1);
+        assert_eq!(parse("w0 ^ -2 == 0"), var(0) ^ -2);
+    }
+
+    #[test]
+    fn test_division() {
+        assert_eq!(parse("w0 / w0 == 0"), make_const(1));
+        assert_eq!(parse("w0 / w1 == 0"), var(0) / var(1));
+        assert_eq!(parse("w1 / w0 == 0"), var(1) / var(0));
+        assert_eq!(parse("w0 / 42 == 0"), var(0) / make_const(42));
+        assert_eq!(parse("42 / w0 == 0"), make_const(42) / var(0));
+        assert_eq!(parse("w0 / w1 / w2 == 0"), var(0) / var(1) / var(2));
+        assert_eq!(parse("w2 / w2 / w3 == 0"), var(3) ^ -1);
+        assert_eq!(parse("w3 / w2 / w3 == 0"), var(2) ^ -1);
+        assert_eq!(parse("w4 / w4 / w4 == 0"), var(4) ^ -1);
+    }
+
+    #[test]
+    fn test_brackets() {
+        assert_eq!(parse("(42) == 0"), make_const(42));
+        assert_eq!(parse("(w0) == 0"), var(0));
+        assert_eq!(parse("(w1) == 0"), var(1));
+        assert_eq!(parse("(w1 + w2) == 0"), var(1) + var(2));
+        assert_eq!(parse("(w1 + w2) * w3 == 0"), (var(1) + var(2)) * var(3));
+        assert_eq!(parse("w3 * (w2 + w1) == 0"), (var(1) + var(2)) * var(3));
+        assert_eq!(parse("w0 ^ (36 + 2 * 3) == 0"), var(0) ^ 42);
+        assert_eq!(parse("w0 ^ -(4 - 2) == 0"), var(0) ^ -2);
+    }
 }

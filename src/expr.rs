@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
 
-/// Represents a PLONK constraint as a sum of monomials.
+/// Represents a PLONK constraint as a sum of monomials (implicitly constrained to equal 0).
 ///
 /// Each monomial is in the form `coeff * var0^exp0 * var1^exp1 * ...`, where `coeff` is a constant
 /// scalar, the `var` variables are witness columns, and the `exp` variables are constant exponents.
@@ -31,8 +31,12 @@ pub struct Constraint {
 impl Constraint {
     /// Makes a `Constraint` whose expression is a constant value.
     pub(crate) fn make_const(value: Scalar) -> Self {
-        Constraint {
-            monomials: BTreeMap::from([(BTreeMap::default(), value)]),
+        if value != Scalar::ZERO {
+            Constraint {
+                monomials: BTreeMap::from([(BTreeMap::default(), value)]),
+            }
+        } else {
+            Constraint::default()
         }
     }
 
@@ -646,7 +650,7 @@ impl DivAssign<Scalar> for Constraint {
 
 impl DivAssign<isize> for Constraint {
     fn div_assign(&mut self, rhs: isize) {
-        *self /= Self::isize_to_scalar(rhs);
+        *self *= Self::isize_to_scalar(rhs).invert_vartime().unwrap();
     }
 }
 

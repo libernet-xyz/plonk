@@ -3,6 +3,7 @@ use regex::{Captures, Regex};
 use starkom_bluesky::Scalar;
 use std::{collections::BTreeMap, sync::LazyLock};
 
+/// Lexical tokens for Starkom's expression syntax.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Token {
     Number(Scalar),
@@ -101,6 +102,8 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// Scans an expression in Starkom's expression syntax and returns the corresponding list of lexical
+/// tokens.
 pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>> {
     Lexer::new(input).tokenize()
 }
