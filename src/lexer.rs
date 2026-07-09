@@ -112,5 +112,29 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>> {
 mod tests {
     use super::*;
 
+    #[inline]
+    fn tokenize(input: &'static str) -> Vec<Token> {
+        super::tokenize(input).unwrap()
+    }
+
+    #[test]
+    fn test_vitalik() {
+        assert_eq!(
+            tokenize("w0 ^ 3 + w0 + 5 == 35"),
+            vec![
+                Token::Variable("w0".to_string()),
+                Token::Power,
+                Token::Number(Scalar::from_const(3)),
+                Token::Plus,
+                Token::Variable("w0".to_string()),
+                Token::Plus,
+                Token::Number(Scalar::from_const(5)),
+                Token::Equal,
+                Token::Number(Scalar::from_const(35)),
+                Token::EndOfInput
+            ]
+        );
+    }
+
     // TODO
 }

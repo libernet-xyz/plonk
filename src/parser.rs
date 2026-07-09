@@ -316,4 +316,20 @@ mod tests {
         assert_eq!(parse("w0 ^ (36 + 2 * 3) == 0"), var(0) ^ 42);
         assert_eq!(parse("w0 ^ -(4 - 2) == 0"), var(0) ^ -2);
     }
+
+    #[test]
+    fn test_equality() {
+        assert_eq!(
+            parse("(w0 + w1) * w2 == 42"),
+            (var(0) + var(1)) * var(2) - make_const(42)
+        );
+        assert_eq!(
+            parse("42 == (w0 + w1) * w2"),
+            make_const(42) - (var(0) + var(1)) * var(2)
+        );
+        assert_eq!(
+            parse("42 * w2 ^ -1 == w0 + w1"),
+            make_const(42) * (var(2) ^ -1) - var(0) - var(1)
+        );
+    }
 }
