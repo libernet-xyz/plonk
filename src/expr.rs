@@ -3,7 +3,7 @@ use crate::parser;
 use anyhow::Result;
 use starkom_bluesky::Scalar;
 use starkom_ff::{Field, PrimeField};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display};
 use std::ops::{
     Add, AddAssign, BitXor, BitXorAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign,
@@ -142,6 +142,51 @@ impl Constraint {
     /// algorithm panics.
     pub fn can_raise(&self) -> bool {
         self.monomials.len() < 2
+    }
+
+    /// Returns the list of variables referenced by this constraint expression, represented as a set
+    /// of column indices (each variable corresponds to a column index).
+    pub fn get_free_variables(&self) -> BTreeSet<usize> {
+        let mut set = BTreeSet::default();
+        for (variables, _) in &self.monomials {
+            for (&column_index, _) in variables {
+                set.insert(column_index);
+            }
+        }
+        set
+    }
+
+    /// Indicates whether this constraint expression is constant, which happens when the
+    /// [free variable set](`Self::get_free_variables`) is empty.
+    ///
+    /// Since `Constraint` instances are expressions that are implicitly equalled to 0, it follows
+    /// that a non-zero constant `Constraint` is invalid because it will always fail in all
+    /// circuits, regardless of the witness values. For example, `42 == 0` will always block
+    /// proving. Because of that, constant-testing is not very useful as a public API. It's mostly
+    /// used internally by the expression parser and doesn't have many other use cases.
+    pub fn is_constant(&self) -> bool {
+        self.monomials
+            .iter()
+            .all(|(variables, _)| variables.is_empty())
+    }
+
+    /// If this constraint expression [is constant](`Self::is_constant`) it returns its constant
+    /// value, otherwise it returns `None`.
+    ///
+    /// Since `Constraint` instances are expressions that are implicitly equalled to 0, it follows
+    /// that a non-zero constant `Constraint` is invalid because it will always fail in all
+    /// circuits, regardless of the witness values. For example, `42 == 0` will always block
+    /// proving. Because of that, constant-testing is not very useful as a public API. It's mostly
+    /// used internally by the expression parser and doesn't have many other use cases.
+    pub fn get_value_if_constant(&self) -> Option<Scalar> {
+        let mut value = Scalar::ZERO;
+        for (variables, coefficient) in &self.monomials {
+            if !variables.is_empty() {
+                return None;
+            }
+            value += coefficient;
+        }
+        Some(value)
     }
 
     /// Returns the first variable with negative exponent, or `None` if there isn't one.
@@ -660,6 +705,9 @@ mod tests {
         let constraint = Constraint {
             monomials: BTreeMap::from([(BTreeMap::default(), value)]),
         };
+        assert_eq!(constraint.get_free_variables(), BTreeSet::default());
+        assert!(constraint.is_constant());
+        assert_eq!(constraint.get_value_if_constant(), Some(value));
         assert_eq!(constraint.evaluate(&[]), value);
         assert_eq!(constraint.evaluate(&[from_const(12)]), value);
         assert_eq!(constraint.evaluate(&[from_const(34)]), value);
@@ -672,6 +720,7 @@ mod tests {
 
     #[test]
     fn test_constant() {
+        test_constant_impl(from_const(0));
         test_constant_impl(from_const(12));
         test_constant_impl(from_const(34));
     }

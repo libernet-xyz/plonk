@@ -78,10 +78,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_exponent(&mut self) -> Result<isize> {
-        match self.consume_token()? {
-            Token::Plus => self.parse_exponent(),
-            Token::Minus => Ok(-self.parse_exponent()?),
-            Token::Number(value) => {
+        match self.parse_leaf()?.get_value_if_constant() {
+            Some(value) => {
                 const MAX: Scalar = Scalar::from_const(isize::MAX as u64);
                 if value > MAX {
                     Err(anyhow!("exponent {} is out of range", value))
@@ -89,7 +87,7 @@ impl<'a> Parser<'a> {
                     Ok(value.try_to_u64().unwrap() as isize)
                 }
             }
-            _ => Err(anyhow!("syntax error")),
+            None => Err(anyhow!("exponents may not contain variables")),
         }
     }
 

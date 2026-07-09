@@ -120,12 +120,19 @@ impl CircuitBuilder {
     /// operations on variables are: addition (`+`), subtraction (binary `-`), negation (unary `-`),
     /// multiplication (`*`), and exponentiation by a constant (`^` followed by a constant).
     pub fn var(&mut self, column_index: usize) -> Constraint {
-        self.num_columns = std::cmp::max(self.num_columns, column_index + 1);
         Constraint::make_var(column_index)
     }
 
     /// Adds a gate to the circuit.
     pub fn add_gate(&mut self, constraint: Constraint) -> usize {
+        self.num_columns = std::cmp::max(
+            self.num_columns,
+            1 + constraint
+                .get_free_variables()
+                .into_iter()
+                .max()
+                .unwrap_or(0),
+        );
         let row = self.num_rows;
         self.num_rows += 1;
         match self.gates.get_mut(&constraint) {
