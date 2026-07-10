@@ -1,3 +1,4 @@
+use starkom_bluesky::Scalar;
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
 /// A "wire" is a termination of a gate, identified by a row index and a column index.
@@ -18,6 +19,24 @@ impl Wire {
 
     pub const fn column(&self) -> usize {
         self.column
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WireOrUnconstrained {
+    Wire(Wire),
+    Unconstrained(Scalar),
+}
+
+impl From<Wire> for WireOrUnconstrained {
+    fn from(wire: Wire) -> Self {
+        WireOrUnconstrained::Wire(wire)
+    }
+}
+
+impl From<Scalar> for WireOrUnconstrained {
+    fn from(value: Scalar) -> Self {
+        WireOrUnconstrained::Unconstrained(value)
     }
 }
 

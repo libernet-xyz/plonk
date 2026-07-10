@@ -1,4 +1,5 @@
 use crate::Constraint;
+use crate::WireOrUnconstrained;
 use crate::utils;
 use crate::wires::{Wire, WirePartitioner};
 use anyhow::{Result, anyhow};
@@ -182,8 +183,13 @@ impl CircuitBuilder {
     }
 
     /// Connects two [`Wire`]s of the circuit.
-    pub fn connect(&mut self, wire1: Wire, wire2: Wire) {
-        self.wires.connect(wire1, wire2);
+    pub fn connect(&mut self, wire1: Option<Wire>, wire2: Option<Wire>) {
+        match (wire1, wire2) {
+            (Some(wire1), Some(wire2)) => {
+                self.wires.connect(wire1, wire2);
+            }
+            _ => {}
+        }
     }
 
     /// Updates the list of witness rows that are revealed.
@@ -911,6 +917,39 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
     }
 }
 
+/// Represents a reusable PLONK chip that you can use to build circuits.
+pub trait Chip<const I: usize, const O: usize> {
+    fn build(
+        &self,
+        builder: &mut CircuitBuilder,
+        inputs: [Option<Wire>; I],
+    ) -> Result<[Option<Wire>; O]>;
+
+    fn witness(
+        &self,
+        witness: &mut Witness,
+        inputs: [WireOrUnconstrained; I],
+    ) -> Result<[WireOrUnconstrained; O]>;
+}
+
+/// A reusable PLONK chip with a variable number of inputs and outputs.
+///
+/// NOTE: PLONK circuits have a fixed structure, so the number of inputs and outputs must be known
+/// at circuit build time; but this trait doesn't require knowing it when compiling the Rust source.
+pub trait DynamicChip {
+    fn build(
+        &self,
+        builder: &mut CircuitBuilder,
+        inputs: &[Option<Wire>],
+    ) -> Result<Vec<Option<Wire>>>;
+
+    fn witness(
+        &self,
+        witness: &mut Witness,
+        inputs: &[WireOrUnconstrained],
+    ) -> Result<Vec<WireOrUnconstrained>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,10 +962,10 @@ mod tests {
         let mut builder = CircuitBuilder::default();
         let square = builder.add_gate((var(0) ^ 2) - var(1));
         let result = builder.add_gate(var(0) * var(1) + var(0) + 5 - var(2));
-        builder.connect(wire(square, 0), wire(result, 0));
-        builder.connect(wire(square, 1), wire(result, 1));
+        builder.connect(wire(square, 0).into(), wire(result, 0).into());
+        builder.connect(wire(square, 1).into(), wire(result, 1).into());
         let nop = builder.add_gate(Constraint::default());
-        builder.connect(wire(result, 2), wire(nop, 0));
+        builder.connect(wire(result, 2).into(), wire(nop, 0).into());
         builder.declare_public_gates([nop]);
         let circuit = builder.build(CompilationOptions {
             canonicalize_constraints: false,
@@ -990,10 +1029,10 @@ mod tests {
         let mut builder = CircuitBuilder::default();
         let square = builder.parse_and_add_gate("w1 == w0 ^ 2");
         let result = builder.parse_and_add_gate("w2 == w0 * w1 + w0 + 5");
-        builder.connect(wire(square, 0), wire(result, 0));
-        builder.connect(wire(square, 1), wire(result, 1));
+        builder.connect(wire(square, 0).into(), wire(result, 0).into());
+        builder.connect(wire(square, 1).into(), wire(result, 1).into());
         let nop = builder.add_gate(Constraint::nop());
-        builder.connect(wire(result, 2), wire(nop, 0));
+        builder.connect(wire(result, 2).into(), wire(nop, 0).into());
         builder.declare_public_gates([nop]);
         let circuit = builder
             .build(CompilationOptions {
@@ -1028,7 +1067,7 @@ mod tests {
         let mut builder = CircuitBuilder::default();
         let result = builder.parse_and_add_gate("w1 == w0 ^ 3 + w0 + 5");
         let nop = builder.add_gate(Constraint::nop());
-        builder.connect(wire(result, 1), wire(nop, 0));
+        builder.connect(wire(result, 1).into(), wire(nop, 0).into());
         builder.declare_public_gates([nop]);
         let circuit = builder
             .build(CompilationOptions {
