@@ -192,6 +192,32 @@ impl CircuitBuilder {
         }
     }
 
+    /// Adds a gate with `N` inputs and `M` outputs.
+    ///
+    /// The provided `constraint` must use exactly `N+M` variables, or the function will panic. The
+    /// provided inputs wires are wrapped in `Option`s because `None` means the corresponding input
+    /// wire of the gate must remain unconstrained.
+    ///
+    /// The first `N` variables used in the constraint (those with the lowest column numbers) will
+    /// be automatically connected to the specified input wires unless they're unconstrained / None,
+    /// while the last `M` variables (those with the highest column numbers) will be returned as
+    /// output wires.
+    pub fn auto_gate<const N: usize, const M: usize>(
+        &mut self,
+        constraint: Constraint,
+        inputs: [Option<Wire>; N],
+    ) -> [Wire; M] {
+        let variables: Vec<usize> = constraint.get_free_variables().into_iter().collect();
+        assert_eq!(variables.len(), N + M);
+        let gate = self.add_gate(constraint);
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.connect(Some(input), Some(wire(gate, variables[i])));
+            }
+        }
+        std::array::from_fn(|i| wire(gate, variables[N + i]))
+    }
+
     /// Updates the list of witness rows that are revealed.
     ///
     /// This method drops any previously provided lists, so if it's called multiple times only the
@@ -314,14 +340,24 @@ impl Witness {
     }
 
     /// Copies a witness cell to another.
-    pub fn copy(&mut self, src_wire: Wire, dst_wire: Wire) -> Scalar {
-        let src_row = src_wire.row();
-        let dst_row = dst_wire.row();
-        assert!(src_row < self.num_rows);
-        assert!(dst_row < self.num_rows);
-        let value = self.data[src_wire.column()][src_row];
-        self.data[dst_wire.column()][dst_row] = value;
-        value
+    pub fn copy(&mut self, src_wire: WireOrUnconstrained, dst_wire: Wire) -> Scalar {
+        match src_wire {
+            WireOrUnconstrained::Wire(src_wire) => {
+                let src_row = src_wire.row();
+                let dst_row = dst_wire.row();
+                assert!(src_row < self.num_rows);
+                assert!(dst_row < self.num_rows);
+                let value = self.data[src_wire.column()][src_row];
+                self.data[dst_wire.column()][dst_row] = value;
+                value
+            }
+            WireOrUnconstrained::Unconstrained(src_value) => {
+                let dst_row = dst_wire.row();
+                assert!(dst_row < self.num_rows);
+                self.data[dst_wire.column()][dst_row] = src_value;
+                src_value
+            }
+        }
     }
 
     /// Adds blinding rows to the polynomial.
@@ -977,10 +1013,10 @@ mod tests {
         let x = from_const(3);
         witness.set(wire(square, 0), x);
         witness.set(wire(square, 1), x.square());
-        witness.copy(wire(square, 0), wire(result, 0));
-        witness.copy(wire(square, 1), wire(result, 1));
+        witness.copy(wire(square, 0).into(), wire(result, 0));
+        witness.copy(wire(square, 1).into(), wire(result, 1));
         witness.set(wire(result, 2), x.cube() + x + from_const(5));
-        witness.copy(wire(result, 2), wire(nop, 0));
+        witness.copy(wire(result, 2).into(), wire(nop, 0));
         let proof = circuit.prove::<H>(witness, ProvingOptions { blowup_log2 })?;
         assert_eq!(proof.degree_bound(), circuit.degree_bound());
         assert_eq!(proof.blowup_log2(), blowup_log2);
@@ -1046,13 +1082,15 @@ mod tests {
         let x = from_const(3);
         witness.set(wire(square, 0), x);
         witness.set(wire(square, 1), x.square());
-        witness.copy(wire(square, 0), wire(result, 0));
-        witness.copy(wire(square, 1), wire(result, 1));
+        witness.copy(wire(square, 0).into(), wire(result, 0));
+        witness.copy(wire(square, 1).into(), wire(result, 1));
         witness.set(wire(result, 2), x.cube() + x + from_const(5));
-        witness.copy(wire(result, 2), wire(nop, 0));
+        witness.copy(wire(result, 2).into(), wire(nop, 0));
         let blowup_log2 = DEFAULT_BLOWUP_LOG2;
         let options = ProvingOptions { blowup_log2 };
-        let proof = circuit.prove(witness, options.clone()).unwrap();
+        let proof = circuit
+            .prove::<Sha2Hash<Scalar>>(witness, options.clone())
+            .unwrap();
         assert_eq!(proof.degree_bound(), circuit.degree_bound());
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(
@@ -1063,7 +1101,32 @@ mod tests {
     }
 
     #[test]
-    fn test_vitalik_circuit_with_third_degree_constraint() {
+    fn test_vitalik_circuit_with_auto_gates() {
+        let mut builder = CircuitBuilder::default();
+        let [x, square] = builder.auto_gate("w1 == w0 ^ 2".parse().unwrap(), []);
+        let [result] = builder.auto_gate(
+            "w2 == w0 * w1 + w0 + 5".parse().unwrap(),
+            [square.into(), x.into()],
+        );
+        let nop = builder.add_gate(Constraint::nop());
+        builder.connect(result.into(), wire(nop, 0).into());
+        builder.declare_public_gates([nop]);
+        let circuit = builder
+            .build(CompilationOptions {
+                canonicalize_constraints: false,
+            })
+            .unwrap();
+        assert_eq!(circuit.num_rows(), 3);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 3);
+        let mut witness = circuit.make_witness();
+        let value = from_const(3);
+        witness.set(x, value);
+        witness.set(square, value.square());
+        // TODO
+    }
+
+    fn test_vitalik_circuit_with_third_degree_constraint_impl<H: Hash<Scalar>>(blowup_log2: usize) {
         let mut builder = CircuitBuilder::default();
         let result = builder.parse_and_add_gate("w1 == w0 ^ 3 + w0 + 5");
         let nop = builder.add_gate(Constraint::nop());
@@ -1081,16 +1144,121 @@ mod tests {
         let x = from_const(3);
         witness.set(wire(result, 0), x);
         witness.set(wire(result, 1), x.cube() + x + from_const(5));
-        witness.copy(wire(result, 1), wire(nop, 0));
-        let blowup_log2 = DEFAULT_BLOWUP_LOG2;
+        witness.copy(wire(result, 1).into(), wire(nop, 0));
         let options = ProvingOptions { blowup_log2 };
-        let proof = circuit.prove(witness, options.clone()).unwrap();
+        let proof = circuit.prove::<H>(witness, options.clone()).unwrap();
         assert_eq!(proof.degree_bound(), circuit.degree_bound());
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(
             proof.extended_domain_size(),
             circuit.degree_bound() << blowup_log2
         );
-        assert!(circuit.verify::<Sha2Hash<Scalar>>(&proof, options).is_ok());
+        assert!(circuit.verify::<H>(&proof, options).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_with_third_degree_constraint_sha2_blowup_2() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Sha2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_with_third_degree_constraint_poseidon2_blowup_2() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Poseidon2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_with_third_degree_constraint_sha2_blowup_4() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Sha2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_with_third_degree_constraint_poseidon2_blowup_4() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_with_third_degree_constraint_sha2_blowup_8() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Sha2Hash<Scalar>>(3);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_with_third_degree_constraint_poseidon2_blowup_8() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Poseidon2Hash<Scalar>>(3);
+    }
+
+    /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
+    /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81).
+    fn test_vitalik_circuit_variation_1_impl<H: Hash<Scalar>>(blowup_log2: usize) {
+        let mut builder = CircuitBuilder::default();
+        let square = builder.parse_and_add_gate("w1 == w0 ^ 2");
+        let mul = builder.parse_and_add_gate("w2 == w0 * w1");
+        builder.connect(wire(square, 0).into(), wire(mul, 0).into());
+        let result = builder.parse_and_add_gate("w3 == w0 * w1 + w2 + 5");
+        builder.connect(wire(square, 0).into(), wire(result, 0).into());
+        builder.connect(wire(square, 1).into(), wire(result, 1).into());
+        builder.connect(wire(mul, 2).into(), wire(result, 2).into());
+        let nop = builder.add_gate(Constraint::nop());
+        builder.connect(wire(result, 3).into(), wire(nop, 0).into());
+        builder.declare_public_gates([nop]);
+        let circuit = builder
+            .build(CompilationOptions {
+                canonicalize_constraints: false,
+            })
+            .unwrap();
+        assert_eq!(circuit.num_rows(), 4);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 4);
+        let mut witness = circuit.make_witness();
+        let x = from_const(3);
+        let y = from_const(4);
+        witness.set(wire(square, 0), x);
+        witness.set(wire(square, 1), x.square());
+        witness.set(wire(mul, 0), x);
+        witness.set(wire(mul, 1), y);
+        witness.set(wire(mul, 2), x * y);
+        witness.copy(wire(square, 0).into(), wire(result, 0));
+        witness.copy(wire(square, 1).into(), wire(result, 1));
+        witness.copy(wire(mul, 2).into(), wire(result, 2));
+        witness.set(wire(result, 3), x.cube() + x * y + Scalar::from_const(5));
+        witness.copy(wire(result, 3).into(), wire(nop, 0));
+        let options = ProvingOptions { blowup_log2 };
+        let proof = circuit.prove::<H>(witness, options.clone()).unwrap();
+        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(
+            proof.extended_domain_size(),
+            circuit.degree_bound() << blowup_log2
+        );
+        assert!(circuit.verify::<H>(&proof, options).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_variation_1_sha2_blowup_2() {
+        test_vitalik_circuit_variation_1_impl::<Sha2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_variation_1_poseidon2_blowup_2() {
+        test_vitalik_circuit_variation_1_impl::<Poseidon2Hash<Scalar>>(1);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_variation_1_sha2_blowup_4() {
+        test_vitalik_circuit_variation_1_impl::<Sha2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_variation_1_poseidon2_blowup_4() {
+        test_vitalik_circuit_variation_1_impl::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_variation_1_sha2_blowup_8() {
+        test_vitalik_circuit_variation_1_impl::<Sha2Hash<Scalar>>(3);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_variation_1_poseidon2_blowup_8() {
+        test_vitalik_circuit_variation_1_impl::<Poseidon2Hash<Scalar>>(3);
     }
 }
