@@ -196,16 +196,17 @@ mod tests {
         super::parse(tokens.as_slice()).unwrap()
     }
 
-    #[inline(always)]
+    #[inline]
     fn nop() -> Constraint {
         Constraint::nop()
     }
 
+    #[inline]
     fn make_const(value: u64) -> Constraint {
         Constraint::make_const(Scalar::from_const(value))
     }
 
-    #[inline(always)]
+    #[inline]
     fn var(column_index: usize) -> Constraint {
         Constraint::make_var(column_index)
     }

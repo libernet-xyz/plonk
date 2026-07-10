@@ -43,7 +43,7 @@ impl Constraint {
     /// Makes a `Constraint` whose expression is a single variable reference.
     ///
     /// `column_index` is the index of the witness column the variable refers to.
-    pub(crate) fn make_var(column_index: usize) -> Self {
+    pub fn make_var(column_index: usize) -> Self {
         Constraint {
             monomials: BTreeMap::from([(BTreeMap::from([(column_index, 1)]), Scalar::ONE)]),
         }
@@ -57,6 +57,42 @@ impl Constraint {
     /// The returned constraint is exactly the same as `Constraint::default()`.
     pub fn nop() -> Self {
         Self::default()
+    }
+
+    /// Removes variables with zero exponents from every monomial and monomials with zero
+    /// coefficients from the overall Constraint.
+    ///
+    /// Invoked after every operation so that the invariants are always held.
+    fn normalize(&mut self) {
+        *self = std::mem::take(self).to_normalized();
+    }
+
+    /// Chainable version of [`Self::normalize`].
+    fn to_normalized(self) -> Self {
+        let mut monomials = BTreeMap::default();
+        self.monomials
+            .into_iter()
+            .map(|(variables, coefficient)| {
+                (
+                    variables
+                        .into_iter()
+                        .filter(|(_, exponent)| *exponent != 0)
+                        .collect::<BTreeMap<usize, isize>>(),
+                    coefficient,
+                )
+            })
+            .filter(|(_, coefficient)| *coefficient != Scalar::ZERO)
+            .for_each(
+                |(variables, coefficient)| match monomials.get_mut(&variables) {
+                    Some(preexisting_coefficient) => {
+                        *preexisting_coefficient += coefficient;
+                    }
+                    None => {
+                        monomials.insert(variables, coefficient);
+                    }
+                },
+            );
+        Constraint { monomials }
     }
 
     /// Multiplies two monomials.
@@ -79,9 +115,6 @@ impl Constraint {
             }
         }
         result
-            .into_iter()
-            .filter(|(_, exponent)| *exponent != 0)
-            .collect()
     }
 
     fn isize_to_scalar(value: isize) -> Scalar {
@@ -230,7 +263,7 @@ impl Constraint {
                 })
                 .collect();
         }
-        self
+        self.to_normalized()
     }
 
     /// Indicates whether this constraint is in canonical form as per [`Self::canonicalize`].
@@ -247,7 +280,11 @@ impl Constraint {
     pub fn get_degree(&self) -> usize {
         let mut degree = 0;
         for (variables, &coefficient) in &self.monomials {
-            assert_ne!(coefficient, Scalar::ZERO);
+            assert_ne!(
+                coefficient,
+                Scalar::ZERO,
+                "the constraint is not in normal form"
+            );
             degree = std::cmp::max(
                 degree,
                 variables
@@ -370,10 +407,7 @@ impl AddAssign for Constraint {
                 }
             }
         }
-        self.monomials = std::mem::take(&mut self.monomials)
-            .into_iter()
-            .filter(|(_, coefficient)| *coefficient != Scalar::ZERO)
-            .collect();
+        self.normalize();
     }
 }
 
@@ -388,6 +422,7 @@ impl AddAssign<Scalar> for Constraint {
                 self.monomials.insert(variables, rhs);
             }
         }
+        self.normalize();
     }
 }
 
@@ -435,10 +470,7 @@ impl SubAssign for Constraint {
                 }
             }
         }
-        self.monomials = std::mem::take(&mut self.monomials)
-            .into_iter()
-            .filter(|(_, coefficient)| *coefficient != Scalar::ZERO)
-            .collect();
+        self.normalize();
     }
 }
 
@@ -453,6 +485,7 @@ impl SubAssign<Scalar> for Constraint {
                 self.monomials.insert(variables, -rhs);
             }
         }
+        self.normalize();
     }
 }
 
@@ -526,10 +559,8 @@ impl MulAssign for Constraint {
                 }
             }
         }
-        self.monomials = monomials
-            .into_iter()
-            .filter(|(_, coefficient)| *coefficient != Scalar::ZERO)
-            .collect();
+        self.monomials = monomials;
+        self.normalize();
     }
 }
 
@@ -607,12 +638,11 @@ impl BitXorAssign<isize> for Constraint {
                                     .map(|(column_index, exponent)| (column_index, exponent * rhs))
                                     .collect(),
                                 if rhs < 0 {
-                                    coefficient
-                                        .invert_unwrap()
-                                        .pow_small_vartime(rhs.unsigned_abs())
+                                    coefficient.invert_unwrap()
                                 } else {
-                                    coefficient.pow_small_vartime(rhs as usize)
-                                },
+                                    coefficient
+                                }
+                                .pow_small_vartime(rhs.unsigned_abs()),
                             )
                         })
                         .collect();

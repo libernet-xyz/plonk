@@ -49,6 +49,38 @@ fn padded_size(mut n: usize) -> usize {
     std::cmp::max(2, n.next_power_of_two())
 }
 
+/// Convenience function for constructing a [`Constraint`] representing a single variable (witness
+/// column) on the fly.
+#[inline]
+pub fn var(column_index: usize) -> Constraint {
+    Constraint::make_var(column_index)
+}
+
+/// Convenience function for constructing a constant [`Constraint`] expression on the fly.
+///
+/// You actually don't need this function in most cases because [`Constraint`] instances naturally
+/// compose with [`Scalar`]s and integers. For example:
+///
+///   var(0) * 3 + var(1) * Scalar::from_const(5)  // no need for `make_const` here
+///
+/// One case where you do need `make_const` is when your constraint expression _begins_ with a
+/// constant:
+///
+///   make_const(42) + var(0)
+///
+/// In the above example, `42 + var(0)` wouldn't work because integers and [`Scalar`]s can't compose
+/// with [`Constraint`]s.
+#[inline]
+pub fn make_const(value: Scalar) -> Constraint {
+    Constraint::make_const(value)
+}
+
+/// Convenience function for constructing a [`Wire`].
+#[inline]
+pub fn wire(gate: usize, column: usize) -> Wire {
+    Wire::new(gate, column)
+}
+
 /// Circuit compilation & proving options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompilationOptions {
@@ -114,21 +146,6 @@ pub struct CircuitBuilder {
 }
 
 impl CircuitBuilder {
-    /// Creates a variable representing a witness column.
-    ///
-    /// These variables can be combined with Rust operators to construct gate constraints. Supported
-    /// operations on variables are: addition (`+`), subtraction (binary `-`), negation (unary `-`),
-    /// multiplication (`*`), and exponentiation by a constant (`^` followed by a constant).
-    pub fn var(&self, column_index: usize) -> Constraint {
-        Constraint::make_var(column_index)
-    }
-
-    /// Convenience method to construct a constant constraint expression on the fly.
-    #[inline]
-    pub fn make_const(&self, value: Scalar) -> Constraint {
-        Constraint::make_const(value)
-    }
-
     /// Adds a gate with the specified [`Constraint`] to the circuit.
     ///
     /// Constraints are polynomial expressions that are implicitly equalled to 0, e.g.
@@ -900,20 +917,12 @@ mod tests {
     use starkom_bluesky::from_const;
     use starkom_pcs::hash::{Poseidon2Hash, Sha2Hash};
 
-    #[inline]
-    fn wire(row: usize, column: usize) -> Wire {
-        Wire::new(row, column)
-    }
-
     // This function tests the circuit from Vitalik's PLONK tutorial,
     // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
     fn test_vitalik_circuit_impl<H: Hash<Scalar>>(blowup_log2: usize) -> Result<()> {
         let mut builder = CircuitBuilder::default();
-        let r0 = builder.var(0);
-        let r1 = builder.var(1);
-        let r2 = builder.var(2);
-        let square = builder.add_gate((r0.clone() ^ 2) - r1.clone());
-        let result = builder.add_gate(r0.clone() * r1.clone() + r0 + 5 - r2);
+        let square = builder.add_gate((var(0) ^ 2) - var(1));
+        let result = builder.add_gate(var(0) * var(1) + var(0) + 5 - var(2));
         builder.connect(wire(square, 0), wire(result, 0));
         builder.connect(wire(square, 1), wire(result, 1));
         let nop = builder.add_gate(Constraint::default());
@@ -1002,6 +1011,38 @@ mod tests {
         witness.copy(wire(square, 1), wire(result, 1));
         witness.set(wire(result, 2), x.cube() + x + from_const(5));
         witness.copy(wire(result, 2), wire(nop, 0));
+        let blowup_log2 = DEFAULT_BLOWUP_LOG2;
+        let options = ProvingOptions { blowup_log2 };
+        let proof = circuit.prove(witness, options.clone()).unwrap();
+        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(
+            proof.extended_domain_size(),
+            circuit.degree_bound() << blowup_log2
+        );
+        assert!(circuit.verify::<Sha2Hash<Scalar>>(&proof, options).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_with_third_degree_constraint() {
+        let mut builder = CircuitBuilder::default();
+        let result = builder.parse_and_add_gate("w1 == w0 ^ 3 + w0 + 5");
+        let nop = builder.add_gate(Constraint::nop());
+        builder.connect(wire(result, 1), wire(nop, 0));
+        builder.declare_public_gates([nop]);
+        let circuit = builder
+            .build(CompilationOptions {
+                canonicalize_constraints: false,
+            })
+            .unwrap();
+        assert_eq!(circuit.num_rows(), 2);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 2);
+        let mut witness = circuit.make_witness();
+        let x = from_const(3);
+        witness.set(wire(result, 0), x);
+        witness.set(wire(result, 1), x.cube() + x + from_const(5));
+        witness.copy(wire(result, 1), wire(nop, 0));
         let blowup_log2 = DEFAULT_BLOWUP_LOG2;
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit.prove(witness, options.clone()).unwrap();
