@@ -143,7 +143,7 @@ impl Constraint {
     }
 
     /// Returns a textual representation of the constraint formula.
-    pub fn to_string(&self) -> String {
+    pub fn format_expression(&self) -> String {
         if self.monomials.is_empty() {
             return "0".into();
         }
@@ -382,7 +382,7 @@ impl Debug for Constraint {
 
 impl Display for Constraint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        write!(f, "{}", self.format_expression())
     }
 }
 
@@ -627,7 +627,9 @@ impl BitXorAssign<isize> for Constraint {
             }
             1 => {}
             _ => match self.monomials.len() {
-                0 => {}
+                0 => {
+                    assert!(rhs >= 0, "cannot raise 0 to a negative power");
+                }
                 1 => {
                     self.monomials = std::mem::take(&mut self.monomials)
                         .into_iter()
