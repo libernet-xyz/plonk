@@ -1348,5 +1348,272 @@ mod tests {
         assert_eq!(constraint.to_string(), "w0 * w1");
     }
 
-    // TODO
+    #[test]
+    fn test_pow_0() {
+        let constraint = make_var(0) ^ 0;
+        assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(1));
+        assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(1));
+        assert_eq!(constraint.to_string(), "1");
+    }
+
+    #[test]
+    fn test_pow_0_of_zero() {
+        let constraint = Constraint::nop() ^ 0;
+        assert_eq!(constraint.evaluate(&[]), from_const(1));
+        assert_eq!(constraint.to_string(), "1");
+    }
+
+    #[test]
+    fn test_pow_1() {
+        let constraint = make_var(0) ^ 1;
+        assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(12));
+        assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(34));
+        assert_eq!(constraint.to_string(), "w0");
+    }
+
+    #[test]
+    fn test_pow_1_of_sum() {
+        let constraint = (make_var(0) + make_var(1)) ^ 1;
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(34)]),
+            from_const(46)
+        );
+        assert_eq!(constraint.to_string(), "w0 + w1");
+    }
+
+    #[test]
+    fn test_pow_2() {
+        let constraint = make_var(0) ^ 2;
+        assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(144));
+        assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(1156));
+        assert_eq!(constraint.to_string(), "w0 ^ 2");
+    }
+
+    #[test]
+    fn test_pow_3() {
+        let constraint = make_var(1) ^ 3;
+        assert_eq!(
+            constraint.evaluate(&[from_const(0), from_const(12)]),
+            from_const(1728)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(0), from_const(34)]),
+            from_const(39304)
+        );
+        assert_eq!(constraint.to_string(), "w1 ^ 3");
+    }
+
+    #[test]
+    fn test_pow_negative_1() {
+        let constraint = make_var(0) ^ -1;
+        assert_eq!(
+            constraint.evaluate(&[from_const(12)]) * from_const(12),
+            from_const(1)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34)]) * from_const(34),
+            from_const(1)
+        );
+        assert_eq!(constraint.to_string(), "w0 ^ -1");
+    }
+
+    #[test]
+    fn test_pow_negative_2() {
+        let constraint = make_var(0) ^ -2;
+        let value = from_const(12);
+        assert_eq!(constraint.evaluate(&[value]) * value * value, from_const(1));
+        assert_eq!(constraint.to_string(), "w0 ^ -2");
+    }
+
+    #[test]
+    fn test_pow_of_constant() {
+        let constraint = Constraint::make_const(from_const(3)) ^ 4;
+        assert_eq!(constraint.evaluate(&[]), from_const(81));
+        assert_eq!(constraint.to_string(), "81");
+    }
+
+    #[test]
+    fn test_pow_of_zero_constraint() {
+        let constraint = Constraint::nop() ^ 5;
+        assert_eq!(constraint.evaluate(&[]), from_const(0));
+        assert_eq!(constraint.to_string(), "0");
+    }
+
+    #[test]
+    #[should_panic(expected = "raising a sum to a power is forbidden")]
+    fn test_pow_sum_panics() {
+        let _ = (make_var(0) + make_var(1)) ^ 2;
+    }
+
+    #[test]
+    fn test_compound_pow_1() {
+        let mut constraint = make_var(0);
+        constraint ^= 2;
+        assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(144));
+        assert_eq!(constraint.evaluate(&[from_const(34)]), from_const(1156));
+        assert_eq!(constraint.to_string(), "w0 ^ 2");
+    }
+
+    #[test]
+    fn test_compound_pow_2() {
+        let mut constraint = make_var(1);
+        constraint ^= 3;
+        assert_eq!(
+            constraint.evaluate(&[from_const(0), from_const(12)]),
+            from_const(1728)
+        );
+        assert_eq!(constraint.to_string(), "w1 ^ 3");
+    }
+
+    #[test]
+    fn test_div_1() {
+        let constraint = make_var(0) / make_var(1);
+        assert_eq!(
+            constraint.evaluate(&[from_const(408), from_const(12)]),
+            from_const(34)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(408), from_const(34)]),
+            from_const(12)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(4368), from_const(56)]),
+            from_const(78)
+        );
+        assert_eq!(constraint.to_string(), "w0 * w1 ^ -1");
+    }
+
+    #[test]
+    fn test_div_2() {
+        let constraint = make_var(1) / make_var(0);
+        assert_eq!(
+            constraint.evaluate(&[from_const(12), from_const(408)]),
+            from_const(34)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(34), from_const(408)]),
+            from_const(12)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(56), from_const(4368)]),
+            from_const(78)
+        );
+        assert_eq!(constraint.to_string(), "w0 ^ -1 * w1");
+    }
+
+    #[test]
+    fn test_div_3() {
+        let constraint = make_var(1) / make_var(2);
+        assert_eq!(
+            constraint.evaluate(&[from_const(0), from_const(1904), from_const(56)]),
+            from_const(34)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(0), from_const(1904), from_const(34)]),
+            from_const(56)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(0), from_const(672), from_const(56)]),
+            from_const(12)
+        );
+        assert_eq!(constraint.to_string(), "w1 * w2 ^ -1");
+    }
+
+    #[test]
+    fn test_div_scalar_1() {
+        let divisor = from_const(12);
+        let constraint = make_var(0) / divisor;
+        let expected_coefficient = divisor.invert_vartime().unwrap();
+        assert_eq!(constraint.evaluate(&[from_const(408)]), from_const(34));
+        assert_eq!(constraint.evaluate(&[from_const(672)]), from_const(56));
+        assert_eq!(
+            constraint.to_string(),
+            format!(
+                "{} * w0",
+                Constraint::print_coefficient(&expected_coefficient)
+            )
+        );
+    }
+
+    #[test]
+    fn test_div_scalar_2() {
+        let divisor = from_const(34);
+        let constraint = make_var(0) / divisor;
+        let expected_coefficient = divisor.invert_vartime().unwrap();
+        assert_eq!(constraint.evaluate(&[from_const(408)]), from_const(12));
+        assert_eq!(constraint.evaluate(&[from_const(1904)]), from_const(56));
+        assert_eq!(
+            constraint.to_string(),
+            format!(
+                "{} * w0",
+                Constraint::print_coefficient(&expected_coefficient)
+            )
+        );
+    }
+
+    #[test]
+    fn test_div_another_scalar() {
+        let constraint = make_var(0) / from_const(34) / from_const(56);
+        let expected_coefficient =
+            from_const(34).invert_vartime().unwrap() * from_const(56).invert_vartime().unwrap();
+        assert_eq!(constraint.evaluate(&[from_const(22848)]), from_const(12));
+        assert_eq!(constraint.evaluate(&[from_const(148512)]), from_const(78));
+        assert_eq!(
+            constraint.to_string(),
+            format!(
+                "{} * w0",
+                Constraint::print_coefficient(&expected_coefficient)
+            )
+        );
+    }
+
+    #[test]
+    fn test_div_isize() {
+        let constraint = make_var(0) / 4isize;
+        let expected_coefficient = Constraint::isize_to_scalar(4).invert_vartime().unwrap();
+        assert_eq!(constraint.evaluate(&[from_const(12)]), from_const(3));
+        assert_eq!(constraint.evaluate(&[from_const(40)]), from_const(10));
+        assert_eq!(
+            constraint.to_string(),
+            format!(
+                "{} * w0",
+                Constraint::print_coefficient(&expected_coefficient)
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "division by zero")]
+    fn test_div_by_zero_panics() {
+        let _ = make_var(0) / Constraint::default();
+    }
+
+    #[test]
+    #[should_panic(expected = "dividing by a polynomial is forbidden")]
+    fn test_div_by_sum_panics() {
+        let _ = make_var(0) / (make_var(1) + make_var(2));
+    }
+
+    #[test]
+    fn test_compound_div_1() {
+        let mut constraint = make_var(0);
+        constraint /= make_var(1);
+        assert_eq!(
+            constraint.evaluate(&[from_const(408), from_const(12)]),
+            from_const(34)
+        );
+        assert_eq!(
+            constraint.evaluate(&[from_const(408), from_const(34)]),
+            from_const(12)
+        );
+        assert_eq!(constraint.to_string(), "w0 * w1 ^ -1");
+    }
+
+    #[test]
+    fn test_compound_div_2() {
+        let mut constraint = make_var(0);
+        constraint /= from_const(12);
+        assert_eq!(constraint.evaluate(&[from_const(408)]), from_const(34));
+        assert_eq!(constraint.evaluate(&[from_const(672)]), from_const(56));
+    }
 }
