@@ -549,17 +549,32 @@ impl Circuit {
     /// This function is used to calculate exactly how many chunks the quotient needs to be split
     /// into before getting committed.
     ///
-    /// The algorithm assumes that all gate selectors have degree<N, where N is the general
-    /// [degree bound](`Self::degree_bound`) of the circuit.
+    /// The algorithm uses the formula `(N - 1) * E`, where E = `max(max_gate_degree, num_columns)`
+    /// and N is the general [degree bound](`Self::degree_bound`) of the circuit. The rationale
+    /// behind it is:
+    ///
+    /// * each column has degree less than or equal to `N - 1`;
+    /// * the grand gate constraint has degree less than or equal to
+    ///   `(N - 1) * (1 + max_gate_degree)` (the selector contributes one factor, degree composition
+    ///   with the constraint columns contributes `max_gate_degree` more);
+    /// * the recurrence constraint of the permutation argument has degree less than or equal to
+    ///   `(N - 1) * (1 + num_columns)` (the accumulator/shifted term contributes one factor, one
+    ///   more per column);
+    /// * the grand PLONK constraint (grand gate constraint + permutation argument fixpoint
+    ///   constraint + permutation argument recurrence constraint) has degree less than or equal to
+    ///   `(N - 1) * (1 + E)`;
+    /// * dividing that by the zero polynomial (`x^N-1`, degree-N) yields a quotient with degree
+    ///   `(N - 1) * (1 + E) - N`;
+    /// * so the degree bound of the quotient is `(N - 1) * (1 + E) - N + 1`
+    /// * ... which simplifies to `(N - 1) * E`.
     fn get_quotient_degree_bound(&self) -> usize {
-        (self.degree_bound - 1)
-            * (1 + self
-                .gates
-                .iter()
-                .map(|(constraint, _)| constraint.get_degree())
-                .max()
-                .unwrap_or(0))
-            + 1
+        let max_gate_degree = self
+            .gates
+            .iter()
+            .map(|(constraint, _)| constraint.get_degree())
+            .max()
+            .unwrap_or(0);
+        (self.degree_bound - 1) * std::cmp::max(max_gate_degree, self.num_columns)
     }
 
     /// Splits the quotient polynomial in chunks so that it can be batch-committed even if its
@@ -756,12 +771,13 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
     ///
     /// See [`Circuit::get_quotient_degree_bound`] for details.
     fn get_num_quotient_chunks(&self) -> usize {
-        1 + self
+        let max_gate_degree = self
             .gates
             .iter()
             .map(|constraint| constraint.get_degree())
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        std::cmp::max(max_gate_degree, self.num_columns)
     }
 
     fn lagrange0(x: Scalar, n: usize) -> Scalar {
