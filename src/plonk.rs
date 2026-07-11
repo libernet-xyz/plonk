@@ -1,32 +1,34 @@
-use crate::circuit::{GateConstraint, Wire, WirePartitioning, padded_size};
+use crate::Constraint;
+use crate::WireOrUnconstrained;
 use crate::utils;
-use crate::witness::Witness;
-use anyhow::{Context, Result, anyhow};
+use crate::wires::{Wire, WirePartitioner};
+use anyhow::{Result, anyhow};
 use starkom_bluesky::Scalar;
 use starkom_ff::Field;
+use starkom_ff::PrimeField;
 use starkom_pcs::{self as pcs, hash::Hash};
-use starkom_poly;
 use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
+use std::ops::{Index, IndexMut};
 use std::sync::LazyLock;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
 
-/// Number of extra rows that implicitly added to all circuits and witnesses for blinding.
+/// Default blowup factor (16) in logarithmic form.
+///
+/// Used with the underlying PCS to compute low-degree extensions.
+pub const OPTIONS_DEFAULT_BLOWUP_LOG2: usize = 4;
+
+/// Number of extra rows that are implicitly added to all circuits and witnesses for blinding.
 ///
 /// Blinding rows are appended at the end using NOP gates and random scalars in the witness.
 ///
 /// The reason why PLONK requires 3 of them is that they must be strictly more than the number of
 /// off-domain locations opened in the underlying polynomial commitment scheme, and PLONK requires
-/// opening two such locations: the Fiat-Shamir challenge xi and also xi*omega (the latter is for
-/// the coordinate pair accumulator polynomial of the permutation argument, which contains the
-/// witness columns in its definition).
+/// opening two such locations: the Fiat-Shamir challenge xi and the shifted point xi*omega (the
+/// latter is for the coordinate pair accumulator polynomial of the permutation argument, which
+/// contains the witness columns in its definition).
 pub const NUM_BLINDING_ROWS: usize = 3;
-
-/// Domain separator tag used for the main Fiat-Shamir challenge.
-static DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/plonk/challenge"));
-
-const K1: Scalar = Scalar::from_const(71);
-const K2: Scalar = Scalar::from_const(104);
 
 const COMMIT_INDEX_CIRCUIT: usize = 0;
 const COMMIT_INDEX_WITNESS: usize = 1;
@@ -34,593 +36,581 @@ const COMMIT_INDEX_PERMUTATION_ARGUMENT: usize = 2;
 const COMMIT_INDEX_QUOTIENT: usize = 3;
 const NUM_COMMIT_INDICES: usize = 4;
 
-#[derive(Debug, Default)]
+const FIAT_SHAMIR_INDEX_ALPHA: Scalar = Scalar::from_const(0);
+const FIAT_SHAMIR_INDEX_BETA: Scalar = Scalar::from_const(1);
+const FIAT_SHAMIR_INDEX_GAMMA: Scalar = Scalar::from_const(2);
+const FIAT_SHAMIR_INDEX_DELTA: Scalar = Scalar::from_const(3);
+const FIAT_SHAMIR_INDEX_XI: Scalar = Scalar::from_const(4);
+
+/// Domain separator tag used for the main Fiat-Shamir challenge.
+static DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/plonk/challenge"));
+
+fn padded_size(mut n: usize) -> usize {
+    n += NUM_BLINDING_ROWS;
+    std::cmp::max(2, n.next_power_of_two())
+}
+
+/// Calculates the degree bound of the PLONK quotient, typically much higher than the circuit's
+/// general [degree bound](`Circuit::degree_bound`) `N` because the constraint equations involve
+/// several polynomial multiplications, such as the gate selectors multiplied by the gate
+/// constraints combined with the witness columns.
+///
+/// The algorithm uses the formula `(N - 1) * E`, where `E = max(max_gate_degree, num_columns)`.
+/// The rationale behind it is:
+///
+/// * each column has degree less than or equal to `N - 1`;
+/// * the grand gate constraint has degree less than or equal to
+///   `(N - 1) * (1 + max_gate_degree)` (the selector contributes one factor, degree composition
+///   with the constraint columns contributes `max_gate_degree` more);
+/// * the recurrence constraint of the permutation argument has degree less than or equal to
+///   `(N - 1) * (1 + num_columns)` (the accumulator/shifted term contributes one factor, one more
+///   per column);
+/// * the grand PLONK constraint (grand gate constraint + permutation argument fixpoint constraint
+///   + permutation argument recurrence constraint) has degree less than or equal to
+///   `(N - 1) * (1 + E)`;
+/// * dividing that by the zero polynomial (`x^N - 1`, degree-N) yields a quotient with degree
+///   `(N - 1) * (1 + E) - N`;
+/// * so the degree bound of the quotient is `(N - 1) * (1 + E) - N + 1`
+/// * ... which simplifies to `(N - 1) * E`.
+fn quotient_degree_bound<'a, I: Iterator<Item = &'a Constraint>>(
+    degree_bound: usize,
+    num_columns: usize,
+    gate_constraints: I,
+) -> usize {
+    let max_gate_degree = gate_constraints
+        .map(|constraint| constraint.get_degree())
+        .max()
+        .unwrap_or(0);
+    (degree_bound - 1) * std::cmp::max(max_gate_degree, num_columns)
+}
+
+/// Convenience function for constructing a [`Constraint`] representing a single variable (witness
+/// column) on the fly.
+#[inline]
+pub fn var(column_index: usize) -> Constraint {
+    Constraint::make_var(column_index)
+}
+
+/// Convenience function for constructing a constant [`Constraint`] expression on the fly.
+///
+/// You actually don't need this function in most cases because [`Constraint`] instances naturally
+/// compose with [`Scalar`]s and integers. For example:
+///
+///   var(0) * 3 + var(1) * Scalar::from_const(5)  // no need for `make_const` here
+///
+/// One case where you do need `make_const` is when your constraint expression _begins_ with a
+/// constant:
+///
+///   make_const(42) + var(0)
+///
+/// In the above example, `42 + var(0)` wouldn't work because integers and [`Scalar`]s can't compose
+/// with [`Constraint`]s.
+#[inline]
+pub fn make_const(value: Scalar) -> Constraint {
+    Constraint::make_const(value)
+}
+
+/// Convenience function for constructing a [`Wire`].
+#[inline]
+pub fn wire(gate: usize, column: usize) -> Wire {
+    Wire::new(gate, column)
+}
+
+/// Circuit compilation & proving options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompilationOptions {
+    /// Converts all constraints to canonical form using [`Constraint::canonicalize`].
+    ///
+    /// When disabled, proving errors out rather than attempting canonicalization if there are
+    /// negative exponents.
+    ///
+    /// Canonicalization is carried out inside [`CircuitBuilder::build`].
+    ///
+    /// WARNING: canonicalized constraints may be more permissive than their original form because a
+    /// negative exponent requires the variable to be different from zero. Starkom does not allow
+    /// proving with negative exponents, so enable this flag only if your circuit is correctly
+    /// constrained even when those variables are zero.
+    pub canonicalize_constraints: bool,
+}
+
+impl Default for CompilationOptions {
+    fn default() -> Self {
+        Self {
+            canonicalize_constraints: false,
+        }
+    }
+}
+
+/// Circuit compilation & proving options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvingOptions {
+    /// Log2 of the blowup factor used to compute the low-degree extensions for the underlying PCS.
+    pub blowup_log2: usize,
+}
+
+impl Default for ProvingOptions {
+    fn default() -> Self {
+        Self {
+            blowup_log2: OPTIONS_DEFAULT_BLOWUP_LOG2,
+        }
+    }
+}
+
+/// Allows building PLONK [`Circuit`]s.
+#[derive(Debug, Default, Clone)]
 pub struct CircuitBuilder {
-    gates: Vec<GateConstraint>,
-    wires: WirePartitioning,
+    /// Current number of gates/rows in the circuit.
+    num_rows: usize,
+
+    /// Current number of columns in the circuit.
+    num_columns: usize,
+
+    /// The gates of the circuit, indexed by constraint.
+    ///
+    /// For every gate type (that is, for every unique gate constraint) this map associates the list
+    /// of rows where the gate is active. During circuit compilation (triggered by
+    /// [`Self::build`]) each list of rows will be converted to a Lagrange basis that activates on
+    /// those rows, aka a "selector".
+    gates: BTreeMap<Constraint, Vec<usize>>,
+
+    /// Wire partitioning inferred from the connections made with [`Self::connect`].
+    wires: WirePartitioner,
+
+    /// List of gates that are revealed in the proofs. Each element is a row index.
     public_gates: BTreeSet<usize>,
 }
 
 impl CircuitBuilder {
-    /// Returns the size of the circuit built so far.
-    pub fn len(&self) -> usize {
-        self.gates.len()
-    }
-
-    /// Returns the number of gates added so far.
+    /// Adds a gate with the specified [`Constraint`] to the circuit.
     ///
-    /// This is exactly the same as `len()`.
-    pub fn gate_count(&self) -> usize {
-        self.len()
-    }
-
-    pub fn add_raw_gate(
-        &mut self,
-        ql: Scalar,
-        qr: Scalar,
-        qo: Scalar,
-        qm: Scalar,
-        qc: Scalar,
-    ) -> usize {
-        let index = self.gates.len();
-        self.gates.push(GateConstraint { ql, qr, qo, qm, qc });
-        index
-    }
-
-    pub fn connect(&mut self, wire1: Wire, wire2: Wire) {
-        self.wires.connect(wire1, wire2);
-    }
-
-    pub fn add_unary_gate(
-        &mut self,
-        ql: Scalar,
-        qr: Scalar,
-        qo: Scalar,
-        qm: Scalar,
-        qc: Scalar,
-        input: Option<Wire>,
-    ) -> Wire {
-        let gate = self.add_raw_gate(ql, qr, qo, qm, qc);
-        self.connect(Wire::LeftIn(gate), Wire::RightIn(gate));
-        if let Some(input) = input {
-            self.connect(input, Wire::LeftIn(gate));
-        }
-        Wire::Out(gate)
-    }
-
-    pub fn add_binary_gate(
-        &mut self,
-        ql: Scalar,
-        qr: Scalar,
-        qo: Scalar,
-        qm: Scalar,
-        qc: Scalar,
-        lhs: Option<Wire>,
-        rhs: Option<Wire>,
-    ) -> Wire {
-        let gate = self.add_raw_gate(ql, qr, qo, qm, qc);
-        if let Some(lhs) = lhs {
-            self.connect(lhs, Wire::LeftIn(gate));
-        }
-        if let Some(rhs) = rhs {
-            self.connect(rhs, Wire::RightIn(gate));
-        }
-        Wire::Out(gate)
-    }
-
-    pub fn add_nop_gate(
-        &mut self,
-        lhs: Option<Wire>,
-        rhs: Option<Wire>,
-        out: Option<Wire>,
-    ) -> usize {
-        let gate = self.add_raw_gate(
-            Scalar::ZERO,
-            Scalar::ZERO,
-            Scalar::ZERO,
-            Scalar::ZERO,
-            Scalar::ZERO,
+    /// Constraints are polynomial expressions that are implicitly equalled to 0, e.g.
+    /// `w0 ^ 3 + w0 - 30 == 0`. All variables within constraint expressions are named `w` followed
+    /// by a number and represent witness columns: `w0` refers to the 0-th witness column, `w1` to
+    /// the first, and so on.
+    pub fn add_gate(&mut self, constraint: Constraint) -> usize {
+        self.num_columns = std::cmp::max(
+            self.num_columns,
+            1 + constraint
+                .get_free_variables()
+                .into_iter()
+                .max()
+                .unwrap_or(0),
         );
-        if let Some(lhs) = lhs {
-            self.connect(lhs, Wire::LeftIn(gate));
+        let row = self.num_rows;
+        self.num_rows += 1;
+        match self.gates.get_mut(&constraint) {
+            Some(rows) => {
+                rows.push(row);
+            }
+            None => {
+                self.gates.insert(constraint, vec![row]);
+            }
         }
-        if let Some(rhs) = rhs {
-            self.connect(rhs, Wire::RightIn(gate));
+        row
+    }
+
+    /// Adds a gate from a parsed constraint expression, panicking if parsing fails.
+    ///
+    /// Equivalent to `builder.add_gate(expr.parse().unwrap())`.
+    pub fn parse_and_add_gate(&mut self, expr: &'static str) -> usize {
+        self.add_gate(expr.parse().unwrap())
+    }
+
+    /// Connects two [`Wire`]s of the circuit.
+    pub fn connect(&mut self, wire1: Option<Wire>, wire2: Option<Wire>) {
+        match (wire1, wire2) {
+            (Some(wire1), Some(wire2)) => {
+                self.wires.connect(wire1, wire2);
+            }
+            _ => {}
         }
-        if let Some(out) = out {
-            self.connect(out, Wire::Out(gate));
-        }
-        gate
     }
 
-    pub fn add_const_gate(&mut self, value: Scalar) -> Wire {
-        Wire::Out(self.add_raw_gate(
-            Scalar::from_const(0),
-            Scalar::from_const(0),
-            Scalar::from_const(1),
-            Scalar::from_const(0),
-            -value,
-        ))
-    }
-
-    pub fn add_sum_gate(&mut self, lhs: Option<Wire>, rhs: Option<Wire>) -> Wire {
-        self.add_binary_gate(
-            Scalar::from_const(1),
-            Scalar::from_const(1),
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            Scalar::from_const(0),
-            lhs,
-            rhs,
-        )
-    }
-
-    pub fn add_sum_with_const_gate(&mut self, lhs: Option<Wire>, c: Scalar) -> Wire {
-        self.add_unary_gate(
-            Scalar::from_const(1),
-            Scalar::from_const(0),
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            c,
-            lhs,
-        )
-    }
-
-    pub fn add_sub_gate(&mut self, lhs: Option<Wire>, rhs: Option<Wire>) -> Wire {
-        self.add_binary_gate(
-            Scalar::from_const(1),
-            -Scalar::from_const(1),
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            Scalar::from_const(0),
-            lhs,
-            rhs,
-        )
-    }
-
-    pub fn add_sub_const_gate(&mut self, lhs: Option<Wire>, c: Scalar) -> Wire {
-        self.add_unary_gate(
-            Scalar::from_const(1),
-            Scalar::from_const(0),
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            -c,
-            lhs,
-        )
-    }
-
-    pub fn add_sub_from_const_gate(&mut self, c: Scalar, rhs: Option<Wire>) -> Wire {
-        self.add_unary_gate(
-            Scalar::from_const(0),
-            -Scalar::from_const(1),
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            c,
-            rhs,
-        )
-    }
-
-    pub fn add_mul_gate(&mut self, lhs: Option<Wire>, rhs: Option<Wire>) -> Wire {
-        self.add_binary_gate(
-            Scalar::from_const(0),
-            Scalar::from_const(0),
-            -Scalar::from_const(1),
-            Scalar::from_const(1),
-            Scalar::from_const(0),
-            lhs,
-            rhs,
-        )
-    }
-
-    pub fn add_square_gate(&mut self, input: Option<Wire>) -> Wire {
-        self.add_unary_gate(
-            Scalar::from_const(0),
-            Scalar::from_const(0),
-            Scalar::from_const(1),
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            input,
-        )
-    }
-
-    pub fn add_mul_by_const_gate(&mut self, lhs: Option<Wire>, c: Scalar) -> Wire {
-        self.add_unary_gate(
-            c,
-            Scalar::from_const(0),
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            Scalar::from_const(0),
-            lhs,
-        )
-    }
-
-    pub fn add_linear_combination_gate(
+    /// Adds a gate with `N` inputs and `M` outputs.
+    ///
+    /// The provided `constraint` must use exactly `N+M` variables, or the function will panic. The
+    /// provided inputs wires are wrapped in `Option`s because `None` means the corresponding input
+    /// wire of the gate must remain unconstrained.
+    ///
+    /// The first `N` variables used in the constraint (those with the lowest column numbers) will
+    /// be automatically connected to the specified input wires unless they're unconstrained / None,
+    /// while the last `M` variables (those with the highest column numbers) will be returned as
+    /// output wires.
+    pub fn auto_gate<const N: usize, const M: usize>(
         &mut self,
-        c1: Scalar,
-        lhs: Option<Wire>,
-        c2: Scalar,
-        rhs: Option<Wire>,
-    ) -> Wire {
-        self.add_binary_gate(
-            c1,
-            c2,
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            Scalar::from_const(0),
-            lhs,
-            rhs,
-        )
+        constraint: Constraint,
+        inputs: [Option<Wire>; N],
+    ) -> [Wire; M] {
+        let variables: Vec<usize> = constraint.get_free_variables().into_iter().collect();
+        assert_eq!(variables.len(), N + M);
+        let gate = self.add_gate(constraint);
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.connect(Some(input), Some(wire(gate, variables[i])));
+            }
+        }
+        std::array::from_fn(|i| wire(gate, variables[N + i]))
     }
 
-    pub fn add_poly2_gate(
-        &mut self,
-        c1: Scalar,
-        c2: Scalar,
-        c3: Scalar,
-        input: Option<Wire>,
-    ) -> Wire {
-        self.add_unary_gate(
-            c2,
-            Scalar::from_const(0),
-            -Scalar::from_const(1),
-            c1,
-            c3,
-            input,
-        )
-    }
-
-    pub fn add_bit_assertion_gate(&mut self, input: Option<Wire>) {
-        self.add_unary_gate(
-            Scalar::from_const(1),
-            Scalar::from_const(0),
-            Scalar::from_const(0),
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            input,
-        );
-    }
-
-    pub fn add_trit_assertion_gate(&mut self, input: Option<Wire>) {
-        let lhs = self.add_poly2_gate(
-            Scalar::from_const(1),
-            -Scalar::from_const(3),
-            Scalar::from_const(2),
-            input,
-        );
-        self.add_binary_gate(
-            Scalar::from_const(0),
-            Scalar::from_const(0),
-            Scalar::from_const(0),
-            Scalar::from_const(1),
-            Scalar::from_const(0),
-            lhs.into(),
-            input,
-        );
-    }
-
-    pub fn add_not_gate(&mut self, input: Option<Wire>) -> Wire {
-        self.add_unary_gate(
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            Scalar::from_const(1),
-            input,
-        )
-    }
-
-    pub fn add_and_gate(&mut self, lhs: Option<Wire>, rhs: Option<Wire>) -> Wire {
-        self.add_binary_gate(
-            Scalar::from_const(0),
-            Scalar::from_const(0),
-            -Scalar::from_const(1),
-            Scalar::from_const(1),
-            Scalar::from_const(0),
-            lhs,
-            rhs,
-        )
-    }
-
-    pub fn add_or_gate(&mut self, lhs: Option<Wire>, rhs: Option<Wire>) -> Wire {
-        self.add_binary_gate(
-            Scalar::from_const(1),
-            Scalar::from_const(1),
-            -Scalar::from_const(1),
-            -Scalar::from_const(1),
-            Scalar::from_const(0),
-            lhs,
-            rhs,
-        )
-    }
-
-    pub fn add_xor_gate(&mut self, lhs: Option<Wire>, rhs: Option<Wire>) -> Wire {
-        self.add_binary_gate(
-            Scalar::from_const(1),
-            Scalar::from_const(1),
-            -Scalar::from_const(1),
-            -Scalar::from_const(2),
-            Scalar::from_const(0),
-            lhs,
-            rhs,
-        )
-    }
-
-    fn add_blinding_gates(&mut self) {
-        self.add_nop_gate(None, None, None);
-        self.add_nop_gate(None, None, None);
-        self.add_nop_gate(None, None, None);
-    }
-
+    /// Updates the list of witness rows that are revealed.
+    ///
+    /// This method drops any previously provided lists, so if it's called multiple times only the
+    /// list provided in the last call is used.
+    ///
+    /// Ideally you should call this method only once after adding all gates, right before
+    /// [`CircuitBuilder::build`].
     pub fn declare_public_gates<I: IntoIterator<Item = usize>>(&mut self, gates: I) {
         self.public_gates = BTreeSet::from_iter(gates);
     }
 
-    fn build_identity_permutation(&self) -> (Vec<Scalar>, Vec<Scalar>, Vec<Scalar>) {
-        let n = padded_size(self.gates.len());
-        let mut x = vec![Scalar::ZERO; n * 3];
-        if n > 0 {
-            x[0] = Scalar::ONE;
-            x[n] = K1;
-            x[n * 2] = K2;
-        }
-        let omega = Polynomial::domain_element2(1, n);
-        for i in 1..n {
-            x[i] = x[i - 1] * omega;
-            x[i + n] = x[i + n - 1] * omega;
-            x[i + n * 2] = x[i + n * 2 - 1] * omega;
-        }
-        for node in self.wires.iter_nodes() {
-            let indices: Vec<usize> = node.iter().map(|wire| wire.sigma_index(n)).collect();
-            let mut permuted: Vec<Scalar> = indices.iter().map(|i| x[*i]).collect();
-            permuted.rotate_left(1);
-            for i in 0..indices.len() {
-                x[indices[i]] = permuted[i];
-            }
-        }
-        (
-            x[0..n].to_vec(),
-            x[n..(n * 2)].to_vec(),
-            x[(n * 2)..(n * 3)].to_vec(),
-        )
-    }
+    /// Compiles the circuit built so far into a [`Circuit`] object.
+    pub fn build(self, options: CompilationOptions) -> Result<Circuit> {
+        let degree_bound = padded_size(self.num_rows);
 
-    pub fn build(mut self) -> Circuit {
-        self.add_blinding_gates();
-        let n = padded_size(self.gates.len());
-        let pad = n - self.gates.len();
-        let ql = Polynomial::encode2(
-            self.gates
-                .iter()
-                .map(|gate| gate.ql)
-                .chain(std::iter::repeat_n(Scalar::ZERO, pad))
-                .collect(),
-        );
-        let qr = Polynomial::encode2(
-            self.gates
-                .iter()
-                .map(|gate| gate.qr)
-                .chain(std::iter::repeat_n(Scalar::ZERO, pad))
-                .collect(),
-        );
-        let qo = Polynomial::encode2(
-            self.gates
-                .iter()
-                .map(|gate| gate.qo)
-                .chain(std::iter::repeat_n(Scalar::ZERO, pad))
-                .collect(),
-        );
-        let qm = Polynomial::encode2(
-            self.gates
-                .iter()
-                .map(|gate| gate.qm)
-                .chain(std::iter::repeat_n(Scalar::ZERO, pad))
-                .collect(),
-        );
-        let qc = Polynomial::encode2(
-            self.gates
-                .iter()
-                .map(|gate| gate.qc)
-                .chain(std::iter::repeat_n(Scalar::ZERO, pad))
-                .collect(),
-        );
-        let (sl_values, sr_values, so_values) = self.build_identity_permutation();
-        let sl = Polynomial::encode2(sl_values.clone());
-        let sr = Polynomial::encode2(sr_values.clone());
-        let so = Polynomial::encode2(so_values.clone());
-        Circuit {
-            size: self.gates.len(),
-            public_gates: self.public_gates,
-            ql,
-            qr,
-            qo,
-            qm,
-            qc,
-            sl_values,
-            sl,
-            sr_values,
-            sr,
-            so_values,
-            so,
-        }
-    }
+        let gates = self
+            .gates
+            .into_iter()
+            .map(|(mut constraint, rows)| {
+                if !constraint.is_canonical() {
+                    if options.canonicalize_constraints {
+                        constraint = constraint.canonicalize();
+                    } else {
+                        return Err(anyhow!(
+                            "constraint `{}` is not in canonical form",
+                            constraint
+                        ));
+                    }
+                }
+                let mut data = vec![Scalar::ZERO; degree_bound];
+                for row in rows {
+                    data[row] = Scalar::ONE;
+                }
+                Ok((constraint, Polynomial::encode2(data)))
+            })
+            .collect::<Result<_>>()?;
 
-    pub fn check_witness(&self, witness: &Witness) -> Result<()> {
-        let size = self.gates.len();
-        if witness.size() != size + NUM_BLINDING_ROWS {
-            return Err(anyhow!(
-                "incorrect witness size (got {}, want {})",
-                witness.size(),
-                size + NUM_BLINDING_ROWS
-            ));
-        }
-        for i in 0..size {
-            let lhs = witness.left[i];
-            let rhs = witness.right[i];
-            let out = witness.out[i];
-            let (ql, qr, qo, qm, qc) = match self.gates[i] {
-                GateConstraint { ql, qr, qo, qm, qc } => (ql, qr, qo, qm, qc),
-            };
-            if ql * lhs + qr * rhs + qo * out + qm * lhs * rhs + qc != Scalar::ZERO {
-                return Err(anyhow!("gate constraint {} violated", i));
+        let sigma_values: Vec<Vec<Scalar>> = {
+            let mut sigma = vec![Scalar::ZERO; degree_bound * self.num_columns];
+            let omega = Polynomial::domain_element2(1, degree_bound);
+            let mut k = Scalar::ONE;
+            for i in 0..self.num_columns {
+                let offset = i * degree_bound;
+                sigma[offset] = k;
+                for j in 1..degree_bound {
+                    sigma[offset + j] = sigma[offset + j - 1] * omega;
+                }
+                k *= Scalar::MULTIPLICATIVE_GENERATOR;
             }
-        }
-        for node in self.wires.iter_nodes() {
-            let mut iter = node.iter();
-            let value = match *iter.next().unwrap() {
-                Wire::LeftIn(index) => witness.left[index as usize],
-                Wire::RightIn(index) => witness.right[index as usize],
-                Wire::Out(index) => witness.out[index as usize],
-            };
-            while let Some(wire) = iter.next() {
-                let next = match *wire {
-                    Wire::LeftIn(index) => witness.left[index as usize],
-                    Wire::RightIn(index) => witness.right[index as usize],
-                    Wire::Out(index) => witness.out[index as usize],
-                };
-                if next != value {
-                    return Err(anyhow!("wire constraint violated"));
+            for node in self.wires.iter_nodes() {
+                let indices: Vec<usize> = node
+                    .iter()
+                    .map(|wire| wire.column() * degree_bound + wire.row())
+                    .collect();
+                let mut permuted: Vec<Scalar> = indices.iter().map(|&i| sigma[i]).collect();
+                permuted.rotate_left(1);
+                for i in 0..indices.len() {
+                    sigma[indices[i]] = permuted[i];
                 }
             }
-        }
-        Ok(())
+            sigma
+                .chunks_exact(degree_bound)
+                .map(|chunk| chunk.to_vec())
+                .collect()
+        };
+
+        let sigma = sigma_values
+            .iter()
+            .map(|chunk| Polynomial::encode2(chunk.to_vec()))
+            .collect();
+
+        Ok(Circuit {
+            num_rows: self.num_rows,
+            degree_bound,
+            num_columns: self.num_columns,
+            gates,
+            sigma,
+            sigma_values,
+            public_gates: self.public_gates,
+        })
     }
 }
 
 #[derive(Debug, Clone)]
+pub struct Witness {
+    /// The number of witness rows *not* including the blinding rows.
+    num_rows: usize,
+
+    /// Used by [`Self::auto_set`] to identify the row to update.
+    gate_counter: usize,
+
+    /// Witness table cells, indexed column-first.
+    ///
+    /// The column-first indexing allows quickly interpolating polynomials for the columns.
+    data: Vec<Vec<Scalar>>,
+}
+
+impl Witness {
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    pub fn degree_bound(&self) -> usize {
+        padded_size(self.num_rows)
+    }
+
+    pub fn num_columns(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Reads a witness cell.
+    pub fn get(&self, wire: Wire) -> Scalar {
+        let row = wire.row();
+        assert!(row < self.num_rows);
+        self.data[wire.column()][row]
+    }
+
+    /// Updates a witness cell.
+    pub fn set(&mut self, wire: Wire, value: Scalar) {
+        let row = wire.row();
+        assert!(row < self.num_rows);
+        self.data[wire.column()][row] = value;
+    }
+
+    /// Copies a witness cell to another.
+    pub fn copy<W: Into<WireOrUnconstrained>>(&mut self, src_wire: W, dst_wire: Wire) -> Scalar {
+        match src_wire.into() {
+            WireOrUnconstrained::Wire(src_wire) => {
+                let src_row = src_wire.row();
+                let dst_row = dst_wire.row();
+                assert!(src_row < self.num_rows);
+                assert!(dst_row < self.num_rows);
+                let value = self.data[src_wire.column()][src_row];
+                self.data[dst_wire.column()][dst_row] = value;
+                value
+            }
+            WireOrUnconstrained::Unconstrained(src_value) => {
+                let dst_row = dst_wire.row();
+                assert!(dst_row < self.num_rows);
+                self.data[dst_wire.column()][dst_row] = src_value;
+                src_value
+            }
+        }
+    }
+
+    /// Sets output variables in the current witness row to the values computed by the provided
+    /// `expressions`, evaluated in the specified `inputs`.
+    ///
+    /// The "current witness row" is kept track of by `Witness` using an internal counter, and
+    /// requires that the auto-set API is used consistently throughout the entire circuit. Only
+    /// [`Self::auto_set`] and [`Self::auto_set_one`] read and update the internal gate counter, so
+    /// if you mix APIs (i.e. set some cells with `auto_set` and some others with [`Self::set`]) the
+    /// counter will loose track of the current row and the witness will be incorrect.
+    ///
+    /// The generic parameter `N` is the number of input wires while `M` is the number of output
+    /// wires. The number of `expressions` entries MUST be equal to `M`, and the union of the
+    /// [free variables](`Constraint::get_free_variables`) of all expressions MUST have exactly `N`
+    /// elements.
+    pub fn auto_set<W: Into<WireOrUnconstrained>, const N: usize, const M: usize>(
+        &mut self,
+        expressions: BTreeMap<usize, Constraint>,
+        inputs: [W; N],
+    ) -> [Wire; M] {
+        assert_eq!(expressions.len(), M);
+        let free_variables = expressions
+            .iter()
+            .map(|(_, expression)| expression.get_free_variables())
+            .fold(BTreeSet::default(), |mut accumulator, mut variables| {
+                accumulator.append(&mut variables);
+                accumulator
+            });
+        assert_eq!(free_variables.len(), N);
+        let row_index = self.gate_counter;
+        self.gate_counter += 1;
+        let mut variables = vec![Scalar::ZERO; self.data.len()];
+        for (column_index, input) in free_variables.into_iter().zip(inputs.into_iter()) {
+            let value = match input.into() {
+                WireOrUnconstrained::Wire(wire) => self.data[wire.column()][wire.row()],
+                WireOrUnconstrained::Unconstrained(value) => value,
+            };
+            self.data[column_index][row_index] = value;
+            variables[column_index] = value;
+        }
+        expressions
+            .into_iter()
+            .map(|(column_index, expression)| {
+                self.data[column_index][row_index] = expression.evaluate(variables.as_slice());
+                wire(row_index, column_index)
+            })
+            .collect::<Vec<Wire>>()
+            .try_into()
+            .unwrap()
+    }
+
+    /// Like [`Self::auto_set`], but produces only one output.
+    pub fn auto_set_one<W: Into<WireOrUnconstrained>, const N: usize>(
+        &mut self,
+        column_index: usize,
+        expression: Constraint,
+        inputs: [W; N],
+    ) -> Wire {
+        let [result] = self.auto_set(BTreeMap::from([(column_index, expression)]), inputs);
+        result
+    }
+
+    /// Adds blinding rows to the polynomial.
+    ///
+    /// This is for internal use, [`Circuit::prove`] calls it automatically.
+    fn blind(&mut self) {
+        for column in &mut self.data {
+            for i in 0..NUM_BLINDING_ROWS {
+                column[self.num_rows + i] = Scalar::random_default();
+            }
+        }
+    }
+}
+
+impl Index<Wire> for Witness {
+    type Output = Scalar;
+
+    fn index(&self, index: Wire) -> &Self::Output {
+        &self.data[index.column()][index.row()]
+    }
+}
+
+impl IndexMut<Wire> for Witness {
+    fn index_mut(&mut self, index: Wire) -> &mut Self::Output {
+        &mut self.data[index.column()][index.row()]
+    }
+}
+
+/// A PLONK proof.
+///
+/// The API in the implementation mostly mirrors that of the underlying PCS proof.
+#[derive(Debug, Clone)]
 pub struct Proof<H: Hash<Scalar>> {
-    commitment: pcs::Commitment,
+    commitment: pcs::Commitment<H>,
     inner_proof: pcs::Proof<H>,
 }
 
 impl<H: Hash<Scalar>> Proof<H> {
+    /// Returns the proven degree bound.
+    pub fn degree_bound(&self) -> usize {
+        self.inner_proof.degree_bound()
+    }
+
+    /// Returns the base-2 logarithm of the blowup factor used in the proof.
     pub fn blowup_log2(&self) -> usize {
         self.inner_proof.blowup_log2()
     }
+
+    /// Returns the size of the extended evaluation domain.
+    pub fn extended_domain_size(&self) -> usize {
+        self.inner_proof.extended_domain_size()
+    }
+
+    /// Returns the number of committed polynomials.
+    ///
+    /// These include the circuit selectors and sigma polynomials, the witness columns, and the
+    /// chunks of the grand quotient.
+    pub fn num_polys(&self) -> usize {
+        self.inner_proof.num_polys()
+    }
 }
 
+/// A PLONK circuit.
 #[derive(Debug, Clone)]
 pub struct Circuit {
-    size: usize,
+    /// The raw number of rows of the circuit.
+    ///
+    /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
+    /// padded to the next power of 2.
+    num_rows: usize,
+
+    /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
+    degree_bound: usize,
+
+    /// Number of witness columns.
+    num_columns: usize,
+
+    /// Gates used in the circuit: the first component of each pair is the gate constraint and the
+    /// second component is the selector / Lagrange basis polynomial that activates on the rows
+    /// where that gate was used.
+    gates: Vec<(Constraint, Polynomial)>,
+
+    /// Sigma polynomials of the permutation argument, one for every witness column.
+    sigma: Vec<Polynomial>,
+
+    /// The [sigma polynomials](`Self::sigma`) expressed on the value domain.
+    ///
+    /// The layout is analogous to [`Self::sigma`] itself: the values are indexed column-first.
+    sigma_values: Vec<Vec<Scalar>>,
+
+    /// List of gates that are revealed in the proofs. Each element is a row index.
     public_gates: BTreeSet<usize>,
-    ql: Polynomial,
-    qr: Polynomial,
-    qo: Polynomial,
-    qm: Polynomial,
-    qc: Polynomial,
-    sl_values: Vec<Scalar>,
-    sl: Polynomial,
-    sr_values: Vec<Scalar>,
-    sr: Polynomial,
-    so_values: Vec<Scalar>,
-    so: Polynomial,
 }
 
 impl Circuit {
-    pub fn size(&self) -> usize {
-        self.size
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
     }
 
+    pub fn degree_bound(&self) -> usize {
+        self.degree_bound
+    }
+
+    pub fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
+    /// Makes an empty [`Witness`] objects suitable for use with this circuit.
     pub fn make_witness(&self) -> Witness {
-        Witness::new(self.size)
-    }
-
-    /// Constructs a `CompressedCircuit` from this circuit.
-    ///
-    /// NOTE: compressed circuits are specific to a given blowup factor.
-    pub fn compress<H: Hash<Scalar>>(&self, blowup_log2: usize) -> CompressedCircuit {
-        let circuit_commitment = {
-            let degree_bound = padded_size(self.size);
-            let committer = pcs::Committer::<H>::new(
-                degree_bound,
-                blowup_log2,
-                vec![
-                    self.ql.clone(),
-                    self.qr.clone(),
-                    self.qo.clone(),
-                    self.qm.clone(),
-                    self.qc.clone(),
-                    self.sl.clone(),
-                    self.sr.clone(),
-                    self.so.clone(),
-                ],
-            );
-            committer.root_hash(0)
-        };
-        CompressedCircuit {
-            original_size: self.size,
-            blowup_log2,
-            public_gates: self.public_gates.clone(),
-            circuit_commitment,
+        Witness {
+            num_rows: self.num_rows,
+            gate_counter: 0,
+            data: vec![vec![Scalar::ZERO; self.degree_bound]; self.num_columns],
         }
     }
 
-    /// Converts this circuit into a compressed one.
-    ///
-    /// NOTE: compressed circuits are specific to a given blowup factor.
-    pub fn to_compressed<H: Hash<Scalar>>(self, blowup_log2: usize) -> CompressedCircuit {
-        let circuit_commitment = {
-            let degree_bound = padded_size(self.size);
-            let committer = pcs::Committer::<H>::new(
-                degree_bound,
-                blowup_log2,
-                vec![
-                    self.ql, self.qr, self.qo, self.qm, self.qc, self.sl, self.sr, self.so,
-                ],
-            );
-            committer.root_hash(0)
-        };
-        CompressedCircuit {
-            original_size: self.size,
-            blowup_log2,
-            public_gates: self.public_gates,
-            circuit_commitment,
-        }
-    }
-
-    /// Builds the two polynomials used in the permutation argument. The components of the returned
-    /// tuple are, respectively: the coordinate pair accumulator, the fixpoint constraint, and the
-    /// recurrence constraint.
+    /// Builds the three polynomials used in the permutation argument. The components of the
+    /// returned tuple are, respectively: the coordinate pair accumulator, the fixpoint constraint,
+    /// and the recurrence constraint.
     fn build_permutation_argument(
         &self,
         witness: &Witness,
-        left: &Polynomial,
-        right: &Polynomial,
-        out: &Polynomial,
+        columns: &[Polynomial],
         beta: Scalar,
         gamma: Scalar,
     ) -> Result<(Polynomial, Polynomial, Polynomial)> {
-        let n = padded_size(self.size);
+        let omega = Polynomial::domain_element2(1, self.degree_bound);
 
-        let sl = self.sl_values.as_slice();
-        let sr = self.sr_values.as_slice();
-        let so = self.so_values.as_slice();
+        let accumulator = {
+            let mut accumulator = vec![Scalar::ZERO; self.degree_bound + 1];
 
-        let mut accumulator = vec![Scalar::ZERO; n + 1];
+            accumulator[0] = Scalar::ONE;
+            let mut omega_pow = Scalar::ONE;
+            for i in 0..self.degree_bound {
+                let mut generator_pow = Scalar::ONE;
+                accumulator[i + 1] = accumulator[i];
+                for j in 0..self.num_columns {
+                    accumulator[i + 1] *=
+                        witness.data[j][i] + beta * generator_pow * omega_pow + gamma;
+                    accumulator[i + 1] *=
+                        (witness.data[j][i] + beta * self.sigma_values[j][i] + gamma)
+                            .invert_unwrap();
+                    generator_pow *= Scalar::MULTIPLICATIVE_GENERATOR;
+                }
+                omega_pow *= omega;
+            }
 
-        accumulator[0] = Scalar::ONE;
-        for i in 0..n {
-            let x = Polynomial::domain_element2(i, n);
-            accumulator[i + 1] = accumulator[i]
-                * (witness.left[i] + beta * x + gamma)
-                * (witness.right[i] + beta * K1 * x + gamma)
-                * (witness.out[i] + beta * K2 * x + gamma)
-                * ((witness.left[i] + beta * sl[i] + gamma)
-                    * (witness.right[i] + beta * sr[i] + gamma)
-                    * (witness.out[i] + beta * so[i] + gamma))
-                    .invert()
-                    .into_option()
-                    .context("division by zero in permutation accumulator")?;
-        }
+            if accumulator.pop().unwrap() != Scalar::ONE {
+                return Err(anyhow!("permutation accumulator wraparound check failed"));
+            }
 
-        if accumulator.pop().unwrap() != Scalar::ONE {
-            return Err(anyhow!("permutation accumulator wraparound check failed"));
-        }
-
-        let accumulator = Polynomial::encode2(accumulator);
+            Polynomial::encode2(accumulator)
+        };
 
         let shifted = {
             let mut coefficients = accumulator.clone().take();
-            let omega = Polynomial::domain_element2(1, n);
             let mut x = Scalar::ONE;
             for coefficient in coefficients.iter_mut() {
                 *coefficient *= x;
@@ -629,125 +619,110 @@ impl Circuit {
             Polynomial::with_coefficients(coefficients)
         };
 
-        let recurrence_constraint = Polynomial::multiply_many([
-            shifted,
-            left.clone() + self.sl.clone() * beta + gamma,
-            right.clone() + self.sr.clone() * beta + gamma,
-            out.clone() + self.so.clone() * beta + gamma,
-        ]) - Polynomial::multiply_many([
-            accumulator.clone(),
-            left.clone() + Polynomial::with_coefficients(vec![gamma, beta]),
-            right.clone() + Polynomial::with_coefficients(vec![gamma, beta * K1]),
-            out.clone() + Polynomial::with_coefficients(vec![gamma, beta * K2]),
-        ]);
+        let recurrence_constraint = {
+            let mut lhs = shifted;
+            for (column, sigma) in columns.iter().zip(self.sigma.iter()) {
+                lhs *= column.clone() + sigma.clone() * beta + gamma;
+            }
+            let mut rhs = accumulator.clone();
+            let mut pow = Scalar::ONE;
+            for column in columns {
+                rhs *= column.clone() + Polynomial::with_coefficients(vec![gamma, beta * pow]);
+                pow *= Scalar::MULTIPLICATIVE_GENERATOR;
+            }
+            lhs - rhs
+        };
 
         let fixpoint_constraint =
-            (accumulator.clone() - Scalar::ONE) * Polynomial::lagrange0(n).clone();
+            (accumulator.clone() - Scalar::ONE) * Polynomial::lagrange0(self.degree_bound).clone();
 
         Ok((accumulator, fixpoint_constraint, recurrence_constraint))
     }
 
-    fn split_polynomial(polynomial: Polynomial, n: usize) -> (Polynomial, Polynomial, Polynomial) {
-        let mut coefficients = polynomial.take();
-        coefficients.resize(n * 3, Scalar::ZERO);
-        let low = Vec::from(&coefficients[0..n]);
-        let mid = Vec::from(&coefficients[n..(n * 2)]);
-        let high = Vec::from(&coefficients[(n * 2)..(n * 3)]);
-        (
-            Polynomial::with_coefficients(low),
-            Polynomial::with_coefficients(mid),
-            Polynomial::with_coefficients(high),
-        )
+    /// Splits the quotient polynomial in chunks so that it can be batch-committed even if its
+    /// degree is much higher than the bound configured in the underlying PCS.
+    fn split_quotient(&self, quotient: Polynomial) -> Vec<Polynomial> {
+        let degree_bound = quotient_degree_bound(
+            self.degree_bound,
+            self.num_columns,
+            self.gates.iter().map(|(constraint, _)| constraint),
+        );
+        let mut coefficients = quotient.take();
+        assert!(coefficients.len() <= degree_bound);
+        coefficients.resize(degree_bound, Scalar::ZERO);
+        coefficients
+            .chunks(self.degree_bound)
+            .map(|coefficients| Polynomial::with_coefficients(coefficients.to_vec()))
+            .collect()
     }
 
+    /// Proves correctness for the given witness, or returns an error in case of a constraint
+    /// violation.
     pub fn prove<H: Hash<Scalar>>(
         &self,
         mut witness: Witness,
-        blowup_log2: usize,
+        options: ProvingOptions,
     ) -> Result<Proof<H>> {
         witness.blind();
-        if witness.size() != self.size {
+        if witness.degree_bound() != self.degree_bound {
             return Err(anyhow!(
                 "incorrect witness size (got {}, want {})",
-                witness.size(),
-                self.size
+                witness.degree_bound(),
+                self.degree_bound
             ));
         }
 
-        let degree_bound = padded_size(self.size);
+        let circuit_polynomials = self
+            .gates
+            .iter()
+            .map(|(_, selector)| selector.clone())
+            .chain(self.sigma.iter().cloned())
+            .collect();
 
-        let left = Polynomial::encode2(witness.left.clone());
-        let right = Polynomial::encode2(witness.right.clone());
-        let out = Polynomial::encode2(witness.out.clone());
+        let mut committer =
+            pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, circuit_polynomials);
 
-        let mut committer = pcs::Committer::<H>::new(
-            degree_bound,
-            blowup_log2,
-            vec![
-                self.ql.clone(),
-                self.qr.clone(),
-                self.qo.clone(),
-                self.qm.clone(),
-                self.qc.clone(),
-                self.sl.clone(),
-                self.sr.clone(),
-                self.so.clone(),
-            ],
-        );
+        let columns: Vec<Polynomial> = witness
+            .data
+            .iter()
+            .map(|data| Polynomial::encode2(data.clone()))
+            .collect();
 
-        let witness_commit_index =
-            committer.add_batch(vec![left.clone(), right.clone(), out.clone()]);
-        assert_eq!(witness_commit_index, COMMIT_INDEX_WITNESS);
-        let beta = H::hash_two(
-            *DST,
-            committer.root_hash(witness_commit_index),
-            Scalar::from_const(1),
-        );
-        let gamma = H::hash_two(
-            *DST,
-            committer.root_hash(witness_commit_index),
-            Scalar::from_const(2),
-        );
+        committer.add_batch(columns.clone());
+
+        let gate_constraint = {
+            let delta = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_DELTA);
+            let mut gate_constraint = Polynomial::default();
+            let mut pow = Scalar::ONE;
+            for (constraint, selector) in &self.gates {
+                gate_constraint += selector.clone() * constraint.compose(columns.as_slice()) * pow;
+                pow *= delta;
+            }
+            gate_constraint
+        };
 
         let (
             permutation_accumulator,
             permutation_fixpoint_constraint,
             permutation_recurrence_constraint,
-        ) = self.build_permutation_argument(&witness, &left, &right, &out, beta, gamma)?;
-
-        let permutation_commit_index = committer.add_batch(vec![permutation_accumulator]);
-        assert_eq!(permutation_commit_index, COMMIT_INDEX_PERMUTATION_ARGUMENT);
-        let alpha = H::hash_two(
-            *DST,
-            committer.root_hash(permutation_commit_index),
-            Scalar::ZERO,
-        );
-
-        let quotient = {
-            let gate_constraint = self.ql.clone() * left.clone()
-                + self.qr.clone() * right.clone()
-                + self.qo.clone() * out.clone()
-                + Polynomial::multiply_many([self.qm.clone(), left.clone(), right.clone()])
-                + self.qc.clone();
-            let constraint = gate_constraint
-                + permutation_fixpoint_constraint * alpha
-                + permutation_recurrence_constraint * alpha.square();
-            constraint.divide_by_zero(degree_bound)?
+        ) = {
+            let beta = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_BETA);
+            let gamma = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_GAMMA);
+            self.build_permutation_argument(&witness, columns.as_slice(), beta, gamma)?
         };
+        committer.add_batch(vec![permutation_accumulator]);
 
-        let omega = Polynomial::domain_element2(1, degree_bound);
+        let alpha = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_ALPHA);
 
-        let (quotient_low, quotient_mid, quotient_high) =
-            Self::split_polynomial(quotient, degree_bound);
+        let quotient = (gate_constraint
+            + permutation_fixpoint_constraint * alpha
+            + permutation_recurrence_constraint * alpha.square())
+        .divide_by_zero(self.degree_bound)?;
+        committer.add_batch(self.split_quotient(quotient));
 
-        let quotient_commit_index =
-            committer.add_batch(vec![quotient_low, quotient_mid, quotient_high]);
-        assert_eq!(quotient_commit_index, COMMIT_INDEX_QUOTIENT);
-        let xi = H::hash_two(
-            *DST,
-            committer.root_hash(quotient_commit_index),
-            Scalar::ZERO,
-        );
+        let xi = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_XI);
+
+        let omega = Polynomial::domain_element2(1, self.degree_bound);
 
         let (commitment, prover) = committer.commit(BTreeSet::from_iter(
             [xi, xi * omega]
@@ -762,41 +737,116 @@ impl Circuit {
         })
     }
 
-    pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>) -> Result<BTreeMap<Wire, Scalar>> {
-        self.compress::<H>(proof.blowup_log2()).verify(proof)
+    pub fn to_compressed<H: Hash<Scalar>>(self, options: ProvingOptions) -> CompressedCircuit<H> {
+        let (gates, selectors): (Vec<Constraint>, Vec<Polynomial>) = self.gates.into_iter().unzip();
+        let sigma = self.sigma;
+        let committer = pcs::Committer::<H>::new(
+            self.degree_bound,
+            options.blowup_log2,
+            selectors.into_iter().chain(sigma.into_iter()).collect(),
+        );
+        CompressedCircuit {
+            num_rows: self.num_rows,
+            degree_bound: self.degree_bound,
+            num_columns: self.num_columns,
+            options,
+            gates,
+            public_gates: self.public_gates,
+            circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
+            _data: Default::default(),
+        }
+    }
+
+    pub fn as_compressed<H: Hash<Scalar>>(&self, options: ProvingOptions) -> CompressedCircuit<H> {
+        let (gates, selectors): (Vec<Constraint>, Vec<Polynomial>) = self
+            .gates
+            .iter()
+            .map(|(constraint, selector)| (constraint.clone(), selector.clone()))
+            .unzip();
+        let sigma = self.sigma.clone();
+        let committer = pcs::Committer::<H>::new(
+            self.degree_bound,
+            options.blowup_log2,
+            selectors.into_iter().chain(sigma.into_iter()).collect(),
+        );
+        CompressedCircuit {
+            num_rows: self.num_rows,
+            degree_bound: self.degree_bound,
+            num_columns: self.num_columns,
+            options,
+            gates,
+            public_gates: self.public_gates.clone(),
+            circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
+            _data: Default::default(),
+        }
+    }
+
+    pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>, options: ProvingOptions) -> Result<()> {
+        self.as_compressed::<H>(options).verify(proof)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct CompressedCircuit {
-    original_size: usize,
-    blowup_log2: usize,
+/// A PLONK circuit in committed form.
+///
+/// This struct is much smaller than the original circuit but still allows full verification of a
+/// proof for the circuit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressedCircuit<H: Hash<Scalar>> {
+    /// The raw number of rows of the circuit.
+    ///
+    /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
+    /// padded to the next power of 2.
+    num_rows: usize,
+
+    /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
+    degree_bound: usize,
+
+    /// Number of witness columns.
+    num_columns: usize,
+
+    /// Proving options used to commit to this circuit (in [`Circuit::as_compressed`] or
+    /// [`Circuit::to_compressed`]).
+    options: ProvingOptions,
+
+    /// Gates used in the original circuit.
+    gates: Vec<Constraint>,
+
+    /// List of gates that are revealed in the proofs.
     public_gates: BTreeSet<usize>,
+
+    /// Merkle root of the circuit selectors.
     circuit_commitment: Scalar,
+
+    _data: PhantomData<H>,
 }
 
-impl CompressedCircuit {
-    pub fn original_size(&self) -> usize {
-        self.original_size
+impl<H: Hash<Scalar>> CompressedCircuit<H> {
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
     }
 
-    pub fn blowup_log2(&self) -> usize {
-        self.blowup_log2
+    pub fn degree_bound(&self) -> usize {
+        self.degree_bound
     }
 
-    pub fn commitment(&self) -> Scalar {
-        self.circuit_commitment
+    pub fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
+    /// Calculates the number of chunks the quotient was split into.
+    ///
+    /// See [`quotient_degree_bound`] for details.
+    fn get_num_quotient_chunks(&self) -> usize {
+        quotient_degree_bound(self.degree_bound, self.num_columns, self.gates.iter())
+            .div_ceil(self.degree_bound)
     }
 
     fn lagrange0(x: Scalar, n: usize) -> Scalar {
         (x.pow_small(n) - Scalar::ONE)
-            * (Scalar::from(n as u64) * (x - Scalar::ONE))
-                .invert()
-                .into_option()
-                .unwrap()
+            * (Scalar::from(n as u64) * (x - Scalar::ONE)).invert_unwrap()
     }
 
-    pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>) -> Result<BTreeMap<Wire, Scalar>> {
+    pub fn verify(&self, proof: &Proof<H>) -> Result<()> {
         let commitment = &proof.commitment;
         let inner_proof = &proof.inner_proof;
 
@@ -815,60 +865,57 @@ impl CompressedCircuit {
             ));
         }
 
-        let n = padded_size(self.original_size);
-        if inner_proof.degree_bound() != n {
+        if inner_proof.degree_bound() != self.degree_bound {
             return Err(anyhow!(
                 "wrong degree bound (got {}, want {})",
                 inner_proof.degree_bound(),
-                n
+                self.degree_bound
             ));
         }
-        if inner_proof.blowup_log2() != self.blowup_log2 {
+        if inner_proof.blowup_log2() != self.options.blowup_log2 {
             return Err(anyhow!(
                 "blowup factor mismatch (got {}, want {})",
                 1usize << inner_proof.blowup_log2(),
-                1usize << self.blowup_log2
+                1usize << self.options.blowup_log2
             ));
         }
-        if inner_proof.num_polys() != 15 {
+
+        let num_gate_selectors = self.gates.len();
+        let num_sigma_polynomials = self.num_columns;
+        let num_witness_columns = self.num_columns;
+        let num_permutation_accumulator_polynomial = 1usize;
+        let num_quotient_chunks = self.get_num_quotient_chunks();
+        let expected_polynomials = num_gate_selectors
+            + num_sigma_polynomials
+            + num_witness_columns
+            + num_permutation_accumulator_polynomial
+            + num_quotient_chunks;
+
+        if inner_proof.num_polys() != expected_polynomials {
             return Err(anyhow!(
-                "incorrect number of committed polynomials (got {}, want 17)",
-                inner_proof.num_polys()
+                "incorrect number of committed polynomials (got {}, want {})",
+                inner_proof.num_polys(),
+                expected_polynomials,
             ));
         }
 
-        let omega = Polynomial::domain_element2(1, n);
+        let omega = Polynomial::domain_element2(1, self.degree_bound);
 
-        let beta = H::hash_two(
-            *DST,
-            commitment.tree_roots()[COMMIT_INDEX_WITNESS],
-            Scalar::from_const(1),
-        );
-        let gamma = H::hash_two(
-            *DST,
-            commitment.tree_roots()[COMMIT_INDEX_WITNESS],
-            Scalar::from_const(2),
-        );
-        let alpha = H::hash_two(
-            *DST,
-            commitment.tree_roots()[COMMIT_INDEX_PERMUTATION_ARGUMENT],
-            Scalar::ZERO,
-        );
         let xi = H::hash_two(
             *DST,
-            commitment.tree_roots()[COMMIT_INDEX_QUOTIENT],
-            Scalar::ZERO,
+            commitment.transcript_hash(COMMIT_INDEX_QUOTIENT + 1),
+            FIAT_SHAMIR_INDEX_XI,
         );
 
         let points = inner_proof.points();
         if !points.contains_key(&xi) {
             return Err(anyhow!(
-                "the proof doesn't have an opening for the Fiat-Shamir challenge value"
+                "the proof doesn't have an opening for the main Fiat-Shamir challenge"
             ));
         }
         if !points.contains_key(&(xi * omega)) {
             return Err(anyhow!(
-                "the proof doesn't have an opening for the shifted Fiat-Shamir challenge value"
+                "the proof doesn't have an opening for the shifted Fiat-Shamir challenge"
             ));
         }
         for &gate in &self.public_gates {
@@ -882,45 +929,95 @@ impl CompressedCircuit {
 
         inner_proof.verify(&commitment)?;
 
-        let ql = points[&xi][0];
-        let qr = points[&xi][1];
-        let qo = points[&xi][2];
-        let qm = points[&xi][3];
-        let qc = points[&xi][4];
-        let sl = points[&xi][5];
-        let sr = points[&xi][6];
-        let so = points[&xi][7];
-
-        let left = points[&xi][8];
-        let right = points[&xi][9];
-        let out = points[&xi][10];
-
-        let xi_n = xi.pow_small(n);
-        let xi_2n = xi.pow_small(2 * n);
-
-        let permutation_accumulator = points[&xi][11];
-        let shifted_permutation_accumulator = points[&(xi * omega)][11];
-        let quotient = {
-            let quotient_low = points[&xi][12];
-            let quotient_mid = points[&xi][13];
-            let quotient_high = points[&xi][14];
-            quotient_low + xi_n * quotient_mid + xi_2n * quotient_high
+        let sigma: Vec<Scalar> = {
+            let offset = num_gate_selectors;
+            (0..self.num_columns)
+                .map(|i| points[&xi][offset + i])
+                .collect()
         };
-        let zero = xi_n - Scalar::ONE;
-
-        let gate_constraint = ql * left + qr * right + qo * out + qm * left * right + qc;
-
-        let permutation_numerator = (left + beta * xi + gamma)
-            * (right + beta * K1 * xi + gamma)
-            * (out + beta * K2 * xi + gamma);
-        let permutation_denominator = {
-            (left + beta * sl + gamma) * (right + beta * sr + gamma) * (out + beta * so + gamma)
+        let variables: Vec<Scalar> = {
+            let offset = num_gate_selectors + num_sigma_polynomials;
+            (0..self.num_columns)
+                .map(|i| points[&xi][offset + i])
+                .collect()
         };
+
+        let gate_constraint: Scalar = {
+            let selectors: Vec<Scalar> = self
+                .gates
+                .iter()
+                .enumerate()
+                .map(|(i, _)| points[&xi][i])
+                .collect();
+            let constraints: Vec<Scalar> = self
+                .gates
+                .iter()
+                .map(|constraint| constraint.evaluate(variables.as_slice()))
+                .collect();
+            let delta = H::hash_two(
+                *DST,
+                commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
+                FIAT_SHAMIR_INDEX_DELTA,
+            );
+            let mut result = Scalar::ZERO;
+            let mut pow = Scalar::ONE;
+            for (selector, constraint) in selectors.into_iter().zip(constraints.into_iter()) {
+                result += selector * constraint * pow;
+                pow *= delta;
+            }
+            result
+        };
+
+        let (permutation_accumulator, shifted_permutation_accumulator) = {
+            let offset = num_gate_selectors + num_sigma_polynomials + num_witness_columns;
+            (points[&xi][offset], points[&(xi * omega)][offset])
+        };
+
+        let beta = H::hash_two(
+            *DST,
+            commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
+            FIAT_SHAMIR_INDEX_BETA,
+        );
+        let gamma = H::hash_two(
+            *DST,
+            commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
+            FIAT_SHAMIR_INDEX_GAMMA,
+        );
+
+        let (permutation_numerator, permutation_denominator) = {
+            let mut numerator = Scalar::ONE;
+            let mut denominator = Scalar::ONE;
+            let mut generator_pow = Scalar::ONE;
+            for (&variable, &sigma) in variables.iter().zip(sigma.iter()) {
+                numerator *= variable + beta * generator_pow * xi + gamma;
+                denominator *= variable + beta * sigma + gamma;
+                generator_pow *= Scalar::MULTIPLICATIVE_GENERATOR;
+            }
+            (numerator, denominator)
+        };
+
+        let quotient: Scalar = {
+            let offset = num_gate_selectors
+                + num_sigma_polynomials
+                + num_witness_columns
+                + num_permutation_accumulator_polynomial;
+            (0..num_quotient_chunks)
+                .map(|i| points[&xi][offset + i] * xi.pow_small(i * self.degree_bound))
+                .sum()
+        };
+        let zero = xi.pow_small(self.degree_bound) - Scalar::ONE;
+
+        let alpha = H::hash_two(
+            *DST,
+            commitment.transcript_hash(COMMIT_INDEX_PERMUTATION_ARGUMENT + 1),
+            FIAT_SHAMIR_INDEX_ALPHA,
+        );
+
         let permutation_recurrence_constraint = shifted_permutation_accumulator
             * permutation_denominator
             - permutation_accumulator * permutation_numerator;
-        let permutation_fixpoint_constraint =
-            (permutation_accumulator - Scalar::from_const(1)) * Self::lagrange0(xi, n);
+        let permutation_fixpoint_constraint = (permutation_accumulator - Scalar::from_const(1))
+            * Self::lagrange0(xi, self.degree_bound);
 
         let full_constraint = gate_constraint
             + alpha * permutation_fixpoint_constraint
@@ -929,1247 +1026,370 @@ impl CompressedCircuit {
             return Err(anyhow!("constraint violation"));
         }
 
-        Ok(BTreeMap::from_iter(
-            self.public_gates
-                .iter()
-                .map(|&gate| {
-                    let z = omega.pow_small(gate);
-                    [
-                        (Wire::LeftIn(gate), points[&z][8]),
-                        (Wire::RightIn(gate), points[&z][9]),
-                        (Wire::Out(gate), points[&z][10]),
-                    ]
-                    .into_iter()
-                })
-                .flatten(),
-        ))
+        Ok(())
     }
+}
+
+/// Represents a reusable PLONK chip that you can use to build circuits.
+pub trait Chip<const I: usize, const O: usize> {
+    fn build(
+        &self,
+        builder: &mut CircuitBuilder,
+        inputs: [Option<Wire>; I],
+    ) -> Result<[Option<Wire>; O]>;
+
+    fn witness(
+        &self,
+        witness: &mut Witness,
+        inputs: [WireOrUnconstrained; I],
+    ) -> Result<[WireOrUnconstrained; O]>;
+}
+
+/// A reusable PLONK chip with a variable number of inputs and outputs.
+///
+/// NOTE: PLONK circuits have a fixed structure, so the number of inputs and outputs must be known
+/// at circuit build time; but this trait doesn't require knowing it when compiling the Rust source.
+pub trait DynamicChip {
+    fn build(
+        &self,
+        builder: &mut CircuitBuilder,
+        inputs: &[Option<Wire>],
+    ) -> Result<Vec<Option<Wire>>>;
+
+    fn witness(
+        &self,
+        witness: &mut Witness,
+        inputs: &[WireOrUnconstrained],
+    ) -> Result<Vec<WireOrUnconstrained>>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::circuit::WireOrUnconstrained;
+    use starkom_bluesky::from_const;
     use starkom_pcs::hash::{Poseidon2Hash, Sha2Hash};
 
-    const fn from_const(value: u64) -> Scalar {
-        Scalar::from_const(value)
-    }
-
-    /// Builds the circuit at https://vitalik.eth.limo/general/2019/09/22/plonk.html.
-    fn build_test_circuit() -> (Circuit, usize) {
+    // This function tests the circuit from Vitalik's PLONK tutorial,
+    // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
+    fn test_vitalik_circuit_impl<H: Hash<Scalar>>(blowup_log2: usize) -> Result<()> {
         let mut builder = CircuitBuilder::default();
-        let gate1 = builder.add_raw_gate(
-            from_const(0),
-            from_const(0),
-            -from_const(1),
-            from_const(1),
-            from_const(0),
+        let square = builder.add_gate((var(0) ^ 2) - var(1));
+        let result = builder.add_gate(var(0) * var(1) + var(0) + 5 - var(2));
+        builder.connect(wire(square, 0).into(), wire(result, 0).into());
+        builder.connect(wire(square, 1).into(), wire(result, 1).into());
+        let nop = builder.add_gate(Constraint::default());
+        builder.connect(wire(result, 2).into(), wire(nop, 0).into());
+        builder.declare_public_gates([nop]);
+        let circuit = builder.build(CompilationOptions {
+            canonicalize_constraints: false,
+        })?;
+        assert_eq!(circuit.num_rows(), 3);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 3);
+        let mut witness = circuit.make_witness();
+        let x = from_const(3);
+        witness.set(wire(square, 0), x);
+        witness.set(wire(square, 1), x.square());
+        witness.copy(wire(square, 0), wire(result, 0));
+        witness.copy(wire(square, 1), wire(result, 1));
+        witness.set(wire(result, 2), x.cube() + x + from_const(5));
+        witness.copy(wire(result, 2), wire(nop, 0));
+        let proof = circuit.prove::<H>(witness, ProvingOptions { blowup_log2 })?;
+        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(
+            proof.extended_domain_size(),
+            circuit.degree_bound() << blowup_log2
         );
-        builder.connect(Wire::LeftIn(gate1), Wire::RightIn(gate1));
-        let gate2 = builder.add_raw_gate(
-            from_const(0),
-            from_const(0),
-            -from_const(1),
-            from_const(1),
-            from_const(0),
-        );
-        builder.connect(Wire::LeftIn(gate2), Wire::Out(gate1));
-        builder.connect(Wire::RightIn(gate2), Wire::LeftIn(gate1));
-        let gate3 = builder.add_raw_gate(
-            from_const(1),
-            from_const(1),
-            -from_const(1),
-            from_const(0),
-            from_const(0),
-        );
-        builder.connect(Wire::LeftIn(gate3), Wire::LeftIn(gate1));
-        builder.connect(Wire::RightIn(gate3), Wire::Out(gate2));
-        let gate4 = builder.add_raw_gate(
-            from_const(1),
-            from_const(1),
-            -from_const(1),
-            from_const(0),
-            from_const(0),
-        );
-        builder.connect(Wire::LeftIn(gate4), Wire::Out(gate3));
-        builder.declare_public_gates([gate4]);
-        (builder.build(), gate4)
+        circuit.verify::<H>(&proof, ProvingOptions { blowup_log2 })?;
+        Ok(())
     }
 
-    fn witness(mut left: Vec<Scalar>, mut right: Vec<Scalar>, mut out: Vec<Scalar>) -> Witness {
-        let original_size = left.len();
-        assert_eq!(original_size, right.len());
-        assert_eq!(original_size, out.len());
-        let blinded_size = original_size + NUM_BLINDING_ROWS;
-        let padded_size = padded_size(blinded_size);
-        left.resize(padded_size, Scalar::ZERO);
-        right.resize(padded_size, Scalar::ZERO);
-        out.resize(padded_size, Scalar::ZERO);
-        Witness {
-            size: blinded_size,
-            gate_counter: original_size,
-            left,
-            right,
-            out,
-        }
+    #[test]
+    fn test_vitalik_circuit_sha2_blowup_2() {
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).is_ok());
     }
 
-    fn test_circuit1<H: Hash<Scalar>>(blowup_log2: usize) {
-        let (circuit, gate) = build_test_circuit();
-        let compressed_circuit = circuit.compress::<H>(blowup_log2);
+    #[test]
+    fn test_vitalik_circuit_poseidon2_blowup_2() {
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(1).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_sha2_blowup_4() {
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(2).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_poseidon2_blowup_4() {
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(2).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_sha2_blowup_8() {
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(3).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_poseidon2_blowup_8() {
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(3).is_ok());
+    }
+
+    const DEFAULT_BLOWUP_LOG2: usize = 1;
+
+    #[test]
+    fn test_vitalik_circuit_with_expressions() {
+        let mut builder = CircuitBuilder::default();
+        let square = builder.parse_and_add_gate("w1 == w0 ^ 2");
+        let result = builder.parse_and_add_gate("w2 == w0 * w1 + w0 + 5");
+        builder.connect(wire(square, 0).into(), wire(result, 0).into());
+        builder.connect(wire(square, 1).into(), wire(result, 1).into());
+        let nop = builder.add_gate(Constraint::nop());
+        builder.connect(wire(result, 2).into(), wire(nop, 0).into());
+        builder.declare_public_gates([nop]);
+        let circuit = builder
+            .build(CompilationOptions {
+                canonicalize_constraints: false,
+            })
+            .unwrap();
+        assert_eq!(circuit.num_rows(), 3);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 3);
+        let mut witness = circuit.make_witness();
+        let x = from_const(3);
+        witness.set(wire(square, 0), x);
+        witness.set(wire(square, 1), x.square());
+        witness.copy(wire(square, 0), wire(result, 0));
+        witness.copy(wire(square, 1), wire(result, 1));
+        witness.set(wire(result, 2), x.cube() + x + from_const(5));
+        witness.copy(wire(result, 2), wire(nop, 0));
+        let blowup_log2 = DEFAULT_BLOWUP_LOG2;
+        let options = ProvingOptions { blowup_log2 };
         let proof = circuit
-            .prove::<H>(
-                witness(
-                    vec![from_const(3), from_const(9), from_const(3), from_const(30)],
-                    vec![from_const(3), from_const(3), from_const(27), from_const(5)],
-                    vec![
-                        from_const(9),
-                        from_const(27),
-                        from_const(30),
-                        from_const(35),
-                    ],
-                ),
-                blowup_log2,
-            )
+            .prove::<Sha2Hash<Scalar>>(witness, options.clone())
             .unwrap();
-        let public_inputs = compressed_circuit.verify(&proof).unwrap();
+        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(
-            *public_inputs.get(&Wire::RightIn(gate)).unwrap(),
-            from_const(5)
+            proof.extended_domain_size(),
+            circuit.degree_bound() << blowup_log2
         );
-        assert_eq!(
-            *public_inputs.get(&Wire::Out(gate)).unwrap(),
-            from_const(35)
-        );
+        assert!(circuit.verify::<Sha2Hash<Scalar>>(&proof, options).is_ok());
     }
 
     #[test]
-    fn test_circuit1_blowup_2() {
-        test_circuit1::<Sha2Hash<Scalar>>(1);
-        test_circuit1::<Poseidon2Hash<Scalar>>(1);
-    }
-
-    #[test]
-    fn test_circuit1_blowup_4() {
-        test_circuit1::<Sha2Hash<Scalar>>(2);
-        test_circuit1::<Poseidon2Hash<Scalar>>(2);
-    }
-
-    #[test]
-    fn test_circuit1_blowup_8() {
-        test_circuit1::<Sha2Hash<Scalar>>(3);
-        test_circuit1::<Poseidon2Hash<Scalar>>(3);
-    }
-
-    #[test]
-    fn test_circuit1_blowup_16() {
-        test_circuit1::<Sha2Hash<Scalar>>(4);
-        test_circuit1::<Poseidon2Hash<Scalar>>(4);
-    }
-
-    #[test]
-    fn test_circuit1_blowup_32() {
-        test_circuit1::<Sha2Hash<Scalar>>(5);
-        test_circuit1::<Poseidon2Hash<Scalar>>(5);
-    }
-
-    #[test]
-    fn test_circuit1_blowup_64() {
-        test_circuit1::<Sha2Hash<Scalar>>(6);
-        test_circuit1::<Poseidon2Hash<Scalar>>(6);
-    }
-
-    #[test]
-    fn test_circuit1_blowup_128() {
-        test_circuit1::<Sha2Hash<Scalar>>(7);
-        test_circuit1::<Poseidon2Hash<Scalar>>(7);
-    }
-
-    #[test]
-    fn test_circuit1_blowup_256() {
-        test_circuit1::<Sha2Hash<Scalar>>(8);
-        test_circuit1::<Poseidon2Hash<Scalar>>(8);
-    }
-
-    fn test_circuit1_with_helpers<H: Hash<Scalar>>(blowup_log2: usize) {
+    fn test_vitalik_circuit_with_auto_gates() {
         let mut builder = CircuitBuilder::default();
-        let input = Wire::LeftIn(builder.gate_count());
-        let gate1 = builder.add_square_gate(input.into());
-        let gate2 = builder.add_mul_gate(gate1.into(), input.into());
-        let gate3 = builder.add_sum_gate(input.into(), gate2.into());
-        let gate4 = builder.add_sum_with_const_gate(gate3.into(), from_const(5));
-        builder.declare_public_gates([gate4.gate()]);
-        let witness = witness(
-            vec![from_const(3), from_const(9), from_const(3), from_const(30)],
-            vec![from_const(3), from_const(3), from_const(27), from_const(30)],
-            vec![
-                from_const(9),
-                from_const(27),
-                from_const(30),
-                from_const(35),
-            ],
+        let [x, square] = builder.auto_gate("w1 == w0 ^ 2".parse().unwrap(), []);
+        let [result] = builder.auto_gate(
+            "w2 == w0 * w1 + w0 + 5".parse().unwrap(),
+            [x.into(), square.into()],
         );
-        assert!(builder.check_witness(&witness).is_ok());
-        let circuit = builder.build();
-        let compressed_circuit = circuit.compress::<H>(blowup_log2);
-        let proof = circuit.prove::<H>(witness, blowup_log2).unwrap();
-        let public_inputs = compressed_circuit.verify(&proof).unwrap();
-        assert_eq!(*public_inputs.get(&gate4).unwrap(), from_const(35));
-    }
-
-    #[test]
-    fn test_circuit1_with_helpers_blowup_2() {
-        test_circuit1_with_helpers::<Sha2Hash<Scalar>>(1);
-        test_circuit1_with_helpers::<Poseidon2Hash<Scalar>>(1);
-    }
-
-    #[test]
-    fn test_circuit1_with_helpers_blowup_4() {
-        test_circuit1_with_helpers::<Sha2Hash<Scalar>>(2);
-        test_circuit1_with_helpers::<Poseidon2Hash<Scalar>>(2);
-    }
-
-    fn test_circuit2<H: Hash<Scalar>>(blowup_log2: usize) {
-        let (circuit, gate) = build_test_circuit();
-        let compressed_circuit = circuit.compress::<H>(blowup_log2);
+        let nop = builder.add_gate(Constraint::nop());
+        builder.connect(result.into(), wire(nop, 0).into());
+        builder.declare_public_gates([nop]);
+        let circuit = builder
+            .build(CompilationOptions {
+                canonicalize_constraints: false,
+            })
+            .unwrap();
+        assert_eq!(circuit.num_rows(), 3);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 3);
+        let mut witness = circuit.make_witness();
+        let value = from_const(3);
+        let x = wire(0, 0);
+        witness.set(x, value);
+        let square = witness.auto_set_one(1, var(0) ^ 2, [x]);
+        let result = witness.auto_set_one(2, var(0) * var(1) + var(0) + 5, [x, square]);
+        witness.auto_set_one(0, var(0), [result]);
+        let blowup_log2 = DEFAULT_BLOWUP_LOG2;
+        let options = ProvingOptions { blowup_log2 };
         let proof = circuit
-            .prove::<H>(
-                witness(
-                    vec![from_const(4), from_const(16), from_const(4), from_const(68)],
-                    vec![from_const(4), from_const(4), from_const(64), from_const(5)],
-                    vec![
-                        from_const(16),
-                        from_const(64),
-                        from_const(68),
-                        from_const(73),
-                    ],
-                ),
-                blowup_log2,
-            )
+            .prove::<Sha2Hash<Scalar>>(witness, options.clone())
             .unwrap();
-        let public_inputs = compressed_circuit.verify(&proof).unwrap();
+        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(
-            *public_inputs.get(&Wire::RightIn(gate)).unwrap(),
-            from_const(5)
+            proof.extended_domain_size(),
+            circuit.degree_bound() << blowup_log2
         );
-        assert_eq!(
-            *public_inputs.get(&Wire::Out(gate)).unwrap(),
-            from_const(73)
-        );
+        assert!(circuit.verify::<Sha2Hash<Scalar>>(&proof, options).is_ok());
     }
 
-    #[test]
-    fn test_circuit2_blowup_2() {
-        test_circuit2::<Sha2Hash<Scalar>>(1);
-        test_circuit2::<Poseidon2Hash<Scalar>>(1);
-    }
-
-    #[test]
-    fn test_circuit2_blowup_4() {
-        test_circuit2::<Sha2Hash<Scalar>>(2);
-        test_circuit2::<Poseidon2Hash<Scalar>>(2);
-    }
-
-    #[test]
-    fn test_circuit2_blowup_8() {
-        test_circuit2::<Sha2Hash<Scalar>>(3);
-        test_circuit2::<Poseidon2Hash<Scalar>>(3);
-    }
-
-    fn test_gate_constraint_violation<H: Hash<Scalar>>(blowup_log2: usize) {
-        let (circuit, _) = build_test_circuit();
-        assert!(
-            circuit
-                .prove::<H>(
-                    witness(
-                        vec![from_const(4), from_const(16), from_const(4), from_const(68)],
-                        vec![from_const(4), from_const(4), from_const(64), from_const(5)],
-                        vec![
-                            from_const(16),
-                            from_const(64),
-                            from_const(68),
-                            from_const(35)
-                        ],
-                    ),
-                    blowup_log2
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn test_gate_constraint_violation_blowup_2() {
-        test_gate_constraint_violation::<Sha2Hash<Scalar>>(1);
-        test_gate_constraint_violation::<Poseidon2Hash<Scalar>>(1);
-    }
-
-    #[test]
-    fn test_gate_constraint_violation_blowup_4() {
-        test_gate_constraint_violation::<Sha2Hash<Scalar>>(2);
-        test_gate_constraint_violation::<Poseidon2Hash<Scalar>>(2);
-    }
-
-    #[test]
-    fn test_gate_constraint_violation_blowup_8() {
-        test_gate_constraint_violation::<Sha2Hash<Scalar>>(3);
-        test_gate_constraint_violation::<Poseidon2Hash<Scalar>>(3);
-    }
-
-    fn test_compressed_circuit1<H: Hash<Scalar>>(blowup_log2: usize) {
-        let (circuit, gate) = build_test_circuit();
-        let proof = circuit
-            .prove::<H>(
-                witness(
-                    vec![from_const(3), from_const(9), from_const(3), from_const(30)],
-                    vec![from_const(3), from_const(3), from_const(27), from_const(5)],
-                    vec![
-                        from_const(9),
-                        from_const(27),
-                        from_const(30),
-                        from_const(35),
-                    ],
-                ),
-                blowup_log2,
-            )
+    fn test_vitalik_circuit_with_third_degree_constraint_impl<H: Hash<Scalar>>(blowup_log2: usize) {
+        let mut builder = CircuitBuilder::default();
+        let result = builder.parse_and_add_gate("w1 == w0 ^ 3 + w0 + 5");
+        let nop = builder.add_gate(Constraint::nop());
+        builder.connect(wire(result, 1).into(), wire(nop, 0).into());
+        builder.declare_public_gates([nop]);
+        let circuit = builder
+            .build(CompilationOptions {
+                canonicalize_constraints: false,
+            })
             .unwrap();
-        let circuit = circuit.to_compressed::<H>(blowup_log2);
-        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(circuit.num_rows(), 2);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 2);
+        let mut witness = circuit.make_witness();
+        let x = from_const(3);
+        witness.set(wire(result, 0), x);
+        witness.set(wire(result, 1), x.cube() + x + from_const(5));
+        witness.copy(wire(result, 1), wire(nop, 0));
+        let options = ProvingOptions { blowup_log2 };
+        let proof = circuit.prove::<H>(witness, options.clone()).unwrap();
+        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(
-            *public_inputs.get(&Wire::RightIn(gate)).unwrap(),
-            from_const(5)
+            proof.extended_domain_size(),
+            circuit.degree_bound() << blowup_log2
         );
-        assert_eq!(
-            *public_inputs.get(&Wire::Out(gate)).unwrap(),
-            from_const(35)
-        );
+        assert!(circuit.verify::<H>(&proof, options).is_ok());
     }
 
     #[test]
-    fn test_compressed_circuit1_blowup_2() {
-        test_compressed_circuit1::<Sha2Hash<Scalar>>(1);
-        test_compressed_circuit1::<Poseidon2Hash<Scalar>>(1);
+    fn test_vitalik_circuit_with_third_degree_constraint_sha2_blowup_2() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Sha2Hash<Scalar>>(1);
     }
 
     #[test]
-    fn test_compressed_circuit1_blowup_4() {
-        test_compressed_circuit1::<Sha2Hash<Scalar>>(2);
-        test_compressed_circuit1::<Poseidon2Hash<Scalar>>(2);
+    fn test_vitalik_circuit_with_third_degree_constraint_poseidon2_blowup_2() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Poseidon2Hash<Scalar>>(1);
     }
 
     #[test]
-    fn test_compressed_circuit1_blowup_8() {
-        test_compressed_circuit1::<Sha2Hash<Scalar>>(3);
-        test_compressed_circuit1::<Poseidon2Hash<Scalar>>(3);
-    }
-
-    fn test_compressed_circuit2<H: Hash<Scalar>>(blowup_log2: usize) {
-        let (circuit, gate) = build_test_circuit();
-        let proof = circuit
-            .prove::<H>(
-                witness(
-                    vec![from_const(4), from_const(16), from_const(4), from_const(68)],
-                    vec![from_const(4), from_const(4), from_const(64), from_const(5)],
-                    vec![
-                        from_const(16),
-                        from_const(64),
-                        from_const(68),
-                        from_const(73),
-                    ],
-                ),
-                blowup_log2,
-            )
-            .unwrap();
-        let circuit = circuit.to_compressed::<H>(blowup_log2);
-        let public_inputs = circuit.verify(&proof).unwrap();
-        assert_eq!(
-            *public_inputs.get(&Wire::RightIn(gate)).unwrap(),
-            from_const(5)
-        );
-        assert_eq!(
-            *public_inputs.get(&Wire::Out(gate)).unwrap(),
-            from_const(73)
-        );
+    fn test_vitalik_circuit_with_third_degree_constraint_sha2_blowup_4() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Sha2Hash<Scalar>>(2);
     }
 
     #[test]
-    fn test_compressed_circuit2_blowup_2() {
-        test_compressed_circuit2::<Sha2Hash<Scalar>>(1);
-        test_compressed_circuit2::<Poseidon2Hash<Scalar>>(1);
+    fn test_vitalik_circuit_with_third_degree_constraint_poseidon2_blowup_4() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Poseidon2Hash<Scalar>>(2);
     }
 
     #[test]
-    fn test_compressed_circuit2_blowup_4() {
-        test_compressed_circuit2::<Sha2Hash<Scalar>>(2);
-        test_compressed_circuit2::<Poseidon2Hash<Scalar>>(2);
+    fn test_vitalik_circuit_with_third_degree_constraint_sha2_blowup_8() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Sha2Hash<Scalar>>(3);
     }
 
     #[test]
-    fn test_compressed_circuit2_blowup_8() {
-        test_compressed_circuit2::<Sha2Hash<Scalar>>(3);
-        test_compressed_circuit2::<Poseidon2Hash<Scalar>>(3);
-    }
-
-    fn test_compile_separately<H: Hash<Scalar>>(blowup_log2: usize) {
-        let (prover_circuit, _) = build_test_circuit();
-        let proof = prover_circuit
-            .prove::<H>(
-                witness(
-                    vec![from_const(3), from_const(9), from_const(3), from_const(30)],
-                    vec![from_const(3), from_const(3), from_const(27), from_const(5)],
-                    vec![
-                        from_const(9),
-                        from_const(27),
-                        from_const(30),
-                        from_const(35),
-                    ],
-                ),
-                blowup_log2,
-            )
-            .unwrap();
-        let (verifier_circuit, gate) = build_test_circuit();
-        let verifier_circuit = verifier_circuit.to_compressed::<H>(blowup_log2);
-        let public_inputs = verifier_circuit.verify(&proof).unwrap();
-        assert_eq!(
-            *public_inputs.get(&Wire::RightIn(gate)).unwrap(),
-            from_const(5)
-        );
-        assert_eq!(
-            *public_inputs.get(&Wire::Out(gate)).unwrap(),
-            from_const(35)
-        );
-    }
-
-    #[test]
-    fn test_compile_separately_blowup_2() {
-        test_compile_separately::<Sha2Hash<Scalar>>(1);
-        test_compile_separately::<Poseidon2Hash<Scalar>>(1);
-        test_compile_separately::<Sha2Hash<Scalar>>(2);
-        test_compile_separately::<Poseidon2Hash<Scalar>>(2);
-        test_compile_separately::<Sha2Hash<Scalar>>(3);
-        test_compile_separately::<Poseidon2Hash<Scalar>>(3);
-    }
-
-    const DEFAULT_BLOWUP_LOG2: usize = 3;
-
-    fn test_gate(circuit: &Circuit, left: u64, right: u64, out: u64) -> Result<()> {
-        let proof = circuit.prove::<Sha2Hash<Scalar>>(
-            witness(vec![left.into()], vec![right.into()], vec![out.into()]),
-            DEFAULT_BLOWUP_LOG2,
-        )?;
-        let compressed_circuit = circuit.compress::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
-        compressed_circuit.verify(&proof).unwrap();
-        Ok(())
-    }
-
-    fn test_connected_unary_gate(circuit: &Circuit, input: u64, output: u64) -> Result<()> {
-        let proof = circuit.prove::<Sha2Hash<Scalar>>(
-            witness(
-                vec![from_const(0), input.into()],
-                vec![from_const(0), input.into()],
-                vec![input.into(), output.into()],
-            ),
-            DEFAULT_BLOWUP_LOG2,
-        )?;
-        let compressed_circuit = circuit.compress::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
-        compressed_circuit.verify(&proof).unwrap();
-        Ok(())
-    }
-
-    fn test_connected_binary_gate(
-        circuit: &Circuit,
-        left: u64,
-        right: u64,
-        out: u64,
-    ) -> Result<()> {
-        let proof = circuit.prove::<Sha2Hash<Scalar>>(
-            witness(
-                vec![from_const(0), from_const(0), left.into()],
-                vec![from_const(0), from_const(0), right.into()],
-                vec![left.into(), right.into(), out.into()],
-            ),
-            DEFAULT_BLOWUP_LOG2,
-        )?;
-        let compressed_circuit = circuit.compress::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
-        compressed_circuit.verify(&proof).unwrap();
-        Ok(())
-    }
-
-    fn test_connected_nop_gate_impl(
-        circuit: &Circuit,
-        left: u64,
-        right: u64,
-        out: u64,
-    ) -> Result<()> {
-        let proof = circuit.prove::<Sha2Hash<Scalar>>(
-            witness(
-                vec![from_const(0), from_const(0), from_const(0), left.into()],
-                vec![from_const(0), from_const(0), from_const(0), right.into()],
-                vec![left.into(), right.into(), out.into(), out.into()],
-            ),
-            DEFAULT_BLOWUP_LOG2,
-        )?;
-        let compressed_circuit = circuit.compress::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
-        compressed_circuit.verify(&proof).unwrap();
-        Ok(())
-    }
-
-    #[test]
-    fn test_nop_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_nop_gate(None, None, None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 12, 34, 56).is_ok());
-        assert!(test_gate(&circuit, 34, 56, 78).is_ok());
-    }
-
-    #[test]
-    fn test_connected_nop_gate() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(123));
-        let rhs = builder.add_const_gate(from_const(456));
-        let out = builder.add_const_gate(from_const(789));
-        builder.add_nop_gate(lhs.into(), rhs.into(), out.into());
-        let circuit = builder.build();
-        assert!(test_connected_nop_gate_impl(&circuit, 123, 456, 789).is_ok());
-        assert!(test_connected_nop_gate_impl(&circuit, 42, 456, 789).is_err());
-        assert!(test_connected_nop_gate_impl(&circuit, 123, 42, 789).is_err());
-        assert!(test_connected_nop_gate_impl(&circuit, 123, 456, 42).is_err());
-    }
-
-    #[test]
-    fn test_const_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_const_gate(from_const(42));
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 0, 0, 41).is_err());
-        assert!(test_gate(&circuit, 0, 0, 42).is_ok());
-        assert!(test_gate(&circuit, 0, 0, 43).is_err());
-    }
-
-    #[test]
-    fn test_sum_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_sum_gate(None, None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 12, 34, 46).is_ok());
-        assert!(test_gate(&circuit, 34, 12, 46).is_ok());
-        assert!(test_gate(&circuit, 56, 78, 134).is_ok());
-        assert!(test_gate(&circuit, 56, 34, 45).is_err());
-        assert!(test_gate(&circuit, 12, 56, 46).is_err());
-        assert!(test_gate(&circuit, 12, 34, 56).is_err());
-    }
-
-    #[test]
-    fn test_connected_sum_gate() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(123));
-        let rhs = builder.add_const_gate(from_const(456));
-        builder.add_sum_gate(lhs.into(), rhs.into());
-        let circuit = builder.build();
-        assert!(test_connected_binary_gate(&circuit, 123, 456, 579).is_ok());
-        assert!(test_connected_binary_gate(&circuit, 123, 456, 975).is_err());
-        assert!(test_connected_binary_gate(&circuit, 321, 456, 579).is_err());
-        assert!(test_connected_binary_gate(&circuit, 123, 654, 579).is_err());
-    }
-
-    #[test]
-    fn test_sum_with_const_gate1() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_sum_with_const_gate(None, from_const(12));
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 34, 34, 46).is_ok());
-        assert!(test_gate(&circuit, 34, 56, 46).is_err());
-        assert!(test_gate(&circuit, 56, 56, 68).is_ok());
-        assert!(test_gate(&circuit, 56, 78, 68).is_err());
-        assert!(test_gate(&circuit, 78, 78, 45).is_err());
-        assert!(test_gate(&circuit, 90, 90, 45).is_err());
-    }
-
-    #[test]
-    fn test_sum_with_const_gate2() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_sum_with_const_gate(None, from_const(34));
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 34, 34, 68).is_ok());
-        assert!(test_gate(&circuit, 34, 56, 68).is_err());
-        assert!(test_gate(&circuit, 56, 56, 90).is_ok());
-        assert!(test_gate(&circuit, 56, 78, 90).is_err());
-        assert!(test_gate(&circuit, 78, 78, 45).is_err());
-        assert!(test_gate(&circuit, 90, 90, 46).is_err());
-    }
-
-    #[test]
-    fn test_connected_sum_with_const_gate1() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(34));
-        builder.add_sum_with_const_gate(input.into(), from_const(12));
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 34, 46).is_ok());
-        assert!(test_connected_unary_gate(&circuit, 34, 56).is_err());
-    }
-
-    #[test]
-    fn test_connected_sum_with_const_gate2() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(56));
-        builder.add_sum_with_const_gate(input.into(), from_const(34));
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 56, 90).is_ok());
-        assert!(test_connected_unary_gate(&circuit, 56, 78).is_err());
-    }
-
-    #[test]
-    fn test_sub_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_sub_gate(None, None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 34, 12, 22).is_ok());
-        assert!(test_gate(&circuit, 56, 12, 44).is_ok());
-        assert!(test_gate(&circuit, 56, 12, 22).is_err());
-        assert!(test_gate(&circuit, 34, 56, 22).is_err());
-        assert!(test_gate(&circuit, 34, 12, 56).is_err());
-    }
-
-    #[test]
-    fn test_connected_sub_gate() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(456));
-        let rhs = builder.add_const_gate(from_const(123));
-        builder.add_sub_gate(lhs.into(), rhs.into());
-        let circuit = builder.build();
-        assert!(test_connected_binary_gate(&circuit, 456, 123, 333).is_ok());
-        assert!(test_connected_binary_gate(&circuit, 456, 123, 999).is_err());
-        assert!(test_connected_binary_gate(&circuit, 654, 123, 333).is_err());
-        assert!(test_connected_binary_gate(&circuit, 456, 321, 333).is_err());
-    }
-
-    #[test]
-    fn test_sub_const_gate1() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_sub_const_gate(None, from_const(12));
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 34, 34, 22).is_ok());
-        assert!(test_gate(&circuit, 34, 56, 22).is_err());
-        assert!(test_gate(&circuit, 56, 56, 44).is_ok());
-        assert!(test_gate(&circuit, 56, 78, 44).is_err());
-        assert!(test_gate(&circuit, 78, 78, 45).is_err());
-        assert!(test_gate(&circuit, 90, 90, 46).is_err());
-    }
-
-    #[test]
-    fn test_sub_const_gate2() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_sub_const_gate(None, from_const(34));
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 34, 34, 0).is_ok());
-        assert!(test_gate(&circuit, 34, 56, 0).is_err());
-        assert!(test_gate(&circuit, 56, 56, 22).is_ok());
-        assert!(test_gate(&circuit, 56, 78, 22).is_err());
-        assert!(test_gate(&circuit, 78, 78, 45).is_err());
-        assert!(test_gate(&circuit, 90, 90, 46).is_err());
-    }
-
-    #[test]
-    fn test_connected_sub_const_gate1() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(34));
-        builder.add_sub_const_gate(input.into(), from_const(12));
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 34, 22).is_ok());
-        assert!(test_connected_unary_gate(&circuit, 34, 56).is_err());
-    }
-
-    #[test]
-    fn test_connected_sub_const_gate2() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(56));
-        builder.add_sub_const_gate(input.into(), from_const(34));
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 56, 22).is_ok());
-        assert!(test_connected_unary_gate(&circuit, 56, 78).is_err());
-    }
-
-    #[test]
-    fn test_sub_from_const_gate1() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_sub_from_const_gate(from_const(90), None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 34, 34, 56).is_ok());
-        assert!(test_gate(&circuit, 34, 56, 56).is_err());
-        assert!(test_gate(&circuit, 56, 56, 34).is_ok());
-        assert!(test_gate(&circuit, 56, 78, 34).is_err());
-        assert!(test_gate(&circuit, 78, 78, 13).is_err());
-        assert!(test_gate(&circuit, 90, 90, 14).is_err());
-    }
-
-    #[test]
-    fn test_sub_from_const_gate2() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_sub_from_const_gate(from_const(78), None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 12, 12, 66).is_ok());
-        assert!(test_gate(&circuit, 12, 34, 66).is_err());
-        assert!(test_gate(&circuit, 34, 34, 44).is_ok());
-        assert!(test_gate(&circuit, 34, 56, 44).is_err());
-        assert!(test_gate(&circuit, 56, 56, 23).is_err());
-        assert!(test_gate(&circuit, 78, 78, 24).is_err());
-    }
-
-    #[test]
-    fn test_connected_sub_from_const_gate1() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(34));
-        builder.add_sub_from_const_gate(from_const(90), input.into());
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 34, 56).is_ok());
-        assert!(test_connected_unary_gate(&circuit, 34, 78).is_err());
-    }
-
-    #[test]
-    fn test_connected_sub_from_const_gate2() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(12));
-        builder.add_sub_from_const_gate(from_const(78), input.into());
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 12, 66).is_ok());
-        assert!(test_connected_unary_gate(&circuit, 12, 34).is_err());
-    }
-
-    #[test]
-    fn test_mul_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_mul_gate(None, None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 12, 34, 408).is_ok());
-        assert!(test_gate(&circuit, 34, 12, 408).is_ok());
-        assert!(test_gate(&circuit, 56, 78, 4368).is_ok());
-        assert!(test_gate(&circuit, 56, 34, 408).is_err());
-        assert!(test_gate(&circuit, 12, 56, 408).is_err());
-        assert!(test_gate(&circuit, 12, 34, 56).is_err());
-    }
-
-    #[test]
-    fn test_connected_mul_gate() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(12));
-        let rhs = builder.add_const_gate(from_const(34));
-        builder.add_mul_gate(lhs.into(), rhs.into());
-        let circuit = builder.build();
-        assert!(test_connected_binary_gate(&circuit, 12, 34, 408).is_ok());
-        assert!(test_connected_binary_gate(&circuit, 12, 34, 804).is_err());
-    }
-
-    #[test]
-    fn test_mul_by_const_gate1() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_mul_by_const_gate(None, from_const(12));
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 12, 12, 144).is_ok());
-        assert!(test_gate(&circuit, 12, 34, 144).is_err());
-        assert!(test_gate(&circuit, 34, 34, 408).is_ok());
-        assert!(test_gate(&circuit, 34, 56, 408).is_err());
-        assert!(test_gate(&circuit, 56, 56, 409).is_err());
-        assert!(test_gate(&circuit, 78, 78, 410).is_err());
-    }
-
-    #[test]
-    fn test_mul_by_const_gate2() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_mul_by_const_gate(None, from_const(34));
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 12, 12, 408).is_ok());
-        assert!(test_gate(&circuit, 12, 34, 408).is_err());
-        assert!(test_gate(&circuit, 34, 34, 1156).is_ok());
-        assert!(test_gate(&circuit, 34, 56, 1156).is_err());
-        assert!(test_gate(&circuit, 56, 56, 1157).is_err());
-        assert!(test_gate(&circuit, 78, 78, 1158).is_err());
-    }
-
-    #[test]
-    fn test_connected_mul_by_const_gate1() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(12));
-        builder.add_mul_by_const_gate(lhs.into(), from_const(34));
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 12, 408).is_ok());
-        assert!(test_connected_unary_gate(&circuit, 12, 804).is_err());
-    }
-
-    #[test]
-    fn test_connected_mul_by_const_gate2() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(34));
-        builder.add_mul_by_const_gate(lhs.into(), from_const(12));
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 34, 408).is_ok());
-        assert!(test_connected_unary_gate(&circuit, 34, 804).is_err());
-    }
-
-    #[test]
-    fn test_linear_combination_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_linear_combination_gate(from_const(12), None, from_const(56), None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 34, 78, 4776).is_ok());
-        assert!(test_gate(&circuit, 78, 90, 5976).is_ok());
-        assert!(test_gate(&circuit, 42, 78, 4776).is_err());
-        assert!(test_gate(&circuit, 34, 42, 4776).is_err());
-        assert!(test_gate(&circuit, 34, 78, 42).is_err());
-    }
-
-    #[test]
-    fn test_connected_linear_combination_gate() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(34));
-        let rhs = builder.add_const_gate(from_const(78));
-        builder.add_linear_combination_gate(from_const(12), lhs.into(), from_const(56), rhs.into());
-        let circuit = builder.build();
-        assert!(test_connected_binary_gate(&circuit, 34, 78, 4776).is_ok());
-        assert!(test_connected_binary_gate(&circuit, 34, 78, 7647).is_err());
-    }
-
-    #[test]
-    fn test_poly2_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_poly2_gate(from_const(12), from_const(34), from_const(56), None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 42, 42, 22652).is_ok());
-        assert!(test_gate(&circuit, 78, 42, 22652).is_err());
-        assert!(test_gate(&circuit, 42, 78, 22652).is_err());
-        assert!(test_gate(&circuit, 42, 42, 78).is_err());
-    }
-
-    #[test]
-    fn test_connected_poly2_gate() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(43));
-        builder.add_poly2_gate(from_const(34), from_const(56), from_const(78), input.into());
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 43, 65352).is_ok());
-        assert!(test_connected_unary_gate(&circuit, 43, 22652).is_err());
-        assert!(test_connected_unary_gate(&circuit, 43, 23706).is_err());
-    }
-
-    #[test]
-    fn test_bit_assertion_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_bit_assertion_gate(None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 0, 0, 0).is_ok());
-        assert!(test_gate(&circuit, 0, 1, 0).is_err());
-        assert!(test_gate(&circuit, 1, 0, 0).is_err());
-        assert!(test_gate(&circuit, 1, 1, 0).is_ok());
-        assert!(test_gate(&circuit, 2, 2, 0).is_err());
-        assert!(test_gate(&circuit, 3, 3, 0).is_err());
-        assert!(test_gate(&circuit, 123, 123, 0).is_err());
-    }
-
-    #[test]
-    fn test_connected_bit_assertion_gate1() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(0));
-        builder.add_bit_assertion_gate(input.into());
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 0, 0).is_ok());
-    }
-
-    #[test]
-    fn test_connected_bit_assertion_gate2() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(1));
-        builder.add_bit_assertion_gate(input.into());
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 1, 0).is_ok());
-    }
-
-    #[test]
-    fn test_connected_bit_assertion_gate3() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(2));
-        builder.add_bit_assertion_gate(input.into());
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 2, 0).is_err());
-    }
-
-    #[test]
-    fn test_connected_bit_assertion_gate4() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(2));
-        builder.add_bit_assertion_gate(input.into());
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 3, 0).is_err());
-    }
-
-    fn test_trit_assertion_gate_impl(value: u64) -> Result<()> {
-        let mut builder = CircuitBuilder::default();
-        builder.add_trit_assertion_gate(None);
-        let circuit = builder.build();
-        let mut witness = Witness::new(circuit.size());
-        witness.assert_trit(WireOrUnconstrained::Unconstrained(value.into()));
-        let proof = circuit.prove::<Sha2Hash<Scalar>>(witness, DEFAULT_BLOWUP_LOG2)?;
-        let compressed_circuit = circuit.to_compressed::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
-        compressed_circuit.verify(&proof)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_trit_assertion_gate() {
-        assert!(test_trit_assertion_gate_impl(0).is_ok());
-        assert!(test_trit_assertion_gate_impl(1).is_ok());
-        assert!(test_trit_assertion_gate_impl(2).is_ok());
-        assert!(test_trit_assertion_gate_impl(3).is_err());
-        assert!(test_trit_assertion_gate_impl(4).is_err());
-    }
-
-    fn test_connected_trit_assertion_gate_impl(value: u64) -> Result<()> {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(value.into());
-        builder.add_trit_assertion_gate(input.into());
-        let circuit = builder.build();
-        let mut witness = Witness::new(circuit.size());
-        let input = witness.assert_constant(value.into());
-        witness.assert_trit(input.into());
-        let proof = circuit.prove::<Sha2Hash<Scalar>>(witness, DEFAULT_BLOWUP_LOG2)?;
-        let compressed_circuit = circuit.to_compressed::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
-        compressed_circuit.verify(&proof)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_connected_trit_assertion_gate() {
-        assert!(test_connected_trit_assertion_gate_impl(0).is_ok());
-        assert!(test_connected_trit_assertion_gate_impl(1).is_ok());
-        assert!(test_connected_trit_assertion_gate_impl(2).is_ok());
-        assert!(test_connected_trit_assertion_gate_impl(3).is_err());
-        assert!(test_connected_trit_assertion_gate_impl(4).is_err());
-    }
-
-    #[test]
-    fn test_not_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_not_gate(None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 0, 0, 0).is_err());
-        assert!(test_gate(&circuit, 0, 0, 1).is_ok());
-        assert!(test_gate(&circuit, 0, 1, 0).is_err());
-        assert!(test_gate(&circuit, 0, 1, 1).is_err());
-        assert!(test_gate(&circuit, 1, 0, 0).is_err());
-        assert!(test_gate(&circuit, 1, 0, 1).is_err());
-        assert!(test_gate(&circuit, 1, 1, 0).is_ok());
-        assert!(test_gate(&circuit, 1, 1, 1).is_err());
-    }
-
-    #[test]
-    fn test_connected_not_gate() {
-        let mut builder = CircuitBuilder::default();
-        let input = builder.add_const_gate(from_const(0));
-        builder.add_not_gate(input.into());
-        let circuit = builder.build();
-        assert!(test_connected_unary_gate(&circuit, 0, 1).is_ok());
-        assert!(test_connected_unary_gate(&circuit, 1, 1).is_err());
-        assert!(test_connected_unary_gate(&circuit, 0, 0).is_err());
-    }
-
-    #[test]
-    fn test_and_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_and_gate(None, None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 0, 0, 0).is_ok());
-        assert!(test_gate(&circuit, 0, 0, 1).is_err());
-        assert!(test_gate(&circuit, 0, 1, 0).is_ok());
-        assert!(test_gate(&circuit, 0, 1, 1).is_err());
-        assert!(test_gate(&circuit, 1, 0, 0).is_ok());
-        assert!(test_gate(&circuit, 1, 0, 1).is_err());
-        assert!(test_gate(&circuit, 1, 1, 0).is_err());
-        assert!(test_gate(&circuit, 1, 1, 1).is_ok());
-    }
-
-    #[test]
-    fn test_connected_and_gate1() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(0));
-        let rhs = builder.add_const_gate(from_const(1));
-        builder.add_and_gate(lhs.into(), rhs.into());
-        let circuit = builder.build();
-        assert!(test_connected_binary_gate(&circuit, 0, 1, 0).is_ok());
-        assert!(test_connected_binary_gate(&circuit, 0, 1, 1).is_err());
-    }
-
-    #[test]
-    fn test_connected_and_gate2() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(1));
-        let rhs = builder.add_const_gate(from_const(1));
-        builder.add_and_gate(lhs.into(), rhs.into());
-        let circuit = builder.build();
-        assert!(test_connected_binary_gate(&circuit, 1, 1, 1).is_ok());
-        assert!(test_connected_binary_gate(&circuit, 1, 1, 0).is_err());
-    }
-
-    #[test]
-    fn test_or_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_or_gate(None, None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 0, 0, 0).is_ok());
-        assert!(test_gate(&circuit, 0, 0, 1).is_err());
-        assert!(test_gate(&circuit, 0, 1, 0).is_err());
-        assert!(test_gate(&circuit, 0, 1, 1).is_ok());
-        assert!(test_gate(&circuit, 1, 0, 0).is_err());
-        assert!(test_gate(&circuit, 1, 0, 1).is_ok());
-        assert!(test_gate(&circuit, 1, 1, 0).is_err());
-        assert!(test_gate(&circuit, 1, 1, 1).is_ok());
-    }
-
-    #[test]
-    fn test_connected_or_gate1() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(0));
-        let rhs = builder.add_const_gate(from_const(0));
-        builder.add_or_gate(lhs.into(), rhs.into());
-        let circuit = builder.build();
-        assert!(test_connected_binary_gate(&circuit, 0, 0, 0).is_ok());
-        assert!(test_connected_binary_gate(&circuit, 0, 0, 1).is_err());
-    }
-
-    #[test]
-    fn test_connected_or_gate2() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(0));
-        let rhs = builder.add_const_gate(from_const(1));
-        builder.add_or_gate(lhs.into(), rhs.into());
-        let circuit = builder.build();
-        assert!(test_connected_binary_gate(&circuit, 0, 1, 1).is_ok());
-        assert!(test_connected_binary_gate(&circuit, 0, 1, 0).is_err());
-    }
-
-    #[test]
-    fn test_xor_gate() {
-        let mut builder = CircuitBuilder::default();
-        builder.add_xor_gate(None, None);
-        let circuit = builder.build();
-        assert!(test_gate(&circuit, 0, 0, 0).is_ok());
-        assert!(test_gate(&circuit, 0, 0, 1).is_err());
-        assert!(test_gate(&circuit, 0, 1, 0).is_err());
-        assert!(test_gate(&circuit, 0, 1, 1).is_ok());
-        assert!(test_gate(&circuit, 1, 0, 0).is_err());
-        assert!(test_gate(&circuit, 1, 0, 1).is_ok());
-        assert!(test_gate(&circuit, 1, 1, 0).is_ok());
-        assert!(test_gate(&circuit, 1, 1, 1).is_err());
-    }
-
-    #[test]
-    fn test_connected_xor_gate1() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(0));
-        let rhs = builder.add_const_gate(from_const(1));
-        builder.add_xor_gate(lhs.into(), rhs.into());
-        let circuit = builder.build();
-        assert!(test_connected_binary_gate(&circuit, 0, 1, 1).is_ok());
-        assert!(test_connected_binary_gate(&circuit, 0, 1, 0).is_err());
-    }
-
-    #[test]
-    fn test_connected_xor_gate2() {
-        let mut builder = CircuitBuilder::default();
-        let lhs = builder.add_const_gate(from_const(1));
-        let rhs = builder.add_const_gate(from_const(1));
-        builder.add_xor_gate(lhs.into(), rhs.into());
-        let circuit = builder.build();
-        assert!(test_connected_binary_gate(&circuit, 1, 1, 0).is_ok());
-        assert!(test_connected_binary_gate(&circuit, 1, 1, 1).is_err());
+    fn test_vitalik_circuit_with_third_degree_constraint_poseidon2_blowup_8() {
+        test_vitalik_circuit_with_third_degree_constraint_impl::<Poseidon2Hash<Scalar>>(3);
     }
 
     /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
-    /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81). This
-    /// test circuit is meaningful because its size is not a power of 2 (it's 6, or 9 including the
-    /// blinding rows), so it tests padding.
-    fn build_uneven_size_circuit() -> (Circuit, usize) {
+    /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81).
+    fn test_vitalik_circuit_variation_1_impl<H: Hash<Scalar>>(blowup_log2: usize) {
         let mut builder = CircuitBuilder::default();
-        let input = Wire::LeftIn(builder.gate_count());
-        let gate1 = builder.add_square_gate(input.into());
-        let gate2 = builder.add_mul_gate(gate1.into(), input.into());
-        let gate3 = builder.add_mul_gate(input.into(), None);
-        let gate4 = builder.add_sum_gate(gate3.into(), gate2.into());
-        let gate5 = builder.add_sum_gate(None, gate4.into());
-        let gate6 = builder.add_nop_gate(Wire::LeftIn(gate5.gate()).into(), None, gate5.into());
-        builder.declare_public_gates([gate6]);
-        (builder.build(), gate6)
-    }
-
-    fn test_uneven_size_circuit1<H: Hash<Scalar>>(blowup_log2: usize) {
-        let (circuit, gate) = build_uneven_size_circuit();
-        let proof = circuit
-            .prove::<H>(
-                witness(
-                    vec![
-                        from_const(3),
-                        from_const(9),
-                        from_const(3),
-                        from_const(12),
-                        from_const(5),
-                        from_const(5),
-                    ],
-                    vec![
-                        from_const(3),
-                        from_const(3),
-                        from_const(4),
-                        from_const(27),
-                        from_const(39),
-                        from_const(0),
-                    ],
-                    vec![
-                        from_const(9),
-                        from_const(27),
-                        from_const(12),
-                        from_const(39),
-                        from_const(44),
-                        from_const(44),
-                    ],
-                ),
-                blowup_log2,
-            )
+        let square = builder.parse_and_add_gate("w1 == w0 ^ 2");
+        let mul = builder.parse_and_add_gate("w2 == w0 * w1");
+        builder.connect(wire(square, 0).into(), wire(mul, 0).into());
+        let result = builder.parse_and_add_gate("w3 == w0 * w1 + w2 + 5");
+        builder.connect(wire(square, 0).into(), wire(result, 0).into());
+        builder.connect(wire(square, 1).into(), wire(result, 1).into());
+        builder.connect(wire(mul, 2).into(), wire(result, 2).into());
+        let nop = builder.add_gate(Constraint::nop());
+        builder.connect(wire(result, 3).into(), wire(nop, 0).into());
+        builder.declare_public_gates([nop]);
+        let circuit = builder
+            .build(CompilationOptions {
+                canonicalize_constraints: false,
+            })
             .unwrap();
-        let compressed_circuit = circuit.to_compressed::<H>(blowup_log2);
-        let public_inputs = compressed_circuit.verify::<H>(&proof).unwrap();
+        assert_eq!(circuit.num_rows(), 4);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 4);
+        let mut witness = circuit.make_witness();
+        let x = from_const(3);
+        let y = from_const(4);
+        witness.set(wire(square, 0), x);
+        witness.set(wire(square, 1), x.square());
+        witness.set(wire(mul, 0), x);
+        witness.set(wire(mul, 1), y);
+        witness.set(wire(mul, 2), x * y);
+        witness.copy(wire(square, 0), wire(result, 0));
+        witness.copy(wire(square, 1), wire(result, 1));
+        witness.copy(wire(mul, 2), wire(result, 2));
+        witness.set(wire(result, 3), x.cube() + x * y + Scalar::from_const(5));
+        witness.copy(wire(result, 3), wire(nop, 0));
+        let options = ProvingOptions { blowup_log2 };
+        let proof = circuit.prove::<H>(witness, options.clone()).unwrap();
+        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(
-            *public_inputs.get(&Wire::LeftIn(gate)).unwrap(),
-            from_const(5)
+            proof.extended_domain_size(),
+            circuit.degree_bound() << blowup_log2
         );
-        assert_eq!(
-            *public_inputs.get(&Wire::Out(gate)).unwrap(),
-            from_const(44)
-        );
+        assert!(circuit.verify::<H>(&proof, options).is_ok());
     }
 
     #[test]
-    fn test_uneven_size_circuit1_blowup_2() {
-        test_uneven_size_circuit1::<Sha2Hash<Scalar>>(1);
-        test_uneven_size_circuit1::<Poseidon2Hash<Scalar>>(1);
+    fn test_vitalik_circuit_variation_1_sha2_blowup_2() {
+        test_vitalik_circuit_variation_1_impl::<Sha2Hash<Scalar>>(1);
     }
 
     #[test]
-    fn test_uneven_size_circuit1_blowup_4() {
-        test_uneven_size_circuit1::<Sha2Hash<Scalar>>(2);
-        test_uneven_size_circuit1::<Poseidon2Hash<Scalar>>(2);
+    fn test_vitalik_circuit_variation_1_poseidon2_blowup_2() {
+        test_vitalik_circuit_variation_1_impl::<Poseidon2Hash<Scalar>>(1);
     }
 
     #[test]
-    fn test_uneven_size_circuit1_blowup_8() {
-        test_uneven_size_circuit1::<Sha2Hash<Scalar>>(3);
-        test_uneven_size_circuit1::<Poseidon2Hash<Scalar>>(3);
+    fn test_vitalik_circuit_variation_1_sha2_blowup_4() {
+        test_vitalik_circuit_variation_1_impl::<Sha2Hash<Scalar>>(2);
     }
 
-    fn test_uneven_size_circuit2<H: Hash<Scalar>>(blowup_log2: usize) {
-        let (circuit, gate) = build_uneven_size_circuit();
-        let proof = circuit
-            .prove::<H>(
-                witness(
-                    vec![
-                        from_const(4),
-                        from_const(16),
-                        from_const(4),
-                        from_const(12),
-                        from_const(5),
-                        from_const(5),
-                    ],
-                    vec![
-                        from_const(4),
-                        from_const(4),
-                        from_const(3),
-                        from_const(64),
-                        from_const(76),
-                        from_const(0),
-                    ],
-                    vec![
-                        from_const(16),
-                        from_const(64),
-                        from_const(12),
-                        from_const(76),
-                        from_const(81),
-                        from_const(81),
-                    ],
-                ),
-                blowup_log2,
-            )
+    #[test]
+    fn test_vitalik_circuit_variation_1_poseidon2_blowup_4() {
+        test_vitalik_circuit_variation_1_impl::<Poseidon2Hash<Scalar>>(2);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_variation_1_sha2_blowup_8() {
+        test_vitalik_circuit_variation_1_impl::<Sha2Hash<Scalar>>(3);
+    }
+
+    #[test]
+    fn test_vitalik_circuit_variation_1_poseidon2_blowup_8() {
+        test_vitalik_circuit_variation_1_impl::<Poseidon2Hash<Scalar>>(3);
+    }
+
+    fn test_wide_circuit_more_columns_than_degree_bound_impl<H: Hash<Scalar>>() {
+        const NUM_COLUMNS: usize = 10;
+
+        let mut builder = CircuitBuilder::default();
+        let mut constraint = Constraint::default();
+        for i in 0..NUM_COLUMNS {
+            constraint += var(i);
+        }
+        let gate = builder.add_gate(constraint);
+        let circuit = builder
+            .build(CompilationOptions {
+                canonicalize_constraints: false,
+            })
             .unwrap();
-        let compressed_circuit = circuit.to_compressed::<H>(blowup_log2);
-        let public_inputs = compressed_circuit.verify::<H>(&proof).unwrap();
-        assert_eq!(
-            *public_inputs.get(&Wire::LeftIn(gate)).unwrap(),
-            from_const(5)
-        );
-        assert_eq!(
-            *public_inputs.get(&Wire::Out(gate)).unwrap(),
-            from_const(81)
-        );
+        assert_eq!(circuit.num_rows(), 1);
+        assert_eq!(circuit.num_columns(), NUM_COLUMNS);
+        assert!(circuit.num_columns() > circuit.degree_bound());
+
+        let mut witness = circuit.make_witness();
+        let mut sum = Scalar::ZERO;
+        for i in 0..NUM_COLUMNS - 1 {
+            let value = from_const((i + 1) as u64);
+            witness.set(wire(gate, i), value);
+            sum += value;
+        }
+        witness.set(wire(gate, NUM_COLUMNS - 1), -sum);
+
+        let options = ProvingOptions {
+            blowup_log2: DEFAULT_BLOWUP_LOG2,
+        };
+        let proof = circuit.prove::<H>(witness, options.clone()).unwrap();
+        assert!(circuit.verify::<H>(&proof, options).is_ok());
     }
 
     #[test]
-    fn test_uneven_size_circuit2_blowup_2() {
-        test_uneven_size_circuit2::<Sha2Hash<Scalar>>(1);
-        test_uneven_size_circuit2::<Poseidon2Hash<Scalar>>(1);
-    }
-
-    #[test]
-    fn test_uneven_size_circuit2_blowup_4() {
-        test_uneven_size_circuit2::<Sha2Hash<Scalar>>(2);
-        test_uneven_size_circuit2::<Poseidon2Hash<Scalar>>(2);
-    }
-
-    #[test]
-    fn test_uneven_size_circuit2_blowup_8() {
-        test_uneven_size_circuit2::<Sha2Hash<Scalar>>(3);
-        test_uneven_size_circuit2::<Poseidon2Hash<Scalar>>(3);
-    }
-
-    #[test]
-    fn test_compile_uneven_size_circuit_separately() {
-        let (prover_circuit, _) = build_uneven_size_circuit();
-        let proof = prover_circuit
-            .prove::<Sha2Hash<Scalar>>(
-                witness(
-                    vec![
-                        from_const(3),
-                        from_const(9),
-                        from_const(3),
-                        from_const(12),
-                        from_const(5),
-                        from_const(5),
-                    ],
-                    vec![
-                        from_const(3),
-                        from_const(3),
-                        from_const(4),
-                        from_const(27),
-                        from_const(39),
-                        from_const(0),
-                    ],
-                    vec![
-                        from_const(9),
-                        from_const(27),
-                        from_const(12),
-                        from_const(39),
-                        from_const(44),
-                        from_const(44),
-                    ],
-                ),
-                DEFAULT_BLOWUP_LOG2,
-            )
-            .unwrap();
-        let (verifier_circuit, gate) = build_uneven_size_circuit();
-        let verifier_circuit =
-            verifier_circuit.to_compressed::<Sha2Hash<Scalar>>(DEFAULT_BLOWUP_LOG2);
-        let public_inputs = verifier_circuit.verify::<Sha2Hash<Scalar>>(&proof).unwrap();
-        assert_eq!(
-            *public_inputs.get(&Wire::LeftIn(gate)).unwrap(),
-            from_const(5)
-        );
-        assert_eq!(
-            *public_inputs.get(&Wire::Out(gate)).unwrap(),
-            from_const(44)
-        );
+    fn test_wide_circuit_more_columns_than_degree_bound() {
+        test_wide_circuit_more_columns_than_degree_bound_impl::<Sha2Hash<Scalar>>();
+        test_wide_circuit_more_columns_than_degree_bound_impl::<Poseidon2Hash<Scalar>>();
     }
 }

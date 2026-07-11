@@ -7,3 +7,6 @@
 ## Overview
 
 This repo contains Starkom's PLONK arithmetization and proving system.
+
+The specific arithmetization type is TurboPLONK: it has an arbitrary number of columns and custom
+constraints.
