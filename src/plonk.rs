@@ -395,16 +395,16 @@ impl Witness {
         let mut variables = vec![Scalar::ZERO; N];
         for (column_index, input) in free_variables.into_iter().zip(inputs.into_iter()) {
             let value = match input.into() {
-                WireOrUnconstrained::Wire(wire) => self.data[wire.row()][wire.column()],
+                WireOrUnconstrained::Wire(wire) => self.data[wire.column()][wire.row()],
                 WireOrUnconstrained::Unconstrained(value) => value,
             };
-            self.data[row_index][column_index] = value;
+            self.data[column_index][row_index] = value;
             variables[column_index] = value;
         }
         expressions
             .into_iter()
             .map(|(column_index, expression)| {
-                self.data[row_index][column_index] = expression.evaluate(variables.as_slice());
+                self.data[column_index][row_index] = expression.evaluate(variables.as_slice());
                 wire(row_index, column_index)
             })
             .collect::<Vec<Wire>>()
