@@ -306,6 +306,9 @@ pub struct Witness {
     /// The number of witness rows *not* including the blinding rows.
     num_rows: usize,
 
+    /// Used by [`Self::auto_set`] to identify the row to update.
+    gate_counter: usize,
+
     /// Witness table cells, indexed column-first.
     ///
     /// The column-first indexing allows quickly interpolating polynomials for the columns.
@@ -340,8 +343,8 @@ impl Witness {
     }
 
     /// Copies a witness cell to another.
-    pub fn copy(&mut self, src_wire: WireOrUnconstrained, dst_wire: Wire) -> Scalar {
-        match src_wire {
+    pub fn copy<W: Into<WireOrUnconstrained>>(&mut self, src_wire: W, dst_wire: Wire) -> Scalar {
+        match src_wire.into() {
             WireOrUnconstrained::Wire(src_wire) => {
                 let src_row = src_wire.row();
                 let dst_row = dst_wire.row();
@@ -358,6 +361,66 @@ impl Witness {
                 src_value
             }
         }
+    }
+
+    /// Sets output variables in the current witness row to the values computed by the provided
+    /// `expressions`, evaluated in the specified `inputs`.
+    ///
+    /// The "current witness row" is kept track of by `Witness` using an internal counter, and
+    /// requires that the auto-set API is used consistently throughout the entire circuit. Only
+    /// [`Self::auto_set`] and [`Self::auto_set_one`] read and update the internal gate counter, so
+    /// if you mix APIs (i.e. set some cells with `auto_set` and some others with [`Self::set`]) the
+    /// counter will loose track of the current row and the witness will be incorrect.
+    ///
+    /// The generic parameter `N` is the number of input wires while `M` is the number of output
+    /// wires. The number of `expressions` entries MUST be equal to `M`, and the union of the
+    /// [free variables](`Constraint::get_free_variables`) of all expressions MUST have exactly `N`
+    /// elements.
+    pub fn auto_set<W: Into<WireOrUnconstrained>, const N: usize, const M: usize>(
+        &mut self,
+        expressions: BTreeMap<usize, Constraint>,
+        inputs: [W; N],
+    ) -> [Wire; M] {
+        assert_eq!(expressions.len(), M);
+        let free_variables = expressions
+            .iter()
+            .map(|(_, expression)| expression.get_free_variables())
+            .fold(BTreeSet::default(), |mut accumulator, mut variables| {
+                accumulator.append(&mut variables);
+                accumulator
+            });
+        assert_eq!(free_variables.len(), N);
+        let row_index = self.gate_counter;
+        self.gate_counter += 1;
+        let mut variables = vec![Scalar::ZERO; N];
+        for (column_index, input) in free_variables.into_iter().zip(inputs.into_iter()) {
+            let value = match input.into() {
+                WireOrUnconstrained::Wire(wire) => self.data[wire.row()][wire.column()],
+                WireOrUnconstrained::Unconstrained(value) => value,
+            };
+            self.data[row_index][column_index] = value;
+            variables[column_index] = value;
+        }
+        expressions
+            .into_iter()
+            .map(|(column_index, expression)| {
+                self.data[row_index][column_index] = expression.evaluate(variables.as_slice());
+                wire(row_index, column_index)
+            })
+            .collect::<Vec<Wire>>()
+            .try_into()
+            .unwrap()
+    }
+
+    /// Like [`Self::auto_set`], but produces only one output.
+    pub fn auto_set_one<W: Into<WireOrUnconstrained>, const N: usize>(
+        &mut self,
+        column_index: usize,
+        expression: Constraint,
+        inputs: [W; N],
+    ) -> Wire {
+        let [result] = self.auto_set(BTreeMap::from([(column_index, expression)]), inputs);
+        result
     }
 
     /// Adds blinding rows to the polynomial.
@@ -469,6 +532,7 @@ impl Circuit {
     pub fn make_witness(&self) -> Witness {
         Witness {
             num_rows: self.num_rows,
+            gate_counter: 0,
             data: vec![vec![Scalar::ZERO; self.degree_bound]; self.num_columns],
         }
     }
@@ -1029,10 +1093,10 @@ mod tests {
         let x = from_const(3);
         witness.set(wire(square, 0), x);
         witness.set(wire(square, 1), x.square());
-        witness.copy(wire(square, 0).into(), wire(result, 0));
-        witness.copy(wire(square, 1).into(), wire(result, 1));
+        witness.copy(wire(square, 0), wire(result, 0));
+        witness.copy(wire(square, 1), wire(result, 1));
         witness.set(wire(result, 2), x.cube() + x + from_const(5));
-        witness.copy(wire(result, 2).into(), wire(nop, 0));
+        witness.copy(wire(result, 2), wire(nop, 0));
         let proof = circuit.prove::<H>(witness, ProvingOptions { blowup_log2 })?;
         assert_eq!(proof.degree_bound(), circuit.degree_bound());
         assert_eq!(proof.blowup_log2(), blowup_log2);
@@ -1098,10 +1162,10 @@ mod tests {
         let x = from_const(3);
         witness.set(wire(square, 0), x);
         witness.set(wire(square, 1), x.square());
-        witness.copy(wire(square, 0).into(), wire(result, 0));
-        witness.copy(wire(square, 1).into(), wire(result, 1));
+        witness.copy(wire(square, 0), wire(result, 0));
+        witness.copy(wire(square, 1), wire(result, 1));
         witness.set(wire(result, 2), x.cube() + x + from_const(5));
-        witness.copy(wire(result, 2).into(), wire(nop, 0));
+        witness.copy(wire(result, 2), wire(nop, 0));
         let blowup_log2 = DEFAULT_BLOWUP_LOG2;
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit
@@ -1137,12 +1201,11 @@ mod tests {
         assert_eq!(circuit.num_columns(), 3);
         let mut witness = circuit.make_witness();
         let value = from_const(3);
-        witness.set(wire(0, 0), value);
-        witness.set(wire(0, 1), value.square());
-        witness.copy(wire(0, 0).into(), wire(1, 0));
-        witness.copy(wire(0, 1).into(), wire(1, 1));
-        witness.set(wire(1, 2), value.cube() + value + from_const(5));
-        witness.copy(wire(1, 2).into(), wire(nop, 0));
+        let x = wire(0, 0);
+        witness.set(x, value);
+        let square = witness.auto_set_one(1, var(0) ^ 2, [x]);
+        let result = witness.auto_set_one(2, var(0) * var(1) + var(0) + 5, [x, square]);
+        witness.auto_set_one(0, var(0), [result]);
         let blowup_log2 = DEFAULT_BLOWUP_LOG2;
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit
@@ -1175,7 +1238,7 @@ mod tests {
         let x = from_const(3);
         witness.set(wire(result, 0), x);
         witness.set(wire(result, 1), x.cube() + x + from_const(5));
-        witness.copy(wire(result, 1).into(), wire(nop, 0));
+        witness.copy(wire(result, 1), wire(nop, 0));
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit.prove::<H>(witness, options.clone()).unwrap();
         assert_eq!(proof.degree_bound(), circuit.degree_bound());
@@ -1247,11 +1310,11 @@ mod tests {
         witness.set(wire(mul, 0), x);
         witness.set(wire(mul, 1), y);
         witness.set(wire(mul, 2), x * y);
-        witness.copy(wire(square, 0).into(), wire(result, 0));
-        witness.copy(wire(square, 1).into(), wire(result, 1));
-        witness.copy(wire(mul, 2).into(), wire(result, 2));
+        witness.copy(wire(square, 0), wire(result, 0));
+        witness.copy(wire(square, 1), wire(result, 1));
+        witness.copy(wire(mul, 2), wire(result, 2));
         witness.set(wire(result, 3), x.cube() + x * y + Scalar::from_const(5));
-        witness.copy(wire(result, 3).into(), wire(nop, 0));
+        witness.copy(wire(result, 3), wire(nop, 0));
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit.prove::<H>(witness, options.clone()).unwrap();
         assert_eq!(proof.degree_bound(), circuit.degree_bound());
