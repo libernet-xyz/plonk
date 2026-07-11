@@ -1122,7 +1122,7 @@ mod tests {
         let [x, square] = builder.auto_gate("w1 == w0 ^ 2".parse().unwrap(), []);
         let [result] = builder.auto_gate(
             "w2 == w0 * w1 + w0 + 5".parse().unwrap(),
-            [square.into(), x.into()],
+            [x.into(), square.into()],
         );
         let nop = builder.add_gate(Constraint::nop());
         builder.connect(result.into(), wire(nop, 0).into());
@@ -1137,9 +1137,24 @@ mod tests {
         assert_eq!(circuit.num_columns(), 3);
         let mut witness = circuit.make_witness();
         let value = from_const(3);
-        witness.set(x, value);
-        witness.set(square, value.square());
-        // TODO
+        witness.set(wire(0, 0), value);
+        witness.set(wire(0, 1), value.square());
+        witness.copy(wire(0, 0).into(), wire(1, 0));
+        witness.copy(wire(0, 1).into(), wire(1, 1));
+        witness.set(wire(1, 2), value.cube() + value + from_const(5));
+        witness.copy(wire(1, 2).into(), wire(nop, 0));
+        let blowup_log2 = DEFAULT_BLOWUP_LOG2;
+        let options = ProvingOptions { blowup_log2 };
+        let proof = circuit
+            .prove::<Sha2Hash<Scalar>>(witness, options.clone())
+            .unwrap();
+        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(
+            proof.extended_domain_size(),
+            circuit.degree_bound() << blowup_log2
+        );
+        assert!(circuit.verify::<Sha2Hash<Scalar>>(&proof, options).is_ok());
     }
 
     fn test_vitalik_circuit_with_third_degree_constraint_impl<H: Hash<Scalar>>(blowup_log2: usize) {
