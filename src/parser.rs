@@ -3,7 +3,7 @@ use crate::lexer::Token;
 use anyhow::{Result, anyhow};
 use regex::Regex;
 use starkom_bluesky::Scalar;
-use starkom_ff::{Field, Field256};
+use starkom_ff::{Field, Field256, PrimeField};
 use std::sync::LazyLock;
 
 static REGEX_VARIABLE_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^w(\d+)$").unwrap());
@@ -79,11 +79,7 @@ impl<'a> Parser<'a> {
     }
 
     fn is_pseudo_negative(value: &Scalar) -> bool {
-        const HALF_RANGE: LazyLock<Scalar> = LazyLock::new(|| {
-            "0x7ffffffffffffffffffffffffffffffe0673ddf29e9b5547c00000000000000"
-                .parse()
-                .unwrap()
-        });
+        const HALF_RANGE: LazyLock<Scalar> = LazyLock::new(|| Scalar::MAX * Scalar::TWO_INV);
         *value > *HALF_RANGE
     }
 

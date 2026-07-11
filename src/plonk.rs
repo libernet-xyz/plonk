@@ -426,7 +426,7 @@ impl Witness {
         assert_eq!(free_variables.len(), N);
         let row_index = self.gate_counter;
         self.gate_counter += 1;
-        let mut variables = vec![Scalar::ZERO; N];
+        let mut variables = vec![Scalar::ZERO; self.data.len()];
         for (column_index, input) in free_variables.into_iter().zip(inputs.into_iter()) {
             let value = match input.into() {
                 WireOrUnconstrained::Wire(wire) => self.data[wire.column()][wire.row()],
