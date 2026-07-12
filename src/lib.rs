@@ -3,13 +3,14 @@
 
 #![doc = include_str!("../README.md")]
 
+mod chip;
 mod expr;
 mod lexer;
-mod parser;
 mod plonk;
 mod utils;
-mod wires;
+mod witness;
 
+pub use chip::*;
 pub use expr::*;
 pub use plonk::*;
-pub use wires::*;
+pub use witness::*;
