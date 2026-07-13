@@ -1,4 +1,6 @@
+use crate::expr::{Constraint, Variable};
 use starkom_bluesky::Scalar;
+use starkom_ff::Field;
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -19,6 +21,11 @@ impl Cell {
     pub const fn column(&self) -> usize {
         self.column
     }
+}
+
+#[inline]
+pub const fn cell(row: usize, column: usize) -> Cell {
+    Cell::new(row, column)
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -111,6 +118,27 @@ impl Partitioner {
     }
 }
 
+pub trait WitnessView {
+    fn width(&self) -> usize;
+
+    /// Reads a witness cell.
+    fn get(&self, cell: Cell) -> Scalar;
+
+    /// Updates a witness cell.
+    fn set(&mut self, cell: Cell, value: Scalar);
+
+    /// Copies a witness cell to another.
+    fn copy(&mut self, src_cell: Cell, dst_cell: Cell) -> Scalar;
+
+    fn auto_set<const N: usize, const M: usize>(
+        &mut self,
+        expressions: &BTreeMap<Variable, Constraint>,
+        inputs: [CellOrUnconstrained; N],
+    ) -> [Cell; M];
+
+    fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView;
+}
+
 #[derive(Debug, Clone)]
 pub struct Witness {
     /// The number of witness rows *not* including the blinding rows.
@@ -123,6 +151,13 @@ pub struct Witness {
 }
 
 impl Witness {
+    pub(crate) fn new(num_rows: usize, num_columns: usize) -> Self {
+        Self {
+            num_rows,
+            data: vec![vec![Scalar::ZERO; num_rows]; num_columns],
+        }
+    }
+
     pub fn num_rows(&self) -> usize {
         self.num_rows
     }
@@ -130,8 +165,109 @@ impl Witness {
     pub fn num_columns(&self) -> usize {
         self.data.len()
     }
+}
 
-    // TODO
+impl WitnessView for Witness {
+    fn width(&self) -> usize {
+        self.data.len()
+    }
+
+    fn get(&self, cell: Cell) -> Scalar {
+        self.data[cell.column()][cell.row()]
+    }
+
+    fn set(&mut self, cell: Cell, value: Scalar) {
+        self.data[cell.column()][cell.row()] = value;
+    }
+
+    fn copy(&mut self, src_cell: Cell, dst_cell: Cell) -> Scalar {
+        let value = self.data[src_cell.column()][src_cell.row()];
+        self.data[dst_cell.column()][dst_cell.row()] = value;
+        value
+    }
+
+    fn auto_set<const N: usize, const M: usize>(
+        &mut self,
+        expressions: &BTreeMap<Variable, Constraint>,
+        inputs: [CellOrUnconstrained; N],
+    ) -> [Cell; M] {
+        // TODO
+        todo!()
+    }
+
+    fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView {
+        WitnessSection::new(self, row_offset, column_offset, width)
+    }
+}
+
+#[derive(Debug)]
+pub struct WitnessSection<'a> {
+    witness: &'a mut Witness,
+    row_offset: usize,
+    column_offset: usize,
+    width: usize,
+    row_counter: usize,
+}
+
+impl<'a> WitnessSection<'a> {
+    fn new(
+        witness: &'a mut Witness,
+        row_offset: usize,
+        column_offset: usize,
+        width: usize,
+    ) -> Self {
+        Self {
+            witness,
+            row_offset,
+            column_offset,
+            width,
+            row_counter: 0,
+        }
+    }
+
+    fn map_cell(&self, cell: Cell) -> Cell {
+        Cell::new(
+            self.row_offset + cell.row(),
+            self.column_offset + cell.column(),
+        )
+    }
+}
+
+impl<'a> WitnessView for WitnessSection<'a> {
+    fn width(&self) -> usize {
+        self.width
+    }
+
+    fn get(&self, cell: Cell) -> Scalar {
+        self.witness.get(self.map_cell(cell))
+    }
+
+    fn set(&mut self, cell: Cell, value: Scalar) {
+        self.witness.set(self.map_cell(cell), value);
+    }
+
+    fn copy(&mut self, src_cell: Cell, dst_cell: Cell) -> Scalar {
+        self.witness
+            .copy(self.map_cell(src_cell), self.map_cell(dst_cell))
+    }
+
+    fn auto_set<const N: usize, const M: usize>(
+        &mut self,
+        expression: &BTreeMap<Variable, Constraint>,
+        inputs: [CellOrUnconstrained; N],
+    ) -> [Cell; M] {
+        // TODO
+        todo!()
+    }
+
+    fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView {
+        WitnessSection::new(
+            self.witness,
+            self.row_offset + row_offset,
+            self.column_offset + column_offset,
+            width,
+        )
+    }
 }
 
 #[cfg(test)]

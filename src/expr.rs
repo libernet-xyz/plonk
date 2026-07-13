@@ -1,4 +1,5 @@
-use crate::utils::is_pseudo_negative;
+use crate::utils::{is_pseudo_negative, isize_to_scalar};
+use crate::witness::Cell;
 use starkom_bluesky::Scalar;
 use starkom_ff::Field;
 use starkom_poly;
@@ -8,6 +9,16 @@ use std::fmt::{Debug, Display};
 use std::ops::Index;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
+
+#[inline]
+pub fn var(column_index: usize, rotation: isize) -> Constraint {
+    Constraint::make_var(column_index, rotation)
+}
+
+#[inline]
+pub fn make_const(value: isize) -> Constraint {
+    Constraint::make_const(isize_to_scalar(value))
+}
 
 /// Represents a variable in a [`Constraint`] expression.
 ///
@@ -36,6 +47,21 @@ impl Variable {
     /// Row offset relative to where the [`Constraint`] applies.
     pub const fn rotation(&self) -> isize {
         self.rotation
+    }
+
+    /// Maps the variable to a witness cell given the root cell where the constraint applies.
+    ///
+    /// For example, if the root cell is at row 12 and column 34 then `w(3, +2)` maps to row 14 and
+    /// column 37.
+    pub const fn map_to_cell(&self, root_cell: Cell) -> Cell {
+        Cell::new(
+            if self.rotation < 0 {
+                root_cell.row() - self.rotation.unsigned_abs()
+            } else {
+                root_cell.row() + self.rotation.unsigned_abs()
+            },
+            root_cell.column() + self.column_index,
+        )
     }
 
     /// Remaps the variable to a different column index, as per [`Constraint::remap_variables`].
