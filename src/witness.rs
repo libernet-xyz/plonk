@@ -1,4 +1,5 @@
 use crate::expr::{Constraint, Variable};
+use crate::utils::padded_circuit_size;
 use starkom_bluesky::Scalar;
 use starkom_ff::Field;
 use std::collections::{BTreeMap, BTreeSet, btree_map};
@@ -144,6 +145,18 @@ pub struct Witness {
     /// The number of witness rows *not* including the blinding rows.
     num_rows: usize,
 
+    /// Number of blinding rows used in the circuit.
+    ///
+    /// This is calculated by [`padded_circuit_size`] and depends on how many different variable
+    /// rotations were used across all constraints.
+    num_blinding_rows: usize,
+
+    /// Padded circuit size, including the blinding rows and rounded up to the next power of 2.
+    degree_bound: usize,
+
+    /// Used by [`Self::auto_set`] to identify the row to update.
+    gate_counter: usize,
+
     /// Witness table cells, indexed column-first.
     ///
     /// The column-first indexing allows quickly interpolating polynomials for the columns.
@@ -151,19 +164,46 @@ pub struct Witness {
 }
 
 impl Witness {
-    pub(crate) fn new(num_rows: usize, num_columns: usize) -> Self {
+    pub(crate) fn new<R: IntoIterator<Item = isize>>(
+        num_rows: usize,
+        num_columns: usize,
+        rotations: R,
+    ) -> Self {
+        let (degree_bound, num_blinding_rows) = padded_circuit_size(num_rows, rotations);
         Self {
             num_rows,
-            data: vec![vec![Scalar::ZERO; num_rows]; num_columns],
+            num_blinding_rows,
+            degree_bound,
+            gate_counter: 0,
+            data: vec![vec![Scalar::ZERO; degree_bound]; num_columns],
         }
     }
 
+    /// Returns the number of witness rows *not* including the blinding rows.
     pub fn num_rows(&self) -> usize {
         self.num_rows
     }
 
+    /// Returns the padded circuit size, including the blinding rows and rounded up to the next
+    /// power of 2.
+    pub fn degree_bound(&self) -> usize {
+        self.degree_bound
+    }
+
+    /// Returns the number of witness columns.
     pub fn num_columns(&self) -> usize {
         self.data.len()
+    }
+
+    /// Fills in the blinding rows of the witness with random values.
+    ///
+    /// The affected rows are the last `num_blinding_rows`.
+    pub(crate) fn blind(&mut self, num_blinding_rows: usize) {
+        for i in 0..self.num_columns() {
+            for j in 0..num_blinding_rows {
+                self.data[i][self.num_rows + j] = Scalar::random_default();
+            }
+        }
     }
 }
 

@@ -3,6 +3,7 @@ use primitive_types::H512;
 use sha3::Digest;
 use starkom_bluesky::Scalar;
 use starkom_ff::{Field, Field256, PrimeField};
+use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 /// Hashes an arbitrary text string into a uniformly distributed BlueSky scalar.
@@ -52,6 +53,31 @@ pub(crate) fn scalar_to_isize(value: Scalar) -> Result<isize> {
     }
 }
 
+/// Calculates the final circuit size (number of rows) by adding the correct number of blinding rows
+/// and rounding up to the next power of two.
+///
+/// The returned pair is `(degree_bound, nun_blinding_rows)`, with `degree_bound` indicating the
+/// total number of rows (always a power of two and suitable for use as the size of the evaluation
+/// domain).
+///
+/// The number of blinding rows added must be strictly greater than the number of non-public opened
+/// points, so we calculate it as the total number of different variable rotations present in the
+/// circuit plus one. We force the 0 and +1 rotations into the rotation set because the main
+/// challenge xi and the shifted challenge xi*omega are always opened (for the final algebraic check
+/// and the permutation argument, respectively) even if the circuit doesn't use those rotations.
+pub(crate) fn padded_circuit_size<R: IntoIterator<Item = isize>>(
+    num_rows: usize,
+    rotations: R,
+) -> (usize, usize) {
+    let num_blinding_rows = [0isize, 1isize]
+        .into_iter()
+        .chain(rotations.into_iter())
+        .collect::<BTreeSet<isize>>()
+        .len();
+    let degree_bound = (num_rows + num_blinding_rows + 1).next_power_of_two();
+    (degree_bound, num_blinding_rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,4 +94,6 @@ mod tests {
             parse_scalar("0x027880d47636bf77d55804a6cf2d5ec8f09427cdf678e2ed3d74c432cc2efa7a")
         );
     }
+
+    // TODO
 }

@@ -1,4 +1,5 @@
 use crate::expr::{Constraint, Variable};
+use crate::utils::padded_circuit_size;
 use crate::witness::{Cell, Partitioner, Witness, cell};
 use anyhow::Result;
 use starkom_bluesky::Scalar;
@@ -87,6 +88,13 @@ pub trait CircuitView {
         inputs: [Option<Cell>; N],
     ) -> [Cell; M];
 
+    fn add_nop_gate<const N: usize, const M: usize>(
+        &mut self,
+        inputs: [Option<Cell>; N],
+    ) -> [Cell; M] {
+        self.auto_gate(Constraint::nop(), inputs)
+    }
+
     /// Spawns a child `CircuitView` at the given coordinates.
     fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView;
 }
@@ -136,7 +144,18 @@ impl CircuitBuilder {
     }
 
     /// Compiles the circuit built so far into a [`Circuit`] object.
-    pub fn build(self) -> Result<Circuit> {
+    pub fn build(mut self) -> Result<Circuit> {
+        let (degree_bound, _) = padded_circuit_size(
+            self.num_rows,
+            self.gates.iter().flat_map(|(constraint, _)| {
+                constraint
+                    .get_free_variables()
+                    .iter()
+                    .map(Variable::rotation)
+                    .collect::<BTreeSet<isize>>()
+            }),
+        );
+
         // TODO
         todo!()
     }
@@ -200,14 +219,7 @@ impl CircuitView for CircuitBuilder {
             }
         }
 
-        match self.gates.get_mut(&constraint) {
-            Some(root_cells) => {
-                root_cells.push(root_cell);
-            }
-            None => {
-                self.gates.insert(constraint, vec![root_cell]);
-            }
-        }
+        self.add_gate_internal(root_cell.row(), root_cell.column(), constraint);
 
         std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
     }
@@ -217,12 +229,22 @@ impl CircuitView for CircuitBuilder {
     }
 }
 
+/// Implements [`CircuitView`] for a sub-section of the circuit.
 #[derive(Debug)]
 struct CircuitSectionBuilder<'a> {
+    /// Reference to the parent [`CircuitBuilder`].
     builder: &'a mut CircuitBuilder,
+
+    /// Row offset of the sub-section.
     row_offset: usize,
+
+    /// Column offset of the sub-section.
     column_offset: usize,
+
+    /// Width (number of columns) of the sub-section.
     width: usize,
+
+    /// Row counter for [`Self::auto_gate`].
     row_counter: usize,
 }
 
@@ -270,8 +292,21 @@ impl<'a> CircuitView for CircuitSectionBuilder<'a> {
         constraint: Constraint,
         inputs: [Option<Cell>; N],
     ) -> [Cell; M] {
-        // TODO
-        todo!()
+        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
+        assert_eq!(variables.len(), N + M);
+
+        let root_cell = cell(self.row_counter, 0);
+        self.row_counter += 1;
+
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.connect(Some(input), Some(variables[i].map_to_cell(root_cell)));
+            }
+        }
+
+        self.add_gate_internal(root_cell.row(), root_cell.column(), constraint);
+
+        std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
     }
 
     fn connect(&mut self, cell1: Option<Cell>, cell2: Option<Cell>) {
@@ -330,6 +365,20 @@ impl<H: Hash<Scalar>> Proof<H> {
     }
 }
 
+/// Describes an instance of a gate.
+///
+/// NOTE: this struct doesn't specify the row of the root cell where the gate was placed because
+/// activating a gate at the correct rows is the gate selector's job. The column of the root cell,
+/// on the other hand, is specified by [`Self::column_index`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GateInstance {
+    /// Column of the root cell where the gate was placed.
+    column_index: usize,
+
+    /// Index of the gate selector polynomial within the [selector pool](`Circuit::selectors`).
+    selector_index: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Circuit {
     /// The raw number of rows of the circuit.
@@ -344,10 +393,18 @@ pub struct Circuit {
     /// Number of witness columns.
     num_columns: usize,
 
+    /// Gate selectors.
+    ///
+    /// This is a pool of Lagrange bases that the grand gate constraint uses to selectively activate
+    /// gates at the rows where they're used.
+    ///
+    /// The size of this pool is not (necessarily) the number of rows: [`CircuitBuilder`]'s
+    /// algorithm tries to reuse selectors as much as possible.
+    selectors: Vec<Polynomial>,
+
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
-    /// second component is the selector / Lagrange basis polynomial that activates on the rows
-    /// where that gate was used.
-    gates: Vec<(Constraint, Polynomial)>,
+    /// second component is the set of instances of that gate across the circuit.
+    gates: BTreeMap<Constraint, BTreeSet<GateInstance>>,
 
     /// Sigma polynomials of the permutation argument, one for every witness column.
     sigma: Vec<Polynomial>,
@@ -376,7 +433,17 @@ impl Circuit {
 
     /// Makes an empty [`Witness`] objects suitable for use with this circuit.
     pub fn make_witness(&self) -> Witness {
-        Witness::new(self.num_rows, self.num_columns)
+        Witness::new(
+            self.num_rows,
+            self.num_columns,
+            self.gates.iter().flat_map(|(constraint, _)| {
+                constraint
+                    .get_free_variables()
+                    .iter()
+                    .map(Variable::rotation)
+                    .collect::<BTreeSet<isize>>()
+            }),
+        )
     }
 
     /// Proves correctness for the given witness, or returns an error in case of a constraint
