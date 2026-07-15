@@ -180,14 +180,7 @@ impl CircuitBuilder {
             for root_cell in root_cells.as_slice() {
                 let key = (constraint.clone(), root_cell.column());
                 let row = root_cell.row();
-                match row_set_map.get_mut(&key) {
-                    Some(rows) => {
-                        rows.insert(row);
-                    }
-                    None => {
-                        row_set_map.insert(key, BTreeSet::from([row]));
-                    }
-                }
+                row_set_map.entry(key).or_default().insert(row);
             }
         }
 
@@ -196,14 +189,10 @@ impl CircuitBuilder {
         let mut gates_by_row_set: BTreeMap<BTreeSet<usize>, Vec<(Constraint, usize)>> =
             BTreeMap::default();
         for ((constraint, column_index), row_set) in row_set_map {
-            match gates_by_row_set.get_mut(&row_set) {
-                Some(gates) => {
-                    gates.push((constraint, column_index));
-                }
-                None => {
-                    gates_by_row_set.insert(row_set, vec![(constraint, column_index)]);
-                }
-            }
+            gates_by_row_set
+                .entry(row_set)
+                .or_default()
+                .push((constraint, column_index));
         }
 
         let mut gates: BTreeMap<Constraint, BTreeSet<GateInstance>> = BTreeMap::default();
@@ -214,18 +203,10 @@ impl CircuitBuilder {
         {
             selectors.push(Self::make_selector(degree_bound, activation_row_set));
             for (constraint, column_index) in gate_instances {
-                let instance = GateInstance {
+                gates.entry(constraint).or_default().insert(GateInstance {
                     column_index,
                     selector_index,
-                };
-                match gates.get_mut(&constraint) {
-                    Some(instances) => {
-                        instances.insert(instance);
-                    }
-                    None => {
-                        gates.insert(constraint, BTreeSet::from([instance]));
-                    }
-                }
+                });
             }
         }
 
