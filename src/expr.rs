@@ -1178,5 +1178,161 @@ mod tests {
         assert_eq!(constraint.to_string(), "-1 * w(1)");
     }
 
+    #[test]
+    fn test_negate_variable() {
+        let constraint = -var(0);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), -from_const(12));
+        assert_eq!(evaluate(&constraint, [from_const(34)]), -from_const(34));
+        assert_eq!(constraint.to_string(), "-1 * w(0)");
+    }
+
+    #[test]
+    fn test_negate_sum() {
+        let constraint = -(var(0) + var(1) + from_const(12));
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(56)]),
+            -from_const(102)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(56), from_const(78)]),
+            -from_const(146)
+        );
+        assert_eq!(constraint.to_string(), "-12 + -1 * w(0) + -1 * w(1)");
+    }
+
+    #[test]
+    fn test_diff_1() {
+        let constraint = var(0) - var(1);
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            -from_const(22)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(12)]),
+            from_const(22)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(56), from_const(78)]),
+            -from_const(22)
+        );
+        assert_eq!(constraint.to_string(), "w(0) + -1 * w(1)");
+    }
+
+    #[test]
+    fn test_diff_2() {
+        let constraint = var(1) - var(0);
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            from_const(22)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(12)]),
+            -from_const(22)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(56), from_const(78)]),
+            from_const(22)
+        );
+        assert_eq!(constraint.to_string(), "-1 * w(0) + w(1)");
+    }
+
+    #[test]
+    fn test_diff_3() {
+        let constraint = rvar(2, -1) - rvar(2, 1);
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            -from_const(22)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(12)]),
+            from_const(22)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(56), from_const(78)]),
+            -from_const(22)
+        );
+        assert_eq!(constraint.to_string(), "w(2,-1) + -1 * w(2,+1)");
+    }
+
+    #[test]
+    fn test_another_diff() {
+        let constraint = var(0) - var(1) - var(2);
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(12), from_const(34), from_const(56)]
+            ),
+            -from_const(78)
+        );
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(12), from_const(56), from_const(34)]
+            ),
+            -from_const(78)
+        );
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(34), from_const(56), from_const(78)]
+            ),
+            -from_const(100)
+        );
+        assert_eq!(constraint.to_string(), "w(0) + -1 * w(1) + -1 * w(2)");
+    }
+
+    #[test]
+    fn test_sub_scalar_1() {
+        let constraint = var(0) - from_const(12);
+        assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(22));
+        assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(44));
+        assert_eq!(constraint.to_string(), "-12 + w(0)");
+    }
+
+    #[test]
+    fn test_sub_scalar_2() {
+        let constraint = var(0) - from_const(34);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), -from_const(22));
+        assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(22));
+        assert_eq!(constraint.to_string(), "-34 + w(0)");
+    }
+
+    #[test]
+    fn test_sub_another_scalar() {
+        let constraint = var(0) - from_const(34) - from_const(56);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), -from_const(78));
+        assert_eq!(evaluate(&constraint, [from_const(78)]), -from_const(12));
+        assert_eq!(constraint.to_string(), "-90 + w(0)");
+    }
+
+    #[test]
+    fn test_optimize_diff_1() {
+        let constraint = var(0) - var(0);
+        assert_eq!(evaluate(&constraint, []), from_const(0));
+        assert_eq!(constraint.to_string(), "0");
+    }
+
+    #[test]
+    fn test_optimize_diff_2() {
+        let constraint = var(0) - var(1) * -from_const(1);
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            from_const(46)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(12)]),
+            from_const(46)
+        );
+        assert_eq!(constraint.to_string(), "w(0) + w(1)");
+    }
+
+    #[test]
+    fn test_optimize_diff_3() {
+        let constraint = var(0) - var(1) - var(0);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), -from_const(12));
+        assert_eq!(evaluate(&constraint, [from_const(34)]), -from_const(34));
+        assert_eq!(constraint.to_string(), "-1 * w(1)");
+    }
+
     // TODO
 }
