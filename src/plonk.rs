@@ -3,6 +3,7 @@ use crate::utils::padded_circuit_size;
 use crate::witness::{Cell, Partitioner, Witness, cell};
 use anyhow::Result;
 use starkom_bluesky::Scalar;
+use starkom_ff::{Field, PrimeField};
 use starkom_pcs::{self as pcs, hash::Hash};
 use starkom_poly;
 use std::collections::{BTreeMap, BTreeSet};
@@ -70,7 +71,7 @@ pub trait CircuitView {
     }
 
     /// "Connects" two circuit [`Cell`]s, meaning they will be constrained to have the same value.
-    fn connect(&mut self, wire1: Option<Cell>, wire2: Option<Cell>);
+    fn connect(&mut self, cell1: Option<Cell>, cell2: Option<Cell>);
 
     /// Adds a gate with `N` inputs and `M` outputs.
     ///
@@ -88,12 +89,13 @@ pub trait CircuitView {
         inputs: [Option<Cell>; N],
     ) -> [Cell; M];
 
-    fn add_nop_gate<const N: usize, const M: usize>(
+    fn auto_gate_constraint<const N: usize>(
         &mut self,
+        constraint: Constraint,
         inputs: [Option<Cell>; N],
-    ) -> [Cell; M] {
-        self.auto_gate(Constraint::nop(), inputs)
-    }
+    ) -> [Cell; N];
+
+    fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N];
 
     /// Spawns a child `CircuitView` at the given coordinates.
     fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView;
@@ -144,7 +146,7 @@ impl CircuitBuilder {
     }
 
     /// Compiles the circuit built so far into a [`Circuit`] object.
-    pub fn build(mut self) -> Result<Circuit> {
+    pub fn build(self) -> Result<Circuit> {
         let (degree_bound, _) = padded_circuit_size(
             self.num_rows,
             self.gates.iter().flat_map(|(constraint, _)| {
@@ -156,8 +158,123 @@ impl CircuitBuilder {
             }),
         );
 
-        // TODO
-        todo!()
+        let (selectors, gates) = {
+            let mut gates_by_selector: BTreeMap<BTreeSet<usize>, Vec<(Constraint, usize)>> =
+                BTreeMap::default();
+            for (constraint, root_cells) in self.gates {
+                let activation_row_set: BTreeSet<usize> =
+                    root_cells.iter().map(Cell::row).collect();
+                match gates_by_selector.get_mut(&activation_row_set) {
+                    Some(gate_instances) => {
+                        for cell in root_cells {
+                            gate_instances.push((constraint.clone(), cell.column()));
+                        }
+                    }
+                    None => {
+                        gates_by_selector.insert(
+                            activation_row_set,
+                            root_cells
+                                .iter()
+                                .map(|cell| (constraint.clone(), cell.column()))
+                                .collect(),
+                        );
+                    }
+                }
+            }
+
+            let gates_by_selector: Vec<(Polynomial, BTreeMap<Constraint, BTreeSet<GateInstance>>)> =
+                gates_by_selector
+                    .into_iter()
+                    .enumerate()
+                    .map(|(selector_index, (activation_row_set, gate_instances))| {
+                        let selector = {
+                            let mut selector_values = vec![Scalar::ZERO; degree_bound];
+                            for row in activation_row_set {
+                                selector_values[row] = Scalar::ONE;
+                            }
+                            Polynomial::encode2(selector_values)
+                        };
+                        let mut gates_by_constraint: BTreeMap<Constraint, BTreeSet<GateInstance>> =
+                            BTreeMap::default();
+                        for (constraint, column_index) in gate_instances {
+                            let gate_instance = GateInstance {
+                                column_index,
+                                selector_index,
+                            };
+                            match gates_by_constraint.get_mut(&constraint) {
+                                Some(gate_instances) => {
+                                    gate_instances.insert(gate_instance);
+                                }
+                                None => {
+                                    gates_by_constraint
+                                        .insert(constraint, BTreeSet::from([gate_instance]));
+                                }
+                            }
+                        }
+                        (selector, gates_by_constraint)
+                    })
+                    .collect();
+
+            let (selectors, gates): (
+                Vec<Polynomial>,
+                Vec<BTreeMap<Constraint, BTreeSet<GateInstance>>>,
+            ) = gates_by_selector.into_iter().unzip();
+
+            (
+                selectors,
+                gates
+                    .into_iter()
+                    .fold(BTreeMap::default(), |mut accumulator, mut item| {
+                        accumulator.append(&mut item);
+                        accumulator
+                    }),
+            )
+        };
+
+        let sigma_values: Vec<Vec<Scalar>> = {
+            let mut sigma = vec![Scalar::ZERO; degree_bound * self.num_columns];
+            let omega = Polynomial::domain_element2(1, degree_bound);
+            let mut k = Scalar::ONE;
+            for i in 0..self.num_columns {
+                let offset = i * degree_bound;
+                sigma[offset] = k;
+                for j in 1..degree_bound {
+                    sigma[offset + j] = sigma[offset + j - 1] * omega;
+                }
+                k *= Scalar::MULTIPLICATIVE_GENERATOR;
+            }
+            for node in self.partitioner.iter_nodes() {
+                let indices: Vec<usize> = node
+                    .iter()
+                    .map(|cell| cell.column() * degree_bound + cell.row())
+                    .collect();
+                let mut permuted: Vec<Scalar> = indices.iter().map(|&i| sigma[i]).collect();
+                permuted.rotate_left(1);
+                for i in 0..indices.len() {
+                    sigma[indices[i]] = permuted[i];
+                }
+            }
+            sigma
+                .chunks_exact(degree_bound)
+                .map(|chunk| chunk.to_vec())
+                .collect()
+        };
+
+        let sigma = sigma_values
+            .iter()
+            .map(|chunk| Polynomial::encode2(chunk.to_vec()))
+            .collect();
+
+        Ok(Circuit {
+            num_rows: self.num_rows,
+            degree_bound,
+            num_columns: self.num_columns,
+            selectors,
+            gates,
+            sigma,
+            sigma_values,
+            public_rows: self.public_rows,
+        })
     }
 }
 
@@ -169,6 +286,8 @@ impl CircuitView for CircuitBuilder {
     fn add_gate_internal(&mut self, row: usize, column: usize, constraint: Constraint) {
         let root_cell = cell(row, column);
         {
+            self.num_rows = std::cmp::max(self.num_rows, row + 1);
+            self.num_columns = std::cmp::max(self.num_columns, column + 1);
             for variable in constraint.get_free_variables() {
                 let rotation = variable.rotation();
                 self.num_rows = std::cmp::max(
@@ -222,6 +341,45 @@ impl CircuitView for CircuitBuilder {
         self.add_gate_internal(root_cell.row(), root_cell.column(), constraint);
 
         std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
+    }
+
+    fn auto_gate_constraint<const N: usize>(
+        &mut self,
+        constraint: Constraint,
+        inputs: [Option<Cell>; N],
+    ) -> [Cell; N] {
+        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
+        assert_eq!(variables.len(), N);
+
+        let root_cell = cell(self.row_counter, 0);
+        self.row_counter += 1;
+
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.connect(Some(input), Some(variables[i].map_to_cell(root_cell)));
+            }
+        }
+
+        self.add_gate_internal(root_cell.row(), root_cell.column(), constraint);
+
+        std::array::from_fn(|i| variables[i].map_to_cell(root_cell))
+    }
+
+    fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N] {
+        let row = self.row_counter;
+        self.row_counter += 1;
+
+        let outputs = std::array::from_fn(|i| cell(row, i));
+
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.connect(Some(input), Some(outputs[i]));
+            }
+        }
+
+        self.add_gate_internal(row, 0, Constraint::nop());
+
+        outputs
     }
 
     fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView {
@@ -307,6 +465,45 @@ impl<'a> CircuitView for CircuitSectionBuilder<'a> {
         self.add_gate_internal(root_cell.row(), root_cell.column(), constraint);
 
         std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
+    }
+
+    fn auto_gate_constraint<const N: usize>(
+        &mut self,
+        constraint: Constraint,
+        inputs: [Option<Cell>; N],
+    ) -> [Cell; N] {
+        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
+        assert_eq!(variables.len(), N);
+
+        let root_cell = cell(self.row_counter, 0);
+        self.row_counter += 1;
+
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.connect(Some(input), Some(variables[i].map_to_cell(root_cell)));
+            }
+        }
+
+        self.add_gate_internal(root_cell.row(), root_cell.column(), constraint);
+
+        std::array::from_fn(|i| variables[i].map_to_cell(root_cell))
+    }
+
+    fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N] {
+        let row = self.row_counter;
+        self.row_counter += 1;
+
+        let outputs = std::array::from_fn(|i| cell(row, self.column_offset + i));
+
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.connect(Some(input), Some(outputs[i]));
+            }
+        }
+
+        self.add_gate_internal(row, 0, Constraint::nop());
+
+        outputs
     }
 
     fn connect(&mut self, cell1: Option<Cell>, cell2: Option<Cell>) {
@@ -446,7 +643,7 @@ impl Circuit {
         )
     }
 
-    /// Proves correctness for the given witness, or returns an error in case of a constraint
+    /// Proves correctness of the given witness, or returns an error in case of a constraint
     /// violation.
     pub fn prove<H: Hash<Scalar>>(
         &self,
@@ -463,6 +660,61 @@ impl Circuit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::var;
+    use starkom_pcs::hash::{Poseidon2Hash, Sha2Hash};
+
+    // This function tests the circuit from Vitalik's PLONK tutorial,
+    // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
+    fn test_vitalik_circuit_impl<H: Hash<Scalar>>(blowup_log2: usize) -> Result<()> {
+        let mut builder = CircuitBuilder::default();
+        let [x, square] = builder.auto_gate((var(0) ^ 2) - var(1), []);
+        let [result] = builder.auto_gate(
+            var(0) * var(1) + var(0) + 5 - var(2),
+            [x.into(), square.into()],
+        );
+        let [result] = builder.add_nop_gate([result.into()]);
+        builder.declare_public_rows([result.row()]);
+        let circuit = builder.build()?;
+        assert_eq!(circuit.num_rows(), 3);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 3);
+        let mut witness = circuit.make_witness();
+        assert_eq!(witness.num_rows(), 3);
+        assert_eq!(witness.degree_bound(), 8);
+        assert_eq!(witness.num_columns(), 3);
+        // TODO
+        Ok(())
+    }
+
+    #[test]
+    fn test_vitalik_circuit_sha2_blowup_2() {
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_poseidon2_blowup_2() {
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(1).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_sha2_blowup_4() {
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(2).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_poseidon2_blowup_4() {
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(2).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_sha2_blowup_8() {
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(3).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_poseidon2_blowup_8() {
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(3).is_ok());
+    }
 
     // TODO
 }

@@ -6,15 +6,27 @@ use starkom_poly;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display};
-use std::ops::Index;
+use std::ops::{
+    Add, AddAssign, BitXor, BitXorAssign, Div, DivAssign, Index, Mul, MulAssign, Neg, Sub,
+    SubAssign,
+};
+use std::str::FromStr;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
 
+/// Short-hand for [`Constraint::make_var`].
 #[inline]
-pub fn var(column_index: usize, rotation: isize) -> Constraint {
+pub fn var(column_index: usize) -> Constraint {
+    Constraint::make_var(column_index, 0)
+}
+
+/// Short-hand for [`Constraint::make_var`] with a rotation.
+#[inline]
+pub fn rvar(column_index: usize, rotation: isize) -> Constraint {
     Constraint::make_var(column_index, rotation)
 }
 
+/// Short-hand for [`Constraint::make_const`].
 #[inline]
 pub fn make_const(value: isize) -> Constraint {
     Constraint::make_const(isize_to_scalar(value))
@@ -93,14 +105,14 @@ impl Display for Variable {
         if self.rotation < 0 {
             write!(
                 f,
-                "w({}, -{})",
+                "w({},-{})",
                 self.column_index,
                 self.rotation.unsigned_abs()
             )
         } else if self.rotation > 0 {
             write!(
                 f,
-                "w({}, +{})",
+                "w({},+{})",
                 self.column_index,
                 self.rotation.unsigned_abs()
             )
@@ -280,10 +292,10 @@ impl Constraint {
                     .chain(
                         variables
                             .iter()
-                            .map(|(&column_index, &exponent)| match exponent {
-                                1 => format!("w{}", column_index),
+                            .map(|(variable, &exponent)| match exponent {
+                                1 => variable.to_string(),
                                 exponent => {
-                                    format!("w{} ^ {}", column_index, exponent)
+                                    format!("{} ^ {}", variable.to_string(), exponent)
                                 }
                             }),
                     )
@@ -536,9 +548,607 @@ impl Display for Constraint {
     }
 }
 
+impl FromStr for Constraint {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // TODO
+        todo!()
+    }
+}
+
+impl AddAssign for Constraint {
+    fn add_assign(&mut self, rhs: Self) {
+        for (variables, coefficient) in rhs.monomials {
+            match self.monomials.get_mut(&variables) {
+                Some(preexisting_coefficient) => {
+                    *preexisting_coefficient += coefficient;
+                }
+                None => {
+                    self.monomials.insert(variables, coefficient);
+                }
+            }
+        }
+        self.normalize();
+    }
+}
+
+impl AddAssign<Scalar> for Constraint {
+    fn add_assign(&mut self, rhs: Scalar) {
+        let variables = BTreeMap::default();
+        match self.monomials.get_mut(&variables) {
+            Some(coefficient) => {
+                *coefficient += rhs;
+            }
+            None => {
+                self.monomials.insert(variables, rhs);
+            }
+        }
+        self.normalize();
+    }
+}
+
+impl AddAssign<isize> for Constraint {
+    fn add_assign(&mut self, rhs: isize) {
+        *self += isize_to_scalar(rhs);
+    }
+}
+
+impl Add for Constraint {
+    type Output = Constraint;
+
+    fn add(mut self, rhs: Self) -> Self::Output {
+        self += rhs;
+        self
+    }
+}
+
+impl Add<Scalar> for Constraint {
+    type Output = Constraint;
+
+    fn add(mut self, rhs: Scalar) -> Self::Output {
+        self += rhs;
+        self
+    }
+}
+
+impl Add<isize> for Constraint {
+    type Output = Constraint;
+
+    fn add(self, rhs: isize) -> Self::Output {
+        self.add(isize_to_scalar(rhs))
+    }
+}
+
+impl Neg for Constraint {
+    type Output = Constraint;
+
+    fn neg(mut self) -> Self::Output {
+        for (_, coefficient) in &mut self.monomials {
+            *coefficient = coefficient.neg();
+        }
+        self
+    }
+}
+
+impl SubAssign for Constraint {
+    fn sub_assign(&mut self, rhs: Self) {
+        for (variables, coefficient) in rhs.monomials {
+            match self.monomials.get_mut(&variables) {
+                Some(preexisting_coefficient) => {
+                    *preexisting_coefficient -= coefficient;
+                }
+                None => {
+                    self.monomials.insert(variables, -coefficient);
+                }
+            }
+        }
+        self.normalize();
+    }
+}
+
+impl SubAssign<Scalar> for Constraint {
+    fn sub_assign(&mut self, rhs: Scalar) {
+        let variables = BTreeMap::default();
+        match self.monomials.get_mut(&variables) {
+            Some(coefficient) => {
+                *coefficient -= rhs;
+            }
+            None => {
+                self.monomials.insert(variables, -rhs);
+            }
+        }
+        self.normalize();
+    }
+}
+
+impl SubAssign<isize> for Constraint {
+    fn sub_assign(&mut self, rhs: isize) {
+        *self -= isize_to_scalar(rhs);
+    }
+}
+
+impl Sub for Constraint {
+    type Output = Constraint;
+
+    fn sub(mut self, rhs: Self) -> Self::Output {
+        self -= rhs;
+        self
+    }
+}
+
+impl Sub<Scalar> for Constraint {
+    type Output = Constraint;
+
+    fn sub(mut self, rhs: Scalar) -> Self::Output {
+        self -= rhs;
+        self
+    }
+}
+
+impl Sub<isize> for Constraint {
+    type Output = Constraint;
+
+    fn sub(mut self, rhs: isize) -> Self::Output {
+        self -= rhs;
+        self
+    }
+}
+
+impl MulAssign for Constraint {
+    fn mul_assign(&mut self, rhs: Self) {
+        let mut monomials = BTreeMap::default();
+        for (lhs_variables, lhs_coefficient) in std::mem::take(&mut self.monomials) {
+            if lhs_coefficient != Scalar::ZERO {
+                for (rhs_variables, &rhs_coefficient) in &rhs.monomials {
+                    if rhs_coefficient != Scalar::ZERO {
+                        let variables = Self::multiply_variables(
+                            lhs_variables.clone(),
+                            rhs_variables
+                                .iter()
+                                .map(|(&column_index, &exponent)| (column_index, exponent)),
+                        );
+                        let coefficient = lhs_coefficient * rhs_coefficient;
+                        match monomials.get_mut(&variables) {
+                            Some(preexisting_coefficient) => {
+                                *preexisting_coefficient += coefficient
+                            }
+                            None => {
+                                monomials.insert(variables, coefficient);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.monomials = monomials;
+        self.normalize();
+    }
+}
+
+impl MulAssign<Scalar> for Constraint {
+    fn mul_assign(&mut self, rhs: Scalar) {
+        if rhs != Scalar::ZERO {
+            for (_, coefficient) in &mut self.monomials {
+                *coefficient *= rhs;
+            }
+        } else {
+            self.monomials = BTreeMap::default();
+        }
+    }
+}
+
+impl MulAssign<isize> for Constraint {
+    fn mul_assign(&mut self, rhs: isize) {
+        *self *= isize_to_scalar(rhs);
+    }
+}
+
+impl Mul for Constraint {
+    type Output = Constraint;
+
+    fn mul(mut self, rhs: Self) -> Self::Output {
+        self *= rhs;
+        self
+    }
+}
+
+impl Mul<Scalar> for Constraint {
+    type Output = Constraint;
+
+    fn mul(mut self, rhs: Scalar) -> Self::Output {
+        self *= rhs;
+        self
+    }
+}
+
+impl Mul<isize> for Constraint {
+    type Output = Constraint;
+
+    fn mul(mut self, rhs: isize) -> Self::Output {
+        self *= rhs;
+        self
+    }
+}
+
+impl BitXorAssign<isize> for Constraint {
+    /// We use the XOR operator to actually implement exponentiation. For example, if `x` is a
+    /// `Constraint` instance (representing a single variable) then `x ^ 5` means x raised to 5.
+    ///
+    /// Negative exponents are supported and they actually perform modular inversion.
+    ///
+    /// WARNING: in Rust the circumflex operator `^` has lower precedence than the arithmetic
+    /// operators `+`, `-`, `*`, and `/`, so for example `x + y ^ 2` actually means `(x + y) ^ 2`.
+    /// That's counterintuitive but unfortunately Rust doesn't provide a proper power operation, and
+    /// exponentiation is often necessary when defining PLONK constraints. Make sure to always
+    /// parenthesize accordingly, eg. `x + (y ^ 2)`.
+    fn bitxor_assign(&mut self, rhs: isize) {
+        match rhs {
+            0 => {
+                self.monomials = BTreeMap::from([(BTreeMap::default(), Scalar::ONE)]);
+            }
+            1 => {}
+            _ => match self.monomials.len() {
+                0 => {
+                    assert!(rhs >= 0, "cannot raise 0 to a negative power");
+                }
+                1 => {
+                    self.monomials = std::mem::take(&mut self.monomials)
+                        .into_iter()
+                        .map(|(variables, coefficient)| {
+                            (
+                                variables
+                                    .into_iter()
+                                    .map(|(column_index, exponent)| (column_index, exponent * rhs))
+                                    .collect(),
+                                if rhs < 0 {
+                                    coefficient.invert_unwrap()
+                                } else {
+                                    coefficient
+                                }
+                                .pow_small_vartime(rhs.unsigned_abs()),
+                            )
+                        })
+                        .collect();
+                }
+                _ => {
+                    panic!("raising a sum to a power is forbidden, try to simplify your constraint")
+                }
+            },
+        }
+    }
+}
+
+impl BitXor<isize> for Constraint {
+    type Output = Constraint;
+
+    fn bitxor(mut self, rhs: isize) -> Self::Output {
+        self ^= rhs;
+        self
+    }
+}
+
+impl DivAssign for Constraint {
+    /// Multiplies the LHS by the inverse of the RHS, which must have exactly one monomial.
+    fn div_assign(&mut self, rhs: Self) {
+        match rhs.monomials.len() {
+            0 => panic!("division by zero"),
+            1 => *self *= rhs.bitxor(-1),
+            _ => panic!("dividing by a polynomial is forbidden, try to simplify your constraint"),
+        }
+    }
+}
+
+impl DivAssign<Scalar> for Constraint {
+    fn div_assign(&mut self, rhs: Scalar) {
+        *self *= rhs.invert_vartime().unwrap();
+    }
+}
+
+impl DivAssign<isize> for Constraint {
+    fn div_assign(&mut self, rhs: isize) {
+        *self *= isize_to_scalar(rhs).invert_vartime().unwrap();
+    }
+}
+
+impl Div for Constraint {
+    type Output = Constraint;
+
+    fn div(mut self, rhs: Self) -> Self::Output {
+        self /= rhs;
+        self
+    }
+}
+
+impl Div<Scalar> for Constraint {
+    type Output = Constraint;
+
+    fn div(mut self, rhs: Scalar) -> Self::Output {
+        self /= rhs;
+        self
+    }
+}
+
+impl Div<isize> for Constraint {
+    type Output = Constraint;
+
+    fn div(mut self, rhs: isize) -> Self::Output {
+        self /= rhs;
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::witness::cell;
+    use starkom_bluesky::from_const;
+
+    #[test]
+    fn test_raw_variable_1() {
+        let variable = Variable::new(12, 34);
+        assert_eq!(variable.column_index(), 12);
+        assert_eq!(variable.rotation(), 34);
+        assert_eq!(variable.map_to_cell(cell(42, 43)), cell(76, 55));
+    }
+
+    #[test]
+    fn test_raw_variable_2() {
+        let variable = Variable::new(56, -44);
+        assert_eq!(variable.column_index(), 56);
+        assert_eq!(variable.rotation(), -44);
+        assert_eq!(variable.map_to_cell(cell(78, 45)), cell(34, 101));
+    }
+
+    #[test]
+    fn test_compare_variables() {
+        let v1 = Variable::new(34, 56);
+        let v2 = Variable::new(34, 12);
+        let v3 = Variable::new(34, 78);
+        let v4 = Variable::new(56, 78);
+        assert!(v1 == v1);
+        assert!(v1 > v2);
+        assert!(v1 < v3);
+        assert!(v1 < v4);
+        assert!(v2 == v2);
+        assert!(v2 < v3);
+        assert!(v2 < v4);
+        assert!(v3 == v3);
+        assert!(v3 < v4);
+        assert!(v4 == v4);
+    }
+
+    #[test]
+    fn test_remap_raw_variable() {
+        let variable = Variable::new(12, 34);
+        assert_eq!(variable.remap(56), Variable::new(68, 34));
+    }
+
+    fn evaluate<const N: usize>(constraint: &Constraint, substitution: [Scalar; N]) -> Scalar {
+        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
+        assert_eq!(variables.len(), N);
+        let substitution: BTreeMap<Variable, Scalar> = variables
+            .into_iter()
+            .zip(substitution.into_iter())
+            .collect();
+        constraint.evaluate(&substitution)
+    }
+
+    #[test]
+    fn test_empty() {
+        let constraint = Constraint::nop();
+        assert_eq!(constraint, Constraint::default());
+        assert_eq!(evaluate(&constraint, []), from_const(0));
+        assert_eq!(constraint.to_string(), "0");
+    }
+
+    fn test_constant_impl(value: Scalar) {
+        let constraint = Constraint {
+            monomials: BTreeMap::from([(BTreeMap::default(), value)]),
+        };
+        assert_eq!(constraint.get_free_variables(), BTreeSet::default());
+        assert!(constraint.is_constant());
+        assert_eq!(constraint.get_value_if_constant(), Some(value));
+        assert_eq!(evaluate(&constraint, []), value);
+        assert_eq!(constraint.to_string(), value.to_str_radix(10, 0, false));
+    }
+
+    #[test]
+    fn test_constant() {
+        test_constant_impl(from_const(0));
+        test_constant_impl(from_const(12));
+        test_constant_impl(from_const(34));
+    }
+
+    #[test]
+    fn test_variable_0() {
+        let constraint = var(0);
+        assert_eq!(
+            constraint.get_free_variables(),
+            BTreeSet::from([Variable::new(0, 0)])
+        );
+        assert!(!constraint.is_constant());
+        assert!(constraint.get_value_if_constant().is_none());
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
+        assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
+        assert_eq!(constraint.to_string(), "w(0)");
+    }
+
+    #[test]
+    fn test_variable_1() {
+        let constraint = var(1);
+        assert_eq!(
+            constraint.get_free_variables(),
+            BTreeSet::from([Variable::new(1, 0)])
+        );
+        assert!(!constraint.is_constant());
+        assert!(constraint.get_value_if_constant().is_none());
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
+        assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
+        assert_eq!(constraint.to_string(), "w(1)");
+    }
+
+    #[test]
+    fn test_rotated_variable_1() {
+        let constraint = rvar(2, 1);
+        assert_eq!(
+            constraint.get_free_variables(),
+            BTreeSet::from([Variable::new(2, 1)])
+        );
+        assert!(!constraint.is_constant());
+        assert!(constraint.get_value_if_constant().is_none());
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
+        assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
+        assert_eq!(constraint.to_string(), "w(2,+1)");
+    }
+
+    #[test]
+    fn test_rotated_variable_2() {
+        let constraint = rvar(2, -1);
+        assert_eq!(
+            constraint.get_free_variables(),
+            BTreeSet::from([Variable::new(2, -1)])
+        );
+        assert!(!constraint.is_constant());
+        assert!(constraint.get_value_if_constant().is_none());
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
+        assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
+        assert_eq!(constraint.to_string(), "w(2,-1)");
+    }
+
+    #[test]
+    fn test_sum_1() {
+        let constraint = var(0) + var(1);
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            from_const(46)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(12)]),
+            from_const(46)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(56), from_const(78)]),
+            from_const(134)
+        );
+        assert_eq!(constraint.to_string(), "w(0) + w(1)");
+    }
+
+    #[test]
+    fn test_sum_2() {
+        let constraint = var(1) + var(0);
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            from_const(46)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(12)]),
+            from_const(46)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(56), from_const(78)]),
+            from_const(134)
+        );
+        assert_eq!(constraint.to_string(), "w(0) + w(1)");
+    }
+
+    #[test]
+    fn test_sum_3() {
+        let constraint = rvar(2, -1) + rvar(2, 1);
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            from_const(46)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(12)]),
+            from_const(46)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(56), from_const(78)]),
+            from_const(134)
+        );
+        assert_eq!(constraint.to_string(), "w(2,-1) + w(2,+1)");
+    }
+
+    #[test]
+    fn test_another_sum() {
+        let constraint = var(0) + var(1) + var(2);
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(12), from_const(34), from_const(56)]
+            ),
+            from_const(102)
+        );
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(12), from_const(56), from_const(34)]
+            ),
+            from_const(102)
+        );
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(34), from_const(56), from_const(78)]
+            ),
+            from_const(168)
+        );
+        assert_eq!(constraint.to_string(), "w(0) + w(1) + w(2)");
+    }
+
+    #[test]
+    fn test_add_scalar_1() {
+        let constraint = var(0) + from_const(12);
+        assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(46));
+        assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(68));
+        assert_eq!(constraint.to_string(), "12 + w(0)");
+    }
+
+    #[test]
+    fn test_add_scalar_2() {
+        let constraint = var(0) + from_const(34);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(46));
+        assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(90));
+        assert_eq!(constraint.to_string(), "34 + w(0)");
+    }
+
+    #[test]
+    fn test_add_another_scalar() {
+        let constraint = var(0) + from_const(34) + from_const(56);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(102));
+        assert_eq!(evaluate(&constraint, [from_const(78)]), from_const(168));
+        assert_eq!(constraint.to_string(), "90 + w(0)");
+    }
+
+    #[test]
+    fn test_optimize_sum_1() {
+        let constraint = var(0) + var(0) * -from_const(1);
+        assert_eq!(evaluate(&constraint, []), from_const(0));
+        assert_eq!(constraint.to_string(), "0");
+    }
+
+    #[test]
+    fn test_optimize_sum_2() {
+        let constraint = var(0) + var(1) * -from_const(1);
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            -from_const(22)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(12)]),
+            from_const(22)
+        );
+        assert_eq!(constraint.to_string(), "w(0) + -1 * w(1)");
+    }
+
+    #[test]
+    fn test_optimize_sum_3() {
+        let constraint = var(0) + var(1) * -from_const(1) + var(0) * -from_const(1);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), -from_const(12));
+        assert_eq!(evaluate(&constraint, [from_const(34)]), -from_const(34));
+        assert_eq!(constraint.to_string(), "-1 * w(1)");
+    }
 
     // TODO
 }
