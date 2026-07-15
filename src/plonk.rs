@@ -101,6 +101,20 @@ pub trait CircuitView {
     fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView;
 }
 
+/// Describes an instance of a gate.
+///
+/// NOTE: this struct doesn't specify the row of the root cell where the gate was placed because
+/// activating a gate at the correct rows is the gate selector's job. The column of the root cell,
+/// on the other hand, is specified by [`Self::column_index`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GateInstance {
+    /// Column of the root cell where the gate was placed.
+    column_index: usize,
+
+    /// Index of the gate selector polynomial within the [selector pool](`Circuit::selectors`).
+    selector_index: usize,
+}
+
 /// Allows building PLONK [`Circuit`]s.
 #[derive(Debug, Default, Clone)]
 pub struct CircuitBuilder {
@@ -145,6 +159,79 @@ impl CircuitBuilder {
         self.public_rows = BTreeSet::from_iter(gates);
     }
 
+    fn make_selector(degree_bound: usize, activation_row_set: BTreeSet<usize>) -> Polynomial {
+        let mut selector_values = vec![Scalar::ZERO; degree_bound];
+        for row in activation_row_set {
+            selector_values[row] = Scalar::ONE;
+        }
+        Polynomial::encode2(selector_values)
+    }
+
+    fn build_gates_and_selectors(
+        &self,
+        degree_bound: usize,
+    ) -> (
+        BTreeMap<Constraint, BTreeSet<GateInstance>>,
+        Vec<Polynomial>,
+    ) {
+        // Keys are (constraint, column_index) pairs; values are activation row sets.
+        let mut row_set_map: BTreeMap<(Constraint, usize), BTreeSet<usize>> = BTreeMap::default();
+        for (constraint, root_cells) in &self.gates {
+            for root_cell in root_cells.as_slice() {
+                let key = (constraint.clone(), root_cell.column());
+                let row = root_cell.row();
+                match row_set_map.get_mut(&key) {
+                    Some(rows) => {
+                        rows.insert(row);
+                    }
+                    None => {
+                        row_set_map.insert(key, BTreeSet::from([row]));
+                    }
+                }
+            }
+        }
+
+        // Roughly the inverse of `row_set_map`: keys are activation row sets, values are the list
+        // of (constraint, column_index) instances that activate at those rows.
+        let mut gates_by_row_set: BTreeMap<BTreeSet<usize>, Vec<(Constraint, usize)>> =
+            BTreeMap::default();
+        for ((constraint, column_index), row_set) in row_set_map {
+            match gates_by_row_set.get_mut(&row_set) {
+                Some(gates) => {
+                    gates.push((constraint, column_index));
+                }
+                None => {
+                    gates_by_row_set.insert(row_set, vec![(constraint, column_index)]);
+                }
+            }
+        }
+
+        let mut gates: BTreeMap<Constraint, BTreeSet<GateInstance>> = BTreeMap::default();
+        let mut selectors: Vec<Polynomial> = vec![];
+
+        for (selector_index, (activation_row_set, gate_instances)) in
+            gates_by_row_set.into_iter().enumerate()
+        {
+            selectors.push(Self::make_selector(degree_bound, activation_row_set));
+            for (constraint, column_index) in gate_instances {
+                let instance = GateInstance {
+                    column_index,
+                    selector_index,
+                };
+                match gates.get_mut(&constraint) {
+                    Some(instances) => {
+                        instances.insert(instance);
+                    }
+                    None => {
+                        gates.insert(constraint, BTreeSet::from([instance]));
+                    }
+                }
+            }
+        }
+
+        (gates, selectors)
+    }
+
     /// Compiles the circuit built so far into a [`Circuit`] object.
     pub fn build(self) -> Result<Circuit> {
         let (degree_bound, _) = padded_circuit_size(
@@ -158,78 +245,7 @@ impl CircuitBuilder {
             }),
         );
 
-        let (selectors, gates) = {
-            let mut gates_by_selector: BTreeMap<BTreeSet<usize>, Vec<(Constraint, usize)>> =
-                BTreeMap::default();
-            for (constraint, root_cells) in self.gates {
-                let activation_row_set: BTreeSet<usize> =
-                    root_cells.iter().map(Cell::row).collect();
-                match gates_by_selector.get_mut(&activation_row_set) {
-                    Some(gate_instances) => {
-                        for cell in root_cells {
-                            gate_instances.push((constraint.clone(), cell.column()));
-                        }
-                    }
-                    None => {
-                        gates_by_selector.insert(
-                            activation_row_set,
-                            root_cells
-                                .iter()
-                                .map(|cell| (constraint.clone(), cell.column()))
-                                .collect(),
-                        );
-                    }
-                }
-            }
-
-            let gates_by_selector: Vec<(Polynomial, BTreeMap<Constraint, BTreeSet<GateInstance>>)> =
-                gates_by_selector
-                    .into_iter()
-                    .enumerate()
-                    .map(|(selector_index, (activation_row_set, gate_instances))| {
-                        let selector = {
-                            let mut selector_values = vec![Scalar::ZERO; degree_bound];
-                            for row in activation_row_set {
-                                selector_values[row] = Scalar::ONE;
-                            }
-                            Polynomial::encode2(selector_values)
-                        };
-                        let mut gates_by_constraint: BTreeMap<Constraint, BTreeSet<GateInstance>> =
-                            BTreeMap::default();
-                        for (constraint, column_index) in gate_instances {
-                            let gate_instance = GateInstance {
-                                column_index,
-                                selector_index,
-                            };
-                            match gates_by_constraint.get_mut(&constraint) {
-                                Some(gate_instances) => {
-                                    gate_instances.insert(gate_instance);
-                                }
-                                None => {
-                                    gates_by_constraint
-                                        .insert(constraint, BTreeSet::from([gate_instance]));
-                                }
-                            }
-                        }
-                        (selector, gates_by_constraint)
-                    })
-                    .collect();
-
-            let (selectors, gates): (
-                Vec<Polynomial>,
-                Vec<BTreeMap<Constraint, BTreeSet<GateInstance>>>,
-            ) = gates_by_selector.into_iter().unzip();
-
-            (
-                selectors,
-                gates
-                    .into_iter()
-                    .fold(BTreeMap::default(), |mut accumulator, mut item| {
-                        accumulator.append(&mut item);
-                        accumulator
-                    }),
-            )
-        };
+        let (gates, selectors) = Self::build_gates_and_selectors(&self, degree_bound);
 
         let sigma_values: Vec<Vec<Scalar>> = {
             let mut sigma = vec![Scalar::ZERO; degree_bound * self.num_columns];
@@ -560,20 +576,6 @@ impl<H: Hash<Scalar>> Proof<H> {
     pub fn num_polys(&self) -> usize {
         self.inner_proof.num_polys()
     }
-}
-
-/// Describes an instance of a gate.
-///
-/// NOTE: this struct doesn't specify the row of the root cell where the gate was placed because
-/// activating a gate at the correct rows is the gate selector's job. The column of the root cell,
-/// on the other hand, is specified by [`Self::column_index`].
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct GateInstance {
-    /// Column of the root cell where the gate was placed.
-    column_index: usize,
-
-    /// Index of the gate selector polynomial within the [selector pool](`Circuit::selectors`).
-    selector_index: usize,
 }
 
 #[derive(Debug, Clone)]
