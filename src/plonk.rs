@@ -89,7 +89,7 @@ pub trait CircuitView {
         inputs: [Option<Cell>; N],
     ) -> [Cell; M];
 
-    fn auto_gate_constraint<const N: usize>(
+    fn auto_constraint<const N: usize>(
         &mut self,
         constraint: Constraint,
         inputs: [Option<Cell>; N],
@@ -340,7 +340,7 @@ impl CircuitView for CircuitBuilder {
         std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
     }
 
-    fn auto_gate_constraint<const N: usize>(
+    fn auto_constraint<const N: usize>(
         &mut self,
         constraint: Constraint,
         inputs: [Option<Cell>; N],
@@ -464,7 +464,7 @@ impl<'a> CircuitView for CircuitSectionBuilder<'a> {
         std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
     }
 
-    fn auto_gate_constraint<const N: usize>(
+    fn auto_constraint<const N: usize>(
         &mut self,
         constraint: Constraint,
         inputs: [Option<Cell>; N],
@@ -644,6 +644,7 @@ impl Circuit {
 mod tests {
     use super::*;
     use crate::expr::var;
+    use crate::witness::WitnessView;
     use starkom_pcs::hash::{Poseidon2Hash, Sha2Hash};
 
     // This function tests the circuit from Vitalik's PLONK tutorial,
@@ -665,6 +666,8 @@ mod tests {
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 3);
+        let square = witness.auto_set_one(var(1), var(0) ^ 2, [x]);
+        let result = witness.auto_set_one(var(2), var(0) * var(1) + var(0) + 5, [x, square]);
         // TODO
         Ok(())
     }

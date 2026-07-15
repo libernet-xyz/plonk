@@ -85,17 +85,17 @@ impl Variable {
     }
 
     /// Used by [`Constraint::compose`] when replacing variables with column polynomials.
-    fn rotate_column(&self, omega: Scalar, column: &Polynomial) -> Polynomial {
+    fn rotate_column(&self, omega: Scalar, column: Polynomial) -> Polynomial {
         match self.rotation.cmp(&0) {
-            Ordering::Less => {
-                // TODO: shift column backward
-                todo!()
-            }
+            Ordering::Less => column.shift_domain_by(
+                omega
+                    .invert_unwrap()
+                    .pow_small(self.rotation.unsigned_abs()),
+            ),
             Ordering::Greater => {
-                // TODO: shift column forward
-                todo!()
+                column.shift_domain_by(omega.pow_small(self.rotation.unsigned_abs()))
             }
-            Ordering::Equal => column.clone(),
+            Ordering::Equal => column,
         }
     }
 }
@@ -359,6 +359,20 @@ impl Constraint {
         Some(value)
     }
 
+    pub fn get_variable(&self) -> Option<Variable> {
+        let mut maybe_variable = None;
+        for (variables, _) in &self.monomials {
+            for (variable, _) in variables {
+                if maybe_variable.is_some() {
+                    return None;
+                } else {
+                    maybe_variable = Some(*variable);
+                }
+            }
+        }
+        maybe_variable
+    }
+
     /// Returns the first variable with negative exponent, or `None` if there isn't one.
     ///
     /// Used by [`Self::canonicalize`] to find variables to multiply.
@@ -497,8 +511,10 @@ impl Constraint {
                         if !columns_by_variable.contains_key(&variable) {
                             columns_by_variable.insert(
                                 variable,
-                                variable
-                                    .rotate_column(omega, &substitution[variable.column_index()]),
+                                variable.rotate_column(
+                                    omega,
+                                    substitution[variable.column_index()].clone(),
+                                ),
                             );
                         }
                     }
@@ -545,6 +561,18 @@ impl Debug for Constraint {
 impl Display for Constraint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.format_expression())
+    }
+}
+
+impl From<Variable> for Constraint {
+    fn from(value: Variable) -> Self {
+        Constraint::make_var(value.column_index(), value.rotation())
+    }
+}
+
+impl From<Scalar> for Constraint {
+    fn from(value: Scalar) -> Self {
+        Constraint::make_const(value)
     }
 }
 
