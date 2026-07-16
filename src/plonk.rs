@@ -179,11 +179,10 @@ pub trait CircuitView: internal::CircuitViewState {
     }
 
     fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N] {
-        let row = self.current_row();
+        let root_cell = cell(self.current_row(), 0).remap(self.root_cell());
         self.advance();
 
-        let root_cell = self.root_cell();
-        let outputs = std::array::from_fn(|i| cell(row, i).remap(root_cell));
+        let outputs = std::array::from_fn(|i| cell(0, i).remap(root_cell));
 
         for i in 0..N {
             if let Some(input) = inputs[i] {
