@@ -55,47 +55,147 @@ impl Default for ProvingOptions {
     }
 }
 
-pub trait CircuitView {
+mod internal {
+    use super::*;
+
+    /// Provides access to the internal state of a circuit view.
+    ///
+    /// This is used to implement the provided methods of the [`CircuitView`] trait.
+    pub trait CircuitViewState {
+        /// Returns a reference to the [`CircuitBuilder`].
+        fn builder(&self) -> &CircuitBuilder;
+
+        /// Returns a mutable reference to the [`CircuitBuilder`].
+        fn builder_mut(&mut self) -> &mut CircuitBuilder;
+
+        /// Returns the row offset of the view (0 for the [`CircuitBuilder`] itself).
+        ///
+        /// This is always an absolute value even for transitive sub-views. It is not relative to
+        /// the parent view.
+        fn row_offset(&self) -> usize;
+
+        /// Returns the column offset of the view (0 for the [`CircuitBuilder`] itself).
+        ///
+        /// This is always an absolute value even for transitive sub-views. It is not relative to
+        /// the parent view.
+        fn column_offset(&self) -> usize;
+
+        /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
+        fn root_cell(&self) -> Cell {
+            cell(self.row_offset(), self.column_offset())
+        }
+
+        /// Returns the current row where [auto gates](`CircuitView::auto_gate`) are added.
+        ///
+        /// This is relative to [`Self::row_offset`] and starts at 0 for all views and sub-views.
+        fn current_row(&self) -> usize;
+
+        fn advance(&mut self);
+    }
+}
+
+pub trait CircuitView: internal::CircuitViewState {
     /// Returns the number of columns included in the view.
     ///
     /// If this is the root view, that is the raw [`CircuitBuilder`] instance, the width is
     /// unbounded and `None` is returned.
     fn width(&self) -> Option<usize>;
 
-    /// INTERNAL ONLY. Not for public usage.
-    fn add_gate_internal(&mut self, row: usize, column: usize, constraint: Constraint);
-
     /// Adds a gate to the circuit.
     fn add_gate(&mut self, row: usize, constraint: Constraint) {
-        self.add_gate_internal(row, 0, constraint);
+        let root_cell = cell(row, 0).remap(self.root_cell());
+        self.builder_mut().add_gate_internal(root_cell, constraint);
     }
 
     /// "Connects" two circuit [`Cell`]s, meaning they will be constrained to have the same value.
-    fn connect(&mut self, cell1: Option<Cell>, cell2: Option<Cell>);
+    fn connect(&mut self, cell1: Option<Cell>, cell2: Option<Cell>) {
+        let root_cell = self.root_cell();
+        self.builder_mut().connect_internal(
+            cell1.map(|cell| cell.remap(root_cell)),
+            cell2.map(|cell| cell.remap(root_cell)),
+        );
+    }
 
     /// Adds a gate with `N` inputs and `M` outputs.
     ///
     /// The provided `constraint` must use exactly `N+M` variables, or the function will panic. The
     /// provided input cells are wrapped in `Option`s because `None` means the corresponding input
-    /// must remain unconstrained.
+    /// is unconstrained.
     ///
     /// The first `N` variables used in the constraint (those with the lowest column numbers) will
     /// be automatically connected to the specified `inputs` unless they're unconstrained / None,
     /// while the last `M` variables (those with the highest column numbers) will be returned as
     /// outputs.
+    ///
+    /// NOTE: variables with the same column number but different rotations are considered different
+    /// variables for the purpose of counting against `N` and `M`. For example, the constraint
+    /// `var(0,+1) == var(0,-1) + var(0)` uses three variables, not two. Variables with the same
+    /// column number are ordered by rotation, so for example if you set `N=2` and `M=1` the above
+    /// constraint would associate the 2 inputs to `var(0,-1)` and `var(0)`, and the output to
+    /// `var(0,+1)`.
     fn auto_gate<const N: usize, const M: usize>(
         &mut self,
         constraint: Constraint,
         inputs: [Option<Cell>; N],
-    ) -> [Cell; M];
+    ) -> [Cell; M] {
+        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
+        assert_eq!(variables.len(), N + M);
+
+        let root_cell = cell(self.current_row(), 0).remap(self.root_cell());
+        self.advance();
+
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.builder_mut()
+                    .connect_internal(Some(input), Some(variables[i].map_to_cell(root_cell)));
+            }
+        }
+
+        self.builder_mut().add_gate_internal(root_cell, constraint);
+
+        std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
+    }
 
     fn auto_constraint<const N: usize>(
         &mut self,
         constraint: Constraint,
         inputs: [Option<Cell>; N],
-    ) -> [Cell; N];
+    ) -> [Cell; N] {
+        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
+        assert_eq!(variables.len(), N);
 
-    fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N];
+        let root_cell = cell(self.current_row(), 0).remap(self.root_cell());
+        self.advance();
+
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.connect(Some(input), Some(variables[i].map_to_cell(root_cell)));
+            }
+        }
+
+        self.builder_mut().add_gate_internal(root_cell, constraint);
+
+        std::array::from_fn(|i| variables[i].map_to_cell(root_cell))
+    }
+
+    fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N] {
+        let row = self.current_row();
+        self.advance();
+
+        let root_cell = self.root_cell();
+        let outputs = std::array::from_fn(|i| cell(row, i).remap(root_cell));
+
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.connect(Some(input), Some(outputs[i]));
+            }
+        }
+
+        self.builder_mut()
+            .add_gate_internal(root_cell, Constraint::nop());
+
+        outputs
+    }
 
     /// Spawns a child `CircuitView` at the given coordinates.
     fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView;
@@ -148,6 +248,38 @@ pub struct CircuitBuilder {
 }
 
 impl CircuitBuilder {
+    fn add_gate_internal(&mut self, root_cell: Cell, constraint: Constraint) {
+        let row = root_cell.row();
+        let column = root_cell.column();
+        {
+            self.num_rows = std::cmp::max(self.num_rows, row + 1);
+            self.num_columns = std::cmp::max(self.num_columns, column + 1);
+            for variable in constraint.get_free_variables() {
+                let rotation = variable.rotation();
+                self.num_rows = std::cmp::max(
+                    self.num_rows,
+                    if rotation < 0 {
+                        row - rotation.unsigned_abs()
+                    } else {
+                        row + rotation.unsigned_abs()
+                    } + 1,
+                );
+                self.num_columns =
+                    std::cmp::max(self.num_columns, column + variable.column_index() + 1);
+            }
+        }
+        self.gates.entry(constraint).or_default().push(root_cell);
+    }
+
+    fn connect_internal(&mut self, cell1: Option<Cell>, cell2: Option<Cell>) {
+        match (cell1, cell2) {
+            (Some(cell1), Some(cell2)) => {
+                self.partitioner.connect(cell1, cell2);
+            }
+            _ => {}
+        }
+    }
+
     /// Updates the list of witness rows that are revealed.
     ///
     /// This method drops any previously provided lists, so if it's called multiple times only the
@@ -275,108 +407,35 @@ impl CircuitBuilder {
     }
 }
 
+impl internal::CircuitViewState for CircuitBuilder {
+    fn builder(&self) -> &CircuitBuilder {
+        self
+    }
+
+    fn builder_mut(&mut self) -> &mut CircuitBuilder {
+        self
+    }
+
+    fn row_offset(&self) -> usize {
+        0
+    }
+
+    fn column_offset(&self) -> usize {
+        0
+    }
+
+    fn current_row(&self) -> usize {
+        self.row_counter
+    }
+
+    fn advance(&mut self) {
+        self.row_counter += 1;
+    }
+}
+
 impl CircuitView for CircuitBuilder {
     fn width(&self) -> Option<usize> {
         None
-    }
-
-    fn add_gate_internal(&mut self, row: usize, column: usize, constraint: Constraint) {
-        let root_cell = cell(row, column);
-        {
-            self.num_rows = std::cmp::max(self.num_rows, row + 1);
-            self.num_columns = std::cmp::max(self.num_columns, column + 1);
-            for variable in constraint.get_free_variables() {
-                let rotation = variable.rotation();
-                self.num_rows = std::cmp::max(
-                    self.num_rows,
-                    if rotation < 0 {
-                        row - rotation.unsigned_abs()
-                    } else {
-                        row + rotation.unsigned_abs()
-                    } + 1,
-                );
-                self.num_columns =
-                    std::cmp::max(self.num_columns, column + variable.column_index() + 1);
-            }
-        }
-        match self.gates.get_mut(&constraint) {
-            Some(root_cells) => {
-                root_cells.push(root_cell);
-            }
-            None => {
-                self.gates.insert(constraint, vec![root_cell]);
-            }
-        }
-    }
-
-    fn connect(&mut self, cell1: Option<Cell>, cell2: Option<Cell>) {
-        match (cell1, cell2) {
-            (Some(cell1), Some(cell2)) => {
-                self.partitioner.connect(cell1, cell2);
-            }
-            _ => {}
-        }
-    }
-
-    fn auto_gate<const N: usize, const M: usize>(
-        &mut self,
-        constraint: Constraint,
-        inputs: [Option<Cell>; N],
-    ) -> [Cell; M] {
-        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
-        assert_eq!(variables.len(), N + M);
-
-        let root_cell = cell(self.row_counter, 0);
-        self.row_counter += 1;
-
-        for i in 0..N {
-            if let Some(input) = inputs[i] {
-                self.connect(Some(input), Some(variables[i].map_to_cell(root_cell)));
-            }
-        }
-
-        self.add_gate_internal(root_cell.row(), root_cell.column(), constraint);
-
-        std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
-    }
-
-    fn auto_constraint<const N: usize>(
-        &mut self,
-        constraint: Constraint,
-        inputs: [Option<Cell>; N],
-    ) -> [Cell; N] {
-        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
-        assert_eq!(variables.len(), N);
-
-        let root_cell = cell(self.row_counter, 0);
-        self.row_counter += 1;
-
-        for i in 0..N {
-            if let Some(input) = inputs[i] {
-                self.connect(Some(input), Some(variables[i].map_to_cell(root_cell)));
-            }
-        }
-
-        self.add_gate_internal(root_cell.row(), root_cell.column(), constraint);
-
-        std::array::from_fn(|i| variables[i].map_to_cell(root_cell))
-    }
-
-    fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N] {
-        let row = self.row_counter;
-        self.row_counter += 1;
-
-        let outputs = std::array::from_fn(|i| cell(row, i));
-
-        for i in 0..N {
-            if let Some(input) = inputs[i] {
-                self.connect(Some(input), Some(outputs[i]));
-            }
-        }
-
-        self.add_gate_internal(row, 0, Constraint::nop());
-
-        outputs
     }
 
     fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView {
@@ -420,92 +479,35 @@ impl<'a> CircuitSectionBuilder<'a> {
     }
 }
 
-impl<'a> CircuitSectionBuilder<'a> {
-    fn map_cell(&self, cell: Cell) -> Cell {
-        Cell::new(
-            self.row_offset + cell.row(),
-            self.column_offset + cell.column(),
-        )
+impl<'a> internal::CircuitViewState for CircuitSectionBuilder<'a> {
+    fn builder(&self) -> &CircuitBuilder {
+        self.builder
+    }
+
+    fn builder_mut(&mut self) -> &mut CircuitBuilder {
+        self.builder
+    }
+
+    fn row_offset(&self) -> usize {
+        self.row_offset
+    }
+
+    fn column_offset(&self) -> usize {
+        self.column_offset
+    }
+
+    fn current_row(&self) -> usize {
+        self.row_counter
+    }
+
+    fn advance(&mut self) {
+        self.row_counter += 1;
     }
 }
 
 impl<'a> CircuitView for CircuitSectionBuilder<'a> {
     fn width(&self) -> Option<usize> {
         Some(self.width)
-    }
-
-    fn add_gate_internal(&mut self, row: usize, column: usize, constraint: Constraint) {
-        self.builder.add_gate_internal(
-            self.row_offset + row,
-            self.column_offset + column,
-            constraint,
-        );
-    }
-
-    fn auto_gate<const N: usize, const M: usize>(
-        &mut self,
-        constraint: Constraint,
-        inputs: [Option<Cell>; N],
-    ) -> [Cell; M] {
-        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
-        assert_eq!(variables.len(), N + M);
-
-        let root_cell = cell(self.row_counter, 0);
-        self.row_counter += 1;
-
-        for i in 0..N {
-            if let Some(input) = inputs[i] {
-                self.connect(Some(input), Some(variables[i].map_to_cell(root_cell)));
-            }
-        }
-
-        self.add_gate_internal(root_cell.row(), root_cell.column(), constraint);
-
-        std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
-    }
-
-    fn auto_constraint<const N: usize>(
-        &mut self,
-        constraint: Constraint,
-        inputs: [Option<Cell>; N],
-    ) -> [Cell; N] {
-        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
-        assert_eq!(variables.len(), N);
-
-        let root_cell = cell(self.row_counter, 0);
-        self.row_counter += 1;
-
-        for i in 0..N {
-            if let Some(input) = inputs[i] {
-                self.connect(Some(input), Some(variables[i].map_to_cell(root_cell)));
-            }
-        }
-
-        self.add_gate_internal(root_cell.row(), root_cell.column(), constraint);
-
-        std::array::from_fn(|i| variables[i].map_to_cell(root_cell))
-    }
-
-    fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N] {
-        let row = self.row_counter;
-        self.row_counter += 1;
-
-        let outputs = std::array::from_fn(|i| cell(row, self.column_offset + i));
-
-        for i in 0..N {
-            if let Some(input) = inputs[i] {
-                self.connect(Some(input), Some(outputs[i]));
-            }
-        }
-
-        self.add_gate_internal(row, 0, Constraint::nop());
-
-        outputs
-    }
-
-    fn connect(&mut self, cell1: Option<Cell>, cell2: Option<Cell>) {
-        let mapper = |cell| self.map_cell(cell);
-        self.builder.connect(cell1.map(mapper), cell2.map(mapper))
     }
 
     fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView {

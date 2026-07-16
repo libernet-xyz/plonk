@@ -22,6 +22,13 @@ impl Cell {
     pub const fn column(&self) -> usize {
         self.column
     }
+
+    pub(crate) const fn remap(self, root_cell: Cell) -> Self {
+        Self {
+            row: root_cell.row + self.row,
+            column: root_cell.column + self.column,
+        }
+    }
 }
 
 #[inline]
