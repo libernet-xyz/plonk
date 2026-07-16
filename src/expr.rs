@@ -1334,5 +1334,255 @@ mod tests {
         assert_eq!(constraint.to_string(), "-1 * w(1)");
     }
 
-    // TODO
+    #[test]
+    fn test_product_1() {
+        let constraint = var(0) * var(1);
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            from_const(408)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(12)]),
+            from_const(408)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(56), from_const(78)]),
+            from_const(4368)
+        );
+        assert_eq!(constraint.to_string(), "w(0) * w(1)");
+    }
+
+    #[test]
+    fn test_product_2() {
+        let constraint = var(1) * var(0);
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            from_const(408)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(12)]),
+            from_const(408)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(56), from_const(78)]),
+            from_const(4368)
+        );
+        assert_eq!(constraint.to_string(), "w(0) * w(1)");
+    }
+
+    #[test]
+    fn test_product_3() {
+        let constraint = rvar(2, -1) * rvar(2, 1);
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            from_const(408)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34), from_const(12)]),
+            from_const(408)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(56), from_const(78)]),
+            from_const(4368)
+        );
+        assert_eq!(constraint.to_string(), "w(2,-1) * w(2,+1)");
+    }
+
+    #[test]
+    fn test_another_product() {
+        let constraint = var(0) * var(1) * var(2);
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(12), from_const(34), from_const(56)]
+            ),
+            from_const(22848)
+        );
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(12), from_const(56), from_const(34)]
+            ),
+            from_const(22848)
+        );
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(34), from_const(56), from_const(78)]
+            ),
+            from_const(148512)
+        );
+        assert_eq!(constraint.to_string(), "w(0) * w(1) * w(2)");
+    }
+
+    #[test]
+    fn test_product_same_variable() {
+        let constraint = var(0) * var(0);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(144));
+        assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(1156));
+        assert_eq!(constraint.to_string(), "w(0) ^ 2");
+    }
+
+    #[test]
+    fn test_mul_scalar_1() {
+        let constraint = var(0) * from_const(12);
+        assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(408));
+        assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(672));
+        assert_eq!(constraint.to_string(), "12 * w(0)");
+    }
+
+    #[test]
+    fn test_mul_scalar_2() {
+        let constraint = var(0) * from_const(34);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(408));
+        assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(1904));
+        assert_eq!(constraint.to_string(), "34 * w(0)");
+    }
+
+    #[test]
+    fn test_mul_another_scalar() {
+        let constraint = var(0) * from_const(34) * from_const(56);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(22848));
+        assert_eq!(evaluate(&constraint, [from_const(78)]), from_const(148512));
+        assert_eq!(constraint.to_string(), "1904 * w(0)");
+    }
+
+    #[test]
+    fn test_mul_by_zero() {
+        let constraint = var(0) * from_const(0);
+        assert_eq!(evaluate(&constraint, []), from_const(0));
+        assert_eq!(constraint.to_string(), "0");
+    }
+
+    #[test]
+    fn test_optimize_product_1() {
+        let constraint = var(0) * (var(0) ^ -1);
+        assert_eq!(evaluate(&constraint, []), from_const(1));
+        assert_eq!(constraint.to_string(), "1");
+    }
+
+    #[test]
+    fn test_optimize_product_2() {
+        let constraint = var(0) * (var(0) ^ -1) * var(1);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
+        assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
+        assert_eq!(constraint.to_string(), "w(1)");
+    }
+
+    #[test]
+    fn test_optimize_product_3() {
+        let constraint = (var(0) ^ 2) * (var(0) ^ -1);
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
+        assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
+        assert_eq!(constraint.to_string(), "w(0)");
+    }
+
+    #[test]
+    fn test_pow_zero_exponent() {
+        let constraint = var(0) ^ 0;
+        assert_eq!(evaluate(&constraint, []), from_const(1));
+        assert_eq!(constraint.to_string(), "1");
+    }
+
+    #[test]
+    fn test_pow_zero_exponent_on_sum() {
+        let constraint = (var(0) + var(1)) ^ 0;
+        assert_eq!(evaluate(&constraint, []), from_const(1));
+        assert_eq!(constraint.to_string(), "1");
+    }
+
+    #[test]
+    fn test_pow_zero_exponent_of_zero() {
+        let constraint = make_const(0) ^ 0;
+        assert_eq!(evaluate(&constraint, []), from_const(1));
+        assert_eq!(constraint.to_string(), "1");
+    }
+
+    #[test]
+    fn test_pow_one_exponent() {
+        let constraint = var(0) ^ 1;
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
+        assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
+        assert_eq!(constraint.to_string(), "w(0)");
+    }
+
+    #[test]
+    fn test_pow_one_exponent_on_sum() {
+        let constraint = (var(0) + var(1)) ^ 1;
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            from_const(46)
+        );
+        assert_eq!(constraint.to_string(), "w(0) + w(1)");
+    }
+
+    #[test]
+    fn test_pow_positive_exponent() {
+        let constraint = var(0) ^ 3;
+        assert_eq!(
+            evaluate(&constraint, [from_const(12)]),
+            from_const(12).pow_small_vartime(3)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34)]),
+            from_const(34).pow_small_vartime(3)
+        );
+        assert_eq!(constraint.to_string(), "w(0) ^ 3");
+    }
+
+    #[test]
+    fn test_pow_negative_exponent() {
+        let constraint = var(0) ^ -2;
+        assert_eq!(
+            evaluate(&constraint, [from_const(12)]),
+            from_const(12).invert_unwrap().pow_small_vartime(2)
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(34)]),
+            from_const(34).invert_unwrap().pow_small_vartime(2)
+        );
+        assert_eq!(constraint.to_string(), "w(0) ^ -2");
+    }
+
+    #[test]
+    fn test_pow_constant_positive_exponent() {
+        let constraint = make_const(2) ^ 3;
+        assert_eq!(evaluate(&constraint, []), from_const(8));
+        assert_eq!(constraint.to_string(), "8");
+    }
+
+    #[test]
+    fn test_pow_constant_negative_exponent() {
+        let constraint = make_const(2) ^ -1;
+        assert_eq!(evaluate(&constraint, []), from_const(2).invert_unwrap());
+    }
+
+    #[test]
+    fn test_bitxor_assign() {
+        let mut constraint = var(0);
+        constraint ^= 3;
+        assert_eq!(
+            evaluate(&constraint, [from_const(12)]),
+            from_const(12).pow_small_vartime(3)
+        );
+        assert_eq!(constraint.to_string(), "w(0) ^ 3");
+    }
+
+    #[test]
+    #[should_panic(expected = "raising a sum to a power is forbidden")]
+    fn test_pow_sum_panics() {
+        let _ = (var(0) + var(1)) ^ 2;
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot raise 0 to a negative power")]
+    fn test_pow_zero_to_negative_exponent_panics_1() {
+        let _ = make_const(0) ^ -1;
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot raise 0 to a negative power")]
+    fn test_pow_zero_to_negative_exponent_panics_2() {
+        let _ = make_const(0) ^ -2;
+    }
 }

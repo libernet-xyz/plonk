@@ -1,5 +1,5 @@
 use crate::plonk::CircuitView;
-use crate::witness::{Cell, CellOrUnconstrained, Witness};
+use crate::witness::{Cell, CellOrUnconstrained, WitnessView};
 use anyhow::Result;
 
 /// Represents a reusable PLONK chip that you can use to build circuits.
@@ -12,7 +12,7 @@ pub trait Chip<const I: usize, const O: usize> {
 
     fn witness(
         &self,
-        witness: &mut Witness,
+        witness: &mut impl WitnessView,
         inputs: [CellOrUnconstrained; I],
     ) -> Result<[CellOrUnconstrained; O]>;
 }
