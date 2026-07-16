@@ -6,13 +6,17 @@ use std::{collections::BTreeMap, sync::LazyLock};
 /// Lexical tokens for Starkom's expression syntax.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Token {
-    Number(Scalar),
-    Variable(String),
+    Number2(Scalar),
+    Number8(Scalar),
+    Number10(Scalar),
+    Number16(Scalar),
+    Identifier(String),
     Plus,
     Minus,
     Multiply,
     Divide,
     Power,
+    Comma,
     Equal,
     LeftBracket,
     RightBracket,
@@ -38,6 +42,7 @@ static SYMBOLS: LazyLock<BTreeMap<&'static str, Token>> = LazyLock::new(|| {
         ("*", Token::Multiply),
         ("/", Token::Divide),
         ("^", Token::Power),
+        (",", Token::Comma),
         ("==", Token::Equal),
         ("(", Token::LeftBracket),
         (")", Token::RightBracket),
@@ -84,15 +89,15 @@ impl<'a> Lexer<'a> {
         self.consume_whitespace();
         while !self.input.is_empty() {
             if let Some(captures) = self.consume_prefix(&*REGEX_IDENTIFIER) {
-                tokens.push(Token::Variable(captures[0].to_string()));
+                tokens.push(Token::Identifier(captures[0].to_string()));
             } else if let Some(captures) = self.consume_prefix(&*REGEX_NUMBER_8) {
-                tokens.push(Token::Number(captures[0].parse().unwrap()));
+                tokens.push(Token::Number8(captures[0].parse().unwrap()));
             } else if let Some(captures) = self.consume_prefix(&*REGEX_NUMBER_2) {
-                tokens.push(Token::Number(captures[0].parse().unwrap()));
+                tokens.push(Token::Number2(captures[0].parse().unwrap()));
             } else if let Some(captures) = self.consume_prefix(&*REGEX_NUMBER_16) {
-                tokens.push(Token::Number(captures[0].parse().unwrap()));
+                tokens.push(Token::Number16(captures[0].parse().unwrap()));
             } else if let Some(captures) = self.consume_prefix(&*REGEX_NUMBER_10) {
-                tokens.push(Token::Number(captures[0].parse().unwrap()));
+                tokens.push(Token::Number10(captures[0].parse().unwrap()));
             } else {
                 tokens.push(self.consume_symbol()?);
             }
@@ -112,6 +117,7 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starkom_bluesky::from_const;
 
     #[inline]
     fn tokenize(input: &'static str) -> Vec<Token> {
@@ -121,17 +127,23 @@ mod tests {
     #[test]
     fn test_vitalik() {
         assert_eq!(
-            tokenize("w0 ^ 3 + w0 + 5 == 35"),
+            tokenize("w(0) ^ 3 + w(0) + 5 == 35"),
             vec![
-                Token::Variable("w0".to_string()),
+                Token::Identifier("w".to_string()),
+                Token::LeftBracket,
+                Token::Number10(from_const(0)),
+                Token::RightBracket,
                 Token::Power,
-                Token::Number(Scalar::from_const(3)),
+                Token::Number10(Scalar::from_const(3)),
                 Token::Plus,
-                Token::Variable("w0".to_string()),
+                Token::Identifier("w".to_string()),
+                Token::LeftBracket,
+                Token::Number10(from_const(0)),
+                Token::RightBracket,
                 Token::Plus,
-                Token::Number(Scalar::from_const(5)),
+                Token::Number10(Scalar::from_const(5)),
                 Token::Equal,
-                Token::Number(Scalar::from_const(35)),
+                Token::Number10(Scalar::from_const(35)),
                 Token::EndOfInput
             ]
         );
@@ -152,19 +164,19 @@ mod tests {
         assert_eq!(
             tokenize("1+2*3-4/5^6==7"),
             vec![
-                Token::Number(Scalar::from_const(1)),
+                Token::Number10(Scalar::from_const(1)),
                 Token::Plus,
-                Token::Number(Scalar::from_const(2)),
+                Token::Number10(Scalar::from_const(2)),
                 Token::Multiply,
-                Token::Number(Scalar::from_const(3)),
+                Token::Number10(Scalar::from_const(3)),
                 Token::Minus,
-                Token::Number(Scalar::from_const(4)),
+                Token::Number10(Scalar::from_const(4)),
                 Token::Divide,
-                Token::Number(Scalar::from_const(5)),
+                Token::Number10(Scalar::from_const(5)),
                 Token::Power,
-                Token::Number(Scalar::from_const(6)),
+                Token::Number10(Scalar::from_const(6)),
                 Token::Equal,
-                Token::Number(Scalar::from_const(7)),
+                Token::Number10(Scalar::from_const(7)),
                 Token::EndOfInput
             ]
         );
@@ -175,9 +187,9 @@ mod tests {
         assert_eq!(
             tokenize("1 \t+\n2"),
             vec![
-                Token::Number(Scalar::from_const(1)),
+                Token::Number10(Scalar::from_const(1)),
                 Token::Plus,
-                Token::Number(Scalar::from_const(2)),
+                Token::Number10(Scalar::from_const(2)),
                 Token::EndOfInput
             ]
         );
@@ -187,7 +199,7 @@ mod tests {
     fn test_decimal_zero() {
         assert_eq!(
             tokenize("0"),
-            vec![Token::Number(Scalar::from_const(0)), Token::EndOfInput]
+            vec![Token::Number10(Scalar::from_const(0)), Token::EndOfInput]
         );
     }
 
@@ -196,7 +208,7 @@ mod tests {
         assert_eq!(
             tokenize("123456789"),
             vec![
-                Token::Number(Scalar::from_const(123456789)),
+                Token::Number10(Scalar::from_const(123456789)),
                 Token::EndOfInput
             ]
         );
@@ -206,7 +218,7 @@ mod tests {
     fn test_octal_number() {
         assert_eq!(
             tokenize("017"),
-            vec![Token::Number(Scalar::from_const(15)), Token::EndOfInput]
+            vec![Token::Number8(Scalar::from_const(15)), Token::EndOfInput]
         );
     }
 
@@ -214,7 +226,7 @@ mod tests {
     fn test_octal_number_with_leading_zeros() {
         assert_eq!(
             tokenize("007"),
-            vec![Token::Number(Scalar::from_const(7)), Token::EndOfInput]
+            vec![Token::Number8(Scalar::from_const(7)), Token::EndOfInput]
         );
     }
 
@@ -222,7 +234,7 @@ mod tests {
     fn test_binary_number_lowercase_prefix() {
         assert_eq!(
             tokenize("0b1010"),
-            vec![Token::Number(Scalar::from_const(10)), Token::EndOfInput]
+            vec![Token::Number2(Scalar::from_const(10)), Token::EndOfInput]
         );
     }
 
@@ -230,23 +242,23 @@ mod tests {
     fn test_binary_number_uppercase_prefix() {
         assert_eq!(
             tokenize("0B1010"),
-            vec![Token::Number(Scalar::from_const(10)), Token::EndOfInput]
+            vec![Token::Number2(Scalar::from_const(10)), Token::EndOfInput]
         );
     }
 
     #[test]
-    fn test_hexadecimal_number_lowercase_prefix() {
+    fn test_hexadecimal_number_lowercase() {
         assert_eq!(
             tokenize("0xff"),
-            vec![Token::Number(Scalar::from_const(255)), Token::EndOfInput]
+            vec![Token::Number16(Scalar::from_const(255)), Token::EndOfInput]
         );
     }
 
     #[test]
-    fn test_hexadecimal_number_uppercase_prefix() {
+    fn test_hexadecimal_number_uppercase() {
         assert_eq!(
             tokenize("0XFF"),
-            vec![Token::Number(Scalar::from_const(255)), Token::EndOfInput]
+            vec![Token::Number16(Scalar::from_const(255)), Token::EndOfInput]
         );
     }
 
@@ -255,9 +267,9 @@ mod tests {
         assert_eq!(
             tokenize("_underscore CamelCase snake_case42"),
             vec![
-                Token::Variable("_underscore".to_string()),
-                Token::Variable("CamelCase".to_string()),
-                Token::Variable("snake_case42".to_string()),
+                Token::Identifier("_underscore".to_string()),
+                Token::Identifier("CamelCase".to_string()),
+                Token::Identifier("snake_case42".to_string()),
                 Token::EndOfInput
             ]
         );
@@ -266,13 +278,14 @@ mod tests {
     #[test]
     fn test_all_symbols() {
         assert_eq!(
-            tokenize("+ - * / ^ == ( )"),
+            tokenize("+ - * / ^ , == ( )"),
             vec![
                 Token::Plus,
                 Token::Minus,
                 Token::Multiply,
                 Token::Divide,
                 Token::Power,
+                Token::Comma,
                 Token::Equal,
                 Token::LeftBracket,
                 Token::RightBracket,
@@ -288,9 +301,9 @@ mod tests {
             vec![
                 Token::LeftBracket,
                 Token::LeftBracket,
-                Token::Number(Scalar::from_const(1)),
+                Token::Number10(Scalar::from_const(1)),
                 Token::Plus,
-                Token::Number(Scalar::from_const(2)),
+                Token::Number10(Scalar::from_const(2)),
                 Token::RightBracket,
                 Token::RightBracket,
                 Token::EndOfInput
@@ -304,7 +317,7 @@ mod tests {
             tokenize("-5"),
             vec![
                 Token::Minus,
-                Token::Number(Scalar::from_const(5)),
+                Token::Number10(Scalar::from_const(5)),
                 Token::EndOfInput
             ]
         );

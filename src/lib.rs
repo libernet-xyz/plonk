@@ -6,6 +6,7 @@
 mod chip;
 mod expr;
 mod lexer;
+mod parser;
 mod plonk;
 mod utils;
 mod witness;

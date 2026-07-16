@@ -40,13 +40,13 @@ pub(crate) fn scalar_to_isize(value: Scalar) -> Result<isize> {
     if is_pseudo_negative(&value) {
         let abs = (Scalar::MAX - value + Scalar::ONE).try_to_u128().unwrap() as i128;
         if abs > -(isize::MIN as i128) {
-            Err(anyhow!("exponent {} is out of range", value))
+            Err(anyhow!("out of range: {}", value))
         } else {
             Ok(-abs as isize)
         }
     } else {
         if value > MAX {
-            Err(anyhow!("exponent {} is out of range", value))
+            Err(anyhow!("out of range: {}", value))
         } else {
             Ok(value.try_to_u64().unwrap() as isize)
         }
