@@ -3,6 +3,8 @@ use crate::witness::{Cell, CellOrUnconstrained, WitnessView};
 use anyhow::Result;
 
 /// Represents a reusable PLONK chip that you can use to build circuits.
+///
+/// The generic parameter `I` is the number of inputs and `O` is the number of outputs.
 pub trait Chip<const I: usize, const O: usize> {
     fn build(
         &self,

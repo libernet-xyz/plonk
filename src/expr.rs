@@ -859,7 +859,8 @@ impl BitXor<isize> for Constraint {
 }
 
 impl DivAssign for Constraint {
-    /// Multiplies the LHS by the inverse of the RHS, which must have exactly one monomial.
+    /// Multiplies the LHS by the inverse of the RHS, which must have exactly one monomial and must
+    /// not be zero.
     fn div_assign(&mut self, rhs: Self) {
         match rhs.monomials.len() {
             0 => panic!("division by zero"),

@@ -1,6 +1,6 @@
+use crate::expr::Constraint;
 use crate::lexer::Token;
-use crate::utils::is_pseudo_negative;
-use crate::{expr::Constraint, utils::scalar_to_isize};
+use crate::utils::{is_pseudo_negative, scalar_to_isize};
 use anyhow::{Result, anyhow};
 use starkom_bluesky::Scalar;
 use starkom_ff::{Field, Field256};

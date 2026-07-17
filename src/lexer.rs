@@ -1,7 +1,8 @@
 use anyhow::{Result, anyhow};
 use regex::{Captures, Regex};
 use starkom_bluesky::Scalar;
-use std::{collections::BTreeMap, sync::LazyLock};
+use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 /// Lexical tokens for Starkom's expression syntax.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

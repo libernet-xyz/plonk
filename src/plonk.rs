@@ -1,5 +1,5 @@
 use crate::expr::{Constraint, Variable};
-use crate::utils::padded_circuit_size;
+use crate::utils::{hash_to_scalar, padded_circuit_size};
 use crate::witness::{Cell, Partitioner, Witness, cell};
 use anyhow::{Result, anyhow};
 use starkom_bluesky::Scalar;
@@ -8,6 +8,7 @@ use starkom_pcs::{self as pcs, hash::Hash};
 use starkom_poly;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
+use std::sync::LazyLock;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
 
@@ -21,6 +22,49 @@ const COMMIT_INDEX_WITNESS: usize = 1;
 const COMMIT_INDEX_PERMUTATION_ARGUMENT: usize = 2;
 const COMMIT_INDEX_QUOTIENT: usize = 3;
 const NUM_COMMIT_INDICES: usize = 4;
+
+const FIAT_SHAMIR_INDEX_ALPHA: Scalar = Scalar::from_const(0);
+const FIAT_SHAMIR_INDEX_BETA: Scalar = Scalar::from_const(1);
+const FIAT_SHAMIR_INDEX_GAMMA: Scalar = Scalar::from_const(2);
+const FIAT_SHAMIR_INDEX_DELTA: Scalar = Scalar::from_const(3);
+const FIAT_SHAMIR_INDEX_XI: Scalar = Scalar::from_const(4);
+
+/// Domain separator tag used for the main Fiat-Shamir challenge.
+static DST: LazyLock<Scalar> = LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge"));
+
+/// Calculates the degree bound of the PLONK quotient, typically much higher than the circuit's
+/// general [degree bound](`Circuit::degree_bound`) `N` because the constraint equations involve
+/// several polynomial multiplications, such as the gate selectors multiplied by the gate
+/// constraints combined with the witness columns.
+///
+/// The algorithm uses the formula `(N - 1) * E`, where `E = max(max_gate_degree, num_columns)`.
+/// The rationale behind it is:
+///
+/// * each column has degree less than or equal to `N - 1`;
+/// * the grand gate constraint has degree less than or equal to
+///   `(N - 1) * (1 + max_gate_degree)` (the selector contributes one factor, degree composition
+///   with the constraint columns contributes `max_gate_degree` more);
+/// * the recurrence constraint of the permutation argument has degree less than or equal to
+///   `(N - 1) * (1 + num_columns)` (the accumulator/shifted term contributes one factor, one more
+///   per column);
+/// * the grand PLONK constraint (grand gate constraint + permutation argument fixpoint constraint
+///   + permutation argument recurrence constraint) has degree less than or equal to
+///   `(N - 1) * (1 + E)`;
+/// * dividing that by the zero polynomial (`x^N - 1`, degree-N) yields a quotient with degree
+///   `(N - 1) * (1 + E) - N`;
+/// * so the degree bound of the quotient is `(N - 1) * (1 + E) - N + 1`
+/// * ... which simplifies to `(N - 1) * E`.
+fn quotient_degree_bound<'a, I: Iterator<Item = &'a Constraint>>(
+    degree_bound: usize,
+    num_columns: usize,
+    gate_constraints: I,
+) -> usize {
+    let max_gate_degree = gate_constraints
+        .map(|constraint| constraint.get_degree())
+        .max()
+        .unwrap_or(0);
+    (degree_bound - 1) * std::cmp::max(max_gate_degree, num_columns)
+}
 
 /// Circuit compilation & proving options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -670,7 +714,7 @@ impl Circuit {
         mut witness: Witness,
         options: ProvingOptions,
     ) -> Result<Proof<H>> {
-        witness.blind(self.num_blinding_rows);
+        witness.blind();
         if witness.degree_bound() != self.degree_bound {
             return Err(anyhow!(
                 "incorrect witness size (got {}, want {})",
@@ -692,6 +736,24 @@ impl Circuit {
         let columns = witness.encode();
         committer.add_batch(columns.clone());
 
+        let omega = Polynomial::domain_element2(1, self.degree_bound);
+
+        let gate_constraint = {
+            let delta = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_DELTA);
+            let mut gate_constraint = Polynomial::default();
+            let mut pow = Scalar::ONE;
+            for (constraint, instances) in &self.gates {
+                for instance in instances {
+                    let constraint = constraint.clone().remap_variables(instance.column_index);
+                    let selector = self.selectors[instance.selector_index].clone();
+                    gate_constraint +=
+                        selector * constraint.compose(omega, columns.as_slice()) * pow;
+                    pow *= delta;
+                }
+            }
+            gate_constraint
+        };
+
         // TODO
         todo!()
     }
@@ -711,7 +773,11 @@ impl Circuit {
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
             options,
-            gates: self.gates,
+            gates: self
+                .gates
+                .into_iter()
+                .map(|(constraint, instances)| (constraint, instances.into_iter().collect()))
+                .collect(),
             public_rows: self.public_rows,
             circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
             _data: Default::default(),
@@ -734,14 +800,24 @@ impl Circuit {
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
             options,
-            gates: self.gates.clone(),
+            gates: self
+                .gates
+                .iter()
+                .map(|(constraint, instances)| {
+                    (constraint.clone(), instances.iter().cloned().collect())
+                })
+                .collect(),
             public_rows: self.public_rows.clone(),
             circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
             _data: Default::default(),
         }
     }
 
-    pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>, options: ProvingOptions) -> Result<()> {
+    pub fn verify<H: Hash<Scalar>>(
+        &self,
+        proof: &Proof<H>,
+        options: ProvingOptions,
+    ) -> Result<BTreeMap<Cell, Scalar>> {
         self.as_compressed::<H>(options).verify(proof)
     }
 }
@@ -769,7 +845,7 @@ pub struct CompressedCircuit<H: Hash<Scalar>> {
 
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
     /// second component is the set of instances of that gate across the circuit.
-    gates: BTreeMap<Constraint, BTreeSet<GateInstance>>,
+    gates: Vec<(Constraint, Vec<GateInstance>)>,
 
     /// List of rows that are revealed in the proofs.
     public_rows: BTreeSet<usize>,
@@ -797,7 +873,24 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         &self.public_rows
     }
 
-    pub fn verify(&self, proof: &Proof<H>) -> Result<()> {
+    /// Calculates the number of chunks the quotient was split into.
+    ///
+    /// See [`quotient_degree_bound`] for details.
+    fn get_num_quotient_chunks(&self) -> usize {
+        quotient_degree_bound(
+            self.degree_bound,
+            self.num_columns,
+            self.gates.iter().map(|(constraint, _)| constraint),
+        )
+        .div_ceil(self.degree_bound)
+    }
+
+    /// Verifies a [`Proof`], returning the map of proven public values if successful or an error
+    /// otherwise.
+    ///
+    /// The returned map will have exactly `N` entries for every row in [`Self::public_rows`], with
+    /// `N` being the [number of columns](`Self::num_columns`).
+    pub fn verify(&self, proof: &Proof<H>) -> Result<BTreeMap<Cell, Scalar>> {
         let commitment = &proof.commitment;
         let inner_proof = &proof.inner_proof;
 
@@ -830,6 +923,112 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
                 1usize << self.options.blowup_log2
             ));
         }
+
+        let num_gate_selectors = self
+            .gates
+            .iter()
+            .map(|(_, gate_instances)| {
+                gate_instances
+                    .iter()
+                    .map(|instance| instance.selector_index)
+            })
+            .flatten()
+            .collect::<BTreeSet<usize>>()
+            .len();
+        let num_sigma_polynomials = self.num_columns;
+        let num_witness_columns = self.num_columns;
+        let num_permutation_accumulator_polynomial = 1usize;
+        let num_quotient_chunks = self.get_num_quotient_chunks();
+        let expected_polynomials = num_gate_selectors
+            + num_sigma_polynomials
+            + num_witness_columns
+            + num_permutation_accumulator_polynomial
+            + num_quotient_chunks;
+
+        if inner_proof.num_polys() != expected_polynomials {
+            return Err(anyhow!(
+                "incorrect number of committed polynomials (got {}, want {})",
+                inner_proof.num_polys(),
+                expected_polynomials,
+            ));
+        }
+
+        let omega = Polynomial::domain_element2(1, self.degree_bound);
+
+        let xi = H::hash_two(
+            *DST,
+            commitment.transcript_hash(COMMIT_INDEX_QUOTIENT + 1),
+            FIAT_SHAMIR_INDEX_XI,
+        );
+
+        let points = inner_proof.points();
+        if !points.contains_key(&xi) {
+            return Err(anyhow!(
+                "the proof doesn't have an opening for the main Fiat-Shamir challenge"
+            ));
+        }
+        if !points.contains_key(&(xi * omega)) {
+            return Err(anyhow!(
+                "the proof doesn't have an opening for the shifted Fiat-Shamir challenge"
+            ));
+        }
+        for &row in &self.public_rows {
+            let z = omega.pow_small(row);
+            if !points.contains_key(&z) {
+                return Err(anyhow!(
+                    "the proof doesn't have an opening for public row {row}"
+                ));
+            }
+        }
+
+        inner_proof.verify(&commitment)?;
+
+        let sigma: Vec<Scalar> = {
+            let offset = num_gate_selectors;
+            (0..self.num_columns)
+                .map(|i| points[&xi][offset + i])
+                .collect()
+        };
+
+        let gate_constraint: Scalar = {
+            let selectors: Vec<Scalar> = (0..num_gate_selectors).map(|i| points[&xi][i]).collect();
+            let delta = H::hash_two(
+                *DST,
+                commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
+                FIAT_SHAMIR_INDEX_DELTA,
+            );
+            let mut result = Scalar::ZERO;
+            let mut pow = Scalar::ONE;
+            for (constraint, gate_instances) in &self.gates {
+                for instance in gate_instances {
+                    let constraint = constraint.clone().remap_variables(instance.column_index);
+                    let substitution: BTreeMap<Variable, Scalar> = constraint
+                        .get_free_variables()
+                        .into_iter()
+                        .map(|variable| {
+                            let offset = num_gate_selectors + num_sigma_polynomials;
+                            let rotation = variable.rotation();
+                            let challenge = xi
+                                * if rotation < 0 {
+                                    omega.invert_vartime().unwrap()
+                                } else {
+                                    omega
+                                }
+                                .pow_small_vartime(rotation.unsigned_abs());
+                            (
+                                variable,
+                                points[&challenge][offset + variable.column_index()],
+                            )
+                        })
+                        .collect();
+                    result += selectors[instance.selector_index]
+                        * constraint.evaluate(&substitution)
+                        * pow;
+                    pow *= delta;
+                }
+            }
+            result
+        };
 
         // TODO
         todo!()

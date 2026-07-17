@@ -320,10 +320,10 @@ impl Witness {
 
     /// Fills in the blinding rows of the witness with random values.
     ///
-    /// The affected rows are the last `num_blinding_rows`.
-    pub(crate) fn blind(&mut self, num_blinding_rows: usize) {
+    /// The affected rows are the last [`Self::num_blinding_rows`] before the power-of-two padding.
+    pub(crate) fn blind(&mut self) {
         for i in 0..self.num_columns() {
-            for j in 0..num_blinding_rows {
+            for j in 0..self.num_blinding_rows {
                 self.data[i][self.num_rows + j] = Scalar::random_default();
             }
         }
@@ -447,11 +447,6 @@ impl<'a> WitnessView for WitnessSection<'a> {
 mod tests {
     use super::*;
 
-    #[inline(always)]
-    fn cell(row: usize, column: usize) -> Cell {
-        Cell::new(row, column)
-    }
-
     #[inline]
     fn node<const N: usize>(cells: [Cell; N]) -> BTreeSet<Cell> {
         BTreeSet::from(cells)
@@ -473,6 +468,34 @@ mod tests {
         let cell = Cell::new(56, 78);
         assert_eq!(cell.row(), 56);
         assert_eq!(cell.column(), 78);
+    }
+
+    #[test]
+    fn test_cell_shorthand_1() {
+        let cell = cell(12, 34);
+        assert_eq!(cell.row(), 12);
+        assert_eq!(cell.column(), 34);
+    }
+
+    #[test]
+    fn test_cell_shorthand_2() {
+        let cell = cell(56, 78);
+        assert_eq!(cell.row(), 56);
+        assert_eq!(cell.column(), 78);
+    }
+
+    #[test]
+    fn test_remap_cell_1() {
+        let cell = cell(12, 34).remap(cell(56, 78));
+        assert_eq!(cell.row(), 68);
+        assert_eq!(cell.column(), 112);
+    }
+
+    #[test]
+    fn test_remap_cell_2() {
+        let cell = cell(56, 78).remap(cell(42, 43));
+        assert_eq!(cell.row(), 98);
+        assert_eq!(cell.column(), 121);
     }
 
     #[test]
