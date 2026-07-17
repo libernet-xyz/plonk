@@ -1,12 +1,13 @@
 use crate::expr::{Constraint, Variable};
 use crate::utils::padded_circuit_size;
 use crate::witness::{Cell, Partitioner, Witness, cell};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use starkom_bluesky::Scalar;
 use starkom_ff::{Field, PrimeField};
 use starkom_pcs::{self as pcs, hash::Hash};
 use starkom_poly;
 use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
 
@@ -14,6 +15,12 @@ type Polynomial = starkom_poly::Polynomial<Scalar>;
 ///
 /// Used with the underlying PCS to compute low-degree extensions.
 pub const OPTIONS_DEFAULT_BLOWUP_LOG2: usize = 4;
+
+const COMMIT_INDEX_CIRCUIT: usize = 0;
+const COMMIT_INDEX_WITNESS: usize = 1;
+const COMMIT_INDEX_PERMUTATION_ARGUMENT: usize = 2;
+const COMMIT_INDEX_QUOTIENT: usize = 3;
+const NUM_COMMIT_INDICES: usize = 4;
 
 /// Circuit compilation & proving options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,7 +353,7 @@ impl CircuitBuilder {
 
     /// Compiles the circuit built so far into a [`Circuit`] object.
     pub fn build(self) -> Result<Circuit> {
-        let (degree_bound, _) = padded_circuit_size(
+        let (degree_bound, num_blinding_rows) = padded_circuit_size(
             self.num_rows,
             self.gates.iter().flat_map(|(constraint, _)| {
                 constraint
@@ -395,6 +402,7 @@ impl CircuitBuilder {
 
         Ok(Circuit {
             num_rows: self.num_rows,
+            num_blinding_rows,
             degree_bound,
             num_columns: self.num_columns,
             selectors,
@@ -568,7 +576,15 @@ pub struct Circuit {
     /// padded to the next power of 2.
     num_rows: usize,
 
+    /// Number of blinding rows used in the circuit.
+    ///
+    /// This is calculated by [`padded_circuit_size`] and depends on how many different variable
+    /// rotations were used across all constraints.
+    num_blinding_rows: usize,
+
     /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
+    ///
+    /// This is the direct result of [`padded_circuit_size`].
     degree_bound: usize,
 
     /// Number of witness columns.
@@ -612,6 +628,10 @@ impl Circuit {
         self.num_columns
     }
 
+    pub fn public_rows(&self) -> &BTreeSet<usize> {
+        &self.public_rows
+    }
+
     /// Makes an empty [`Witness`] objects suitable for use with this circuit.
     pub fn make_witness(&self) -> Witness {
         Witness::new(
@@ -634,11 +654,132 @@ impl Circuit {
         mut witness: Witness,
         options: ProvingOptions,
     ) -> Result<Proof<H>> {
+        witness.blind(self.num_blinding_rows);
+        if witness.degree_bound() != self.degree_bound {
+            return Err(anyhow!(
+                "incorrect witness size (got {}, want {})",
+                witness.degree_bound(),
+                self.degree_bound
+            ));
+        }
+
+        let circuit_polynomials = self
+            .selectors
+            .iter()
+            .cloned()
+            .chain(self.sigma.iter().cloned())
+            .collect();
+
+        let mut committer =
+            pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, circuit_polynomials);
+
         // TODO
         todo!()
     }
 
-    // TODO
+    pub fn to_compressed<H: Hash<Scalar>>(self, options: ProvingOptions) -> CompressedCircuit<H> {
+        // TODO
+        todo!()
+    }
+
+    pub fn as_compressed<H: Hash<Scalar>>(&self, options: ProvingOptions) -> CompressedCircuit<H> {
+        // TODO
+        todo!()
+    }
+
+    pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>, options: ProvingOptions) -> Result<()> {
+        self.as_compressed::<H>(options).verify(proof)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressedCircuit<H: Hash<Scalar>> {
+    /// The raw number of rows of the circuit.
+    ///
+    /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
+    /// padded to the next power of 2.
+    num_rows: usize,
+
+    /// Number of blinding rows used in the circuit.
+    num_blinding_rows: usize,
+
+    /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
+    degree_bound: usize,
+
+    /// Number of witness columns.
+    num_columns: usize,
+
+    /// Proving options used to commit to this circuit (in [`Circuit::as_compressed`] or
+    /// [`Circuit::to_compressed`]).
+    options: ProvingOptions,
+
+    /// Gates used in the circuit: the first component of each pair is the gate constraint and the
+    /// second component is the set of instances of that gate across the circuit.
+    gates: Vec<(Constraint, BTreeSet<GateInstance>)>,
+
+    /// List of rows that are revealed in the proofs.
+    public_rows: BTreeSet<usize>,
+
+    /// Merkle root of the circuit selectors.
+    circuit_commitment: Scalar,
+
+    _data: PhantomData<H>,
+}
+
+impl<H: Hash<Scalar>> CompressedCircuit<H> {
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    pub fn degree_bound(&self) -> usize {
+        self.degree_bound
+    }
+
+    pub fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
+    pub fn public_rows(&self) -> &BTreeSet<usize> {
+        &self.public_rows
+    }
+
+    pub fn verify(&self, proof: &Proof<H>) -> Result<()> {
+        let commitment = &proof.commitment;
+        let inner_proof = &proof.inner_proof;
+
+        if commitment.tree_roots().len() != NUM_COMMIT_INDICES {
+            return Err(anyhow!(
+                "wrong number of Merkle roots (got {}, want {})",
+                commitment.tree_roots().len(),
+                NUM_COMMIT_INDICES
+            ));
+        }
+        if commitment.tree_roots()[COMMIT_INDEX_CIRCUIT] != self.circuit_commitment {
+            return Err(anyhow!(
+                "wrong circuit commitment (got {}, want {})",
+                commitment.tree_roots()[COMMIT_INDEX_CIRCUIT],
+                self.circuit_commitment
+            ));
+        }
+
+        if inner_proof.degree_bound() != self.degree_bound {
+            return Err(anyhow!(
+                "wrong degree bound (got {}, want {})",
+                inner_proof.degree_bound(),
+                self.degree_bound
+            ));
+        }
+        if inner_proof.blowup_log2() != self.options.blowup_log2 {
+            return Err(anyhow!(
+                "blowup factor mismatch (got {}, want {})",
+                1usize << inner_proof.blowup_log2(),
+                1usize << self.options.blowup_log2
+            ));
+        }
+
+        // TODO
+        todo!()
+    }
 }
 
 #[cfg(test)]
