@@ -92,12 +92,9 @@ mod internal {
             cell(self.row_offset(), self.column_offset())
         }
 
-        /// Returns the current row where [auto gates](`CircuitView::auto_gate`) are added.
-        ///
-        /// This is relative to [`Self::row_offset`] and starts at 0 for all views and sub-views.
-        fn current_row(&self) -> usize;
-
-        fn advance(&mut self);
+        /// Returns the next root cell where an [auto gate](`CircuitView::auto_gate`) can be placed,
+        /// advancing the internal state to the next row.
+        fn step_row(&mut self) -> Cell;
     }
 }
 
@@ -136,7 +133,7 @@ pub trait CircuitView: internal::CircuitViewState {
     ///
     /// NOTE: variables with the same column number but different rotations are considered different
     /// variables for the purpose of counting against `N` and `M`. For example, the constraint
-    /// `var(0,+1) == var(0,-1) + var(0)` uses three variables, not two. Variables with the same
+    /// `var(0,+1) == var(0,-1) + var(0)` uses three variables, not one. Variables with the same
     /// column number are ordered by rotation, so for example if you set `N=2` and `M=1` the above
     /// constraint would associate the 2 inputs to `var(0,-1)` and `var(0)`, and the output to
     /// `var(0,+1)`.
@@ -148,8 +145,7 @@ pub trait CircuitView: internal::CircuitViewState {
         let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
         assert_eq!(variables.len(), N + M);
 
-        let root_cell = cell(self.current_row(), 0).remap(self.root_cell());
-        self.advance();
+        let root_cell = self.step_row();
 
         for i in 0..N {
             if let Some(input) = inputs[i] {
@@ -163,6 +159,23 @@ pub trait CircuitView: internal::CircuitViewState {
         std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
     }
 
+    /// Adds a gate with `N` terminations.
+    ///
+    /// Unlike [`Self::auto_gate`] this method doesn't make a distinction between input and output
+    /// terminations; it simply enforces a polynomial relation among `N` terminations.
+    ///
+    /// The provided `constraint` must use exactly `N` variables, or the function will panic. The
+    /// provided input cells are wrapped in `Option`s because `None` means the corresponding input
+    /// is unconstrained.
+    ///
+    /// The `N` variables used in the constraint will be automatically connected to the specified
+    /// `inputs` unless they're unconstrained / None.
+    ///
+    /// NOTE: variables with the same column number but different rotations are considered different
+    /// variables for the purpose of counting against `N`. For example, the constraint
+    /// `var(0,+1) == var(0,-1) + var(0)` uses three variables, not one. Variables with the same
+    /// column number are ordered by rotation, so for example the above constraint would associate
+    /// the 3 inputs to `var(0,-1)`, `var(0)`, and `var(0,+1)`, respectively.
     fn auto_constraint<const N: usize>(
         &mut self,
         constraint: Constraint,
@@ -171,8 +184,7 @@ pub trait CircuitView: internal::CircuitViewState {
         let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
         assert_eq!(variables.len(), N);
 
-        let root_cell = cell(self.current_row(), 0).remap(self.root_cell());
-        self.advance();
+        let root_cell = self.step_row();
 
         for i in 0..N {
             if let Some(input) = inputs[i] {
@@ -185,10 +197,18 @@ pub trait CircuitView: internal::CircuitViewState {
         std::array::from_fn(|i| variables[i].map_to_cell(root_cell))
     }
 
+    /// Adds a NOP gate with `N` terminations; the constraint of the gate is `0 == 0`.
+    ///
+    /// This is conceptually equivalent to calling:
+    ///
+    /// ```ignore
+    /// witness.auto_constraint::<N>(Constraint::nop(), inputs);
+    /// ```
+    ///
+    /// except that the above call wouldn't work because the nop constraint uses 0 variables, so it
+    /// would panic because `0 != N`.
     fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N] {
-        let root_cell = cell(self.current_row(), 0).remap(self.root_cell());
-        self.advance();
-
+        let root_cell = self.step_row();
         let outputs = std::array::from_fn(|i| cell(0, i).remap(root_cell));
 
         for i in 0..N {
@@ -431,12 +451,10 @@ impl internal::CircuitViewState for CircuitBuilder {
         0
     }
 
-    fn current_row(&self) -> usize {
-        self.row_counter
-    }
-
-    fn advance(&mut self) {
+    fn step_row(&mut self) -> Cell {
+        let root_cell = cell(self.row_counter, 0);
         self.row_counter += 1;
+        root_cell
     }
 }
 
@@ -503,12 +521,10 @@ impl<'a> internal::CircuitViewState for CircuitSectionBuilder<'a> {
         self.column_offset
     }
 
-    fn current_row(&self) -> usize {
-        self.row_counter
-    }
-
-    fn advance(&mut self) {
+    fn step_row(&mut self) -> Cell {
+        let root_cell = cell(self.row_counter, 0).remap(self.root_cell());
         self.row_counter += 1;
+        root_cell
     }
 }
 
@@ -673,18 +689,56 @@ impl Circuit {
         let mut committer =
             pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, circuit_polynomials);
 
+        let columns = witness.encode();
+        committer.add_batch(columns.clone());
+
         // TODO
         todo!()
     }
 
     pub fn to_compressed<H: Hash<Scalar>>(self, options: ProvingOptions) -> CompressedCircuit<H> {
-        // TODO
-        todo!()
+        let committer = pcs::Committer::<H>::new(
+            self.degree_bound,
+            options.blowup_log2,
+            self.selectors
+                .into_iter()
+                .chain(self.sigma.into_iter())
+                .collect(),
+        );
+        CompressedCircuit {
+            num_rows: self.num_rows,
+            num_blinding_rows: self.num_blinding_rows,
+            degree_bound: self.degree_bound,
+            num_columns: self.num_columns,
+            options,
+            gates: self.gates,
+            public_rows: self.public_rows,
+            circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
+            _data: Default::default(),
+        }
     }
 
     pub fn as_compressed<H: Hash<Scalar>>(&self, options: ProvingOptions) -> CompressedCircuit<H> {
-        // TODO
-        todo!()
+        let committer = pcs::Committer::<H>::new(
+            self.degree_bound,
+            options.blowup_log2,
+            self.selectors
+                .iter()
+                .cloned()
+                .chain(self.sigma.iter().cloned())
+                .collect(),
+        );
+        CompressedCircuit {
+            num_rows: self.num_rows,
+            num_blinding_rows: self.num_blinding_rows,
+            degree_bound: self.degree_bound,
+            num_columns: self.num_columns,
+            options,
+            gates: self.gates.clone(),
+            public_rows: self.public_rows.clone(),
+            circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
+            _data: Default::default(),
+        }
     }
 
     pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>, options: ProvingOptions) -> Result<()> {
@@ -715,7 +769,7 @@ pub struct CompressedCircuit<H: Hash<Scalar>> {
 
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
     /// second component is the set of instances of that gate across the circuit.
-    gates: Vec<(Constraint, BTreeSet<GateInstance>)>,
+    gates: BTreeMap<Constraint, BTreeSet<GateInstance>>,
 
     /// List of rows that are revealed in the proofs.
     public_rows: BTreeSet<usize>,

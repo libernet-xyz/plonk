@@ -4,6 +4,9 @@ use starkom_bluesky::Scalar;
 use starkom_ff::Field;
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
+type Polynomial = starkom_poly::Polynomial<Scalar>;
+
+/// A cell in a circuit or witness, uniquely identified by a row number and a column number.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Cell {
     row: usize,
@@ -11,14 +14,17 @@ pub struct Cell {
 }
 
 impl Cell {
+    /// Creates a new cell.
     pub const fn new(row: usize, column: usize) -> Self {
         Self { row, column }
     }
 
+    /// Returns the row number of the cell.
     pub const fn row(&self) -> usize {
         self.row
     }
 
+    /// Returns the column number of the cell.
     pub const fn column(&self) -> usize {
         self.column
     }
@@ -31,6 +37,7 @@ impl Cell {
     }
 }
 
+/// Shorthand for [`Cell::new`].
 #[inline]
 pub const fn cell(row: usize, column: usize) -> Cell {
     Cell::new(row, column)
@@ -126,23 +133,105 @@ impl Partitioner {
     }
 }
 
-pub trait WitnessView {
+mod internal {
+    use super::*;
+
+    /// Provides access to the internal state of a circuit view.
+    ///
+    /// This is used to implement the provided methods of the [`WitnessView`] trait.
+    pub trait WitnessViewState {
+        /// Returns a reference to the [`Witness`].
+        fn witness(&self) -> &Witness;
+
+        /// Returns a mutable reference to the [`Witness`].
+        fn witness_mut(&mut self) -> &mut Witness;
+
+        /// Returns the row offset of the view (0 for the [`Witness`] itself).
+        ///
+        /// This is always an absolute value even for transitive sub-views. It is not relative to
+        /// the parent view.
+        fn row_offset(&self) -> usize;
+
+        /// Returns the column offset of the view (0 for the [`Witness`] itself).
+        ///
+        /// This is always an absolute value even for transitive sub-views. It is not relative to
+        /// the parent view.
+        fn column_offset(&self) -> usize;
+
+        /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
+        fn root_cell(&self) -> Cell {
+            cell(self.row_offset(), self.column_offset())
+        }
+
+        /// Returns the next root cell for [setting auto gates](`Witness::auto_set`), advancing the
+        /// internal state to the next row.
+        fn step_row(&mut self) -> Cell;
+    }
+}
+
+pub trait WitnessView: internal::WitnessViewState {
     fn width(&self) -> usize;
 
     /// Reads a witness cell.
-    fn get(&self, cell: Cell) -> Scalar;
+    fn get(&self, cell: Cell) -> Scalar {
+        self.witness().get_internal(cell)
+    }
 
     /// Updates a witness cell.
-    fn set(&mut self, cell: Cell, value: Scalar);
+    fn set(&mut self, cell: Cell, value: Scalar) {
+        self.witness_mut().set_internal(cell, value);
+    }
 
     /// Copies a witness cell to another.
-    fn copy(&mut self, src_cell: Cell, dst_cell: Cell) -> Scalar;
+    fn copy(&mut self, src_cell: Cell, dst_cell: Cell) -> Scalar {
+        self.witness_mut().copy_internal(src_cell, dst_cell)
+    }
 
     fn auto_set<C: Into<CellOrUnconstrained>, const N: usize, const M: usize>(
         &mut self,
         expressions: &BTreeMap<Variable, Constraint>,
         inputs: [C; N],
-    ) -> [Cell; M];
+    ) -> [Cell; M] {
+        assert_eq!(expressions.len(), M);
+
+        let root_cell = self.step_row();
+
+        let variables: BTreeSet<Variable> = expressions
+            .iter()
+            .map(|(_, constraint)| constraint.get_free_variables())
+            .fold(BTreeSet::default(), |mut accumulator, mut variables| {
+                accumulator.append(&mut variables);
+                accumulator
+            });
+        assert_eq!(variables.len(), N);
+
+        let substitution: BTreeMap<Variable, Scalar> = variables
+            .into_iter()
+            .zip(inputs.into_iter())
+            .map(|(variable, input)| {
+                let dst_cell = variable.map_to_cell(root_cell);
+                let value = match input.into() {
+                    CellOrUnconstrained::Cell(cell) => self.copy(cell, dst_cell),
+                    CellOrUnconstrained::Unconstrained(value) => {
+                        self.set(dst_cell, value);
+                        value
+                    }
+                };
+                (variable, value)
+            })
+            .collect();
+
+        expressions
+            .iter()
+            .map(|(variable, expression)| {
+                let cell = variable.map_to_cell(root_cell);
+                self.set(cell, expression.evaluate(&substitution));
+                cell
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap()
+    }
 
     fn auto_set_one<C: Into<CellOrUnconstrained>, const N: usize>(
         &mut self,
@@ -215,6 +304,20 @@ impl Witness {
         self.data.len()
     }
 
+    fn get_internal(&self, cell: Cell) -> Scalar {
+        self.data[cell.column()][cell.row()]
+    }
+
+    fn set_internal(&mut self, cell: Cell, value: Scalar) {
+        self.data[cell.column()][cell.row()] = value;
+    }
+
+    fn copy_internal(&mut self, src_cell: Cell, dst_cell: Cell) -> Scalar {
+        let value = self.data[src_cell.column()][src_cell.row()];
+        self.data[dst_cell.column()][dst_cell.row()] = value;
+        value
+    }
+
     /// Fills in the blinding rows of the witness with random values.
     ///
     /// The affected rows are the last `num_blinding_rows`.
@@ -225,72 +328,42 @@ impl Witness {
             }
         }
     }
+
+    pub(crate) fn encode(self) -> Vec<Polynomial> {
+        self.data
+            .iter()
+            .map(|data| Polynomial::encode2(data.clone()))
+            .collect()
+    }
+}
+
+impl internal::WitnessViewState for Witness {
+    fn witness(&self) -> &Witness {
+        self
+    }
+
+    fn witness_mut(&mut self) -> &mut Witness {
+        self
+    }
+
+    fn row_offset(&self) -> usize {
+        0
+    }
+
+    fn column_offset(&self) -> usize {
+        0
+    }
+
+    fn step_row(&mut self) -> Cell {
+        let root_cell = cell(self.row_counter, 0);
+        self.row_counter += 1;
+        root_cell
+    }
 }
 
 impl WitnessView for Witness {
     fn width(&self) -> usize {
         self.data.len()
-    }
-
-    fn get(&self, cell: Cell) -> Scalar {
-        self.data[cell.column()][cell.row()]
-    }
-
-    fn set(&mut self, cell: Cell, value: Scalar) {
-        self.data[cell.column()][cell.row()] = value;
-    }
-
-    fn copy(&mut self, src_cell: Cell, dst_cell: Cell) -> Scalar {
-        let value = self.data[src_cell.column()][src_cell.row()];
-        self.data[dst_cell.column()][dst_cell.row()] = value;
-        value
-    }
-
-    fn auto_set<C: Into<CellOrUnconstrained>, const N: usize, const M: usize>(
-        &mut self,
-        expressions: &BTreeMap<Variable, Constraint>,
-        inputs: [C; N],
-    ) -> [Cell; M] {
-        assert_eq!(expressions.len(), M);
-
-        let root_cell = cell(self.row_counter, 0);
-        self.row_counter += 1;
-
-        let variables: BTreeSet<Variable> = expressions
-            .iter()
-            .map(|(_, constraint)| constraint.get_free_variables())
-            .fold(BTreeSet::default(), |mut accumulator, mut variables| {
-                accumulator.append(&mut variables);
-                accumulator
-            });
-        assert_eq!(variables.len(), N);
-
-        let substitution: BTreeMap<Variable, Scalar> = variables
-            .into_iter()
-            .zip(inputs.into_iter())
-            .map(|(variable, input)| {
-                let dst_cell = variable.map_to_cell(root_cell);
-                let value = match input.into() {
-                    CellOrUnconstrained::Cell(cell) => self.copy(cell, dst_cell),
-                    CellOrUnconstrained::Unconstrained(value) => {
-                        self.set(dst_cell, value);
-                        value
-                    }
-                };
-                (variable, value)
-            })
-            .collect();
-
-        expressions
-            .iter()
-            .map(|(variable, expression)| {
-                let cell = variable.map_to_cell(root_cell);
-                self.set(cell, expression.evaluate(&substitution));
-                cell
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap()
     }
 
     fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView {
@@ -331,31 +404,33 @@ impl<'a> WitnessSection<'a> {
     }
 }
 
+impl<'a> internal::WitnessViewState for WitnessSection<'a> {
+    fn witness(&self) -> &Witness {
+        self.witness
+    }
+
+    fn witness_mut(&mut self) -> &mut Witness {
+        self.witness
+    }
+
+    fn row_offset(&self) -> usize {
+        self.row_offset
+    }
+
+    fn column_offset(&self) -> usize {
+        self.column_offset
+    }
+
+    fn step_row(&mut self) -> Cell {
+        let root_cell = cell(self.row_counter, 0);
+        self.row_counter += 1;
+        root_cell
+    }
+}
+
 impl<'a> WitnessView for WitnessSection<'a> {
     fn width(&self) -> usize {
         self.width
-    }
-
-    fn get(&self, cell: Cell) -> Scalar {
-        self.witness.get(self.map_cell(cell))
-    }
-
-    fn set(&mut self, cell: Cell, value: Scalar) {
-        self.witness.set(self.map_cell(cell), value);
-    }
-
-    fn copy(&mut self, src_cell: Cell, dst_cell: Cell) -> Scalar {
-        self.witness
-            .copy(self.map_cell(src_cell), self.map_cell(dst_cell))
-    }
-
-    fn auto_set<C: Into<CellOrUnconstrained>, const N: usize, const M: usize>(
-        &mut self,
-        expression: &BTreeMap<Variable, Constraint>,
-        inputs: [C; N],
-    ) -> [Cell; M] {
-        // TODO
-        todo!()
     }
 
     fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView {
