@@ -350,6 +350,7 @@ impl CircuitBuilder {
                 self.num_rows = std::cmp::max(
                     self.num_rows,
                     if rotation < 0 {
+                        assert!(rotation.unsigned_abs() <= row);
                         row - rotation.unsigned_abs()
                     } else {
                         row + rotation.unsigned_abs()

@@ -70,7 +70,10 @@ impl Variable {
     pub const fn map_to_cell(&self, root_cell: Cell) -> Cell {
         Cell::new(
             if self.rotation < 0 {
-                root_cell.row() - self.rotation.unsigned_abs()
+                let row = root_cell.row();
+                let rotation_abs = self.rotation.unsigned_abs();
+                assert!(rotation_abs <= row);
+                row - rotation_abs
             } else {
                 root_cell.row() + self.rotation.unsigned_abs()
             },
