@@ -437,7 +437,24 @@ impl CircuitBuilder {
     }
 
     /// Compiles the circuit built so far into a [`Circuit`] object.
-    pub fn build(self) -> Result<Circuit> {
+    pub fn build(mut self, options: CompilationOptions) -> Result<Circuit> {
+        if options.canonicalize_constraints {
+            let mut old_gates: BTreeMap<Constraint, Vec<Cell>> = BTreeMap::default();
+            std::mem::swap(&mut self.gates, &mut old_gates);
+            for (constraint, mut root_cells) in old_gates {
+                self.gates
+                    .entry(constraint)
+                    .or_default()
+                    .append(&mut root_cells);
+            }
+        } else {
+            for (constraint, _) in &self.gates {
+                if !constraint.is_canonical() {
+                    return Err(anyhow!("constraint `{}` is not canonical", constraint));
+                }
+            }
+        }
+
         let (degree_bound, num_blinding_rows) = padded_circuit_size(
             self.num_rows,
             self.gates.iter().flat_map(|(constraint, _)| {
@@ -1251,7 +1268,10 @@ mod tests {
 
     // This function tests the circuit from Vitalik's PLONK tutorial,
     // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
-    fn test_vitalik_circuit_impl<H: Hash<Scalar>>(blowup_log2: usize) -> Result<()> {
+    fn test_vitalik_circuit_impl<H: Hash<Scalar>>(
+        canonicalize_constraints: bool,
+        blowup_log2: usize,
+    ) -> Result<()> {
         let mut builder = CircuitBuilder::default();
         let [x, square] = builder.auto_gate((var(0) ^ 2) - var(1), []);
         let [result] = builder.auto_gate(
@@ -1260,7 +1280,9 @@ mod tests {
         );
         let [_, result] = builder.add_nop_gate([x.into(), result.into()]);
         builder.declare_public_rows([result.row()]);
-        let circuit = builder.build()?;
+        let circuit = builder.build(CompilationOptions {
+            canonicalize_constraints,
+        })?;
         assert_eq!(circuit.num_rows(), 3);
         assert_eq!(circuit.degree_bound(), 8);
         assert_eq!(circuit.num_columns(), 3);
@@ -1285,32 +1307,38 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_2() {
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 1).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 1).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_2() {
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(1).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 1).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 1).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_4() {
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(2).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 2).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 2).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_4() {
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(2).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 2).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 2).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_8() {
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(3).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 3).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 3).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_8() {
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(3).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 3).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 3).is_ok());
     }
 
     // TODO
