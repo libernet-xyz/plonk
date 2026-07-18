@@ -246,6 +246,25 @@ pub trait WitnessView: internal::WitnessViewState {
         result
     }
 
+    fn nop<C: Copy + Into<CellOrUnconstrained>, const N: usize>(
+        &mut self,
+        inputs: [C; N],
+    ) -> [Cell; N] {
+        let root_cell = self.step_row();
+        std::array::from_fn(|i| {
+            let cell = cell(0, i).remap(root_cell);
+            match inputs[i].into() {
+                CellOrUnconstrained::Cell(input) => {
+                    self.witness_mut().copy_internal(input, cell);
+                }
+                CellOrUnconstrained::Unconstrained(value) => {
+                    self.witness_mut().set_internal(cell, value);
+                }
+            }
+            cell
+        })
+    }
+
     fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView;
 }
 
