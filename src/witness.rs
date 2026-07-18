@@ -268,6 +268,7 @@ pub trait WitnessView: internal::WitnessViewState {
         })
     }
 
+    /// Spawns a child `WitnessView` at the given coordinates.
     fn spawn_at(
         &mut self,
         row_offset: usize,
@@ -805,6 +806,72 @@ mod tests {
         assert_eq!(witness.get(cell(1, 1)), from_const(0));
         assert_eq!(witness.get(cell(2, 0)), from_const(0));
         assert_eq!(witness.get(cell(2, 1)), from_const(0));
+    }
+
+    #[test]
+    fn test_witness_four_rows_three_rotations_1() {
+        let witness = Witness::new(4, 3, [-1, 0, 1]);
+        assert_eq!(witness.num_rows(), 4);
+        assert_eq!(witness.degree_bound(), 8);
+        assert_eq!(witness.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_witness_four_rows_three_rotations_2() {
+        let witness = Witness::new(4, 3, [0, 1, 2]);
+        assert_eq!(witness.num_rows(), 4);
+        assert_eq!(witness.degree_bound(), 8);
+        assert_eq!(witness.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_witness_four_rows_four_rotations_1() {
+        let witness = Witness::new(4, 3, [-1, 0, 1, 2]);
+        assert_eq!(witness.num_rows(), 4);
+        assert_eq!(witness.degree_bound(), 16);
+        assert_eq!(witness.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_witness_four_rows_four_rotations_2() {
+        let witness = Witness::new(4, 3, [-2, -1, 0, 1]);
+        assert_eq!(witness.num_rows(), 4);
+        assert_eq!(witness.degree_bound(), 16);
+        assert_eq!(witness.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_witness_four_rows_five_rotations() {
+        let witness = Witness::new(4, 3, [-2, -1, 0, 1, 2]);
+        assert_eq!(witness.num_rows(), 4);
+        assert_eq!(witness.degree_bound(), 16);
+        assert_eq!(witness.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_update_witness() {
+        let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 1), from_const(42));
+        witness.set(cell(1, 2), from_const(43));
+        assert_eq!(witness.get(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get(cell(0, 1)), from_const(42));
+        assert_eq!(witness.get(cell(0, 2)), from_const(0));
+        assert_eq!(witness.get(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get(cell(1, 1)), from_const(0));
+        assert_eq!(witness.get(cell(1, 2)), from_const(43));
+    }
+
+    #[test]
+    fn test_copy_cell() {
+        let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 1), from_const(44));
+        assert_eq!(witness.copy(cell(0, 1), cell(1, 2)), from_const(44));
+        assert_eq!(witness.get(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get(cell(0, 1)), from_const(44));
+        assert_eq!(witness.get(cell(0, 2)), from_const(0));
+        assert_eq!(witness.get(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get(cell(1, 1)), from_const(0));
+        assert_eq!(witness.get(cell(1, 2)), from_const(44));
     }
 
     // TODO

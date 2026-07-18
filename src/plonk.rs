@@ -289,7 +289,41 @@ pub trait CircuitView: internal::CircuitViewState {
     }
 
     /// Spawns a child `CircuitView` at the given coordinates.
-    fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView;
+    fn spawn_at(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        width: usize,
+    ) -> impl CircuitView;
+
+    fn auto_spawn<'a>(&'a mut self, width: usize, count: usize) -> CircuitViewGenerator<'a>;
+}
+
+#[derive(Debug)]
+pub struct CircuitViewGenerator<'a> {
+    /// Reference to the [`CircuitBuilder`].
+    builder: &'a mut CircuitBuilder,
+
+    /// Row offset where all sub-sections are rooted.
+    row_offset: usize,
+
+    /// Width of each sub-section.
+    width: usize,
+
+    /// Number of sub-sections to generate.
+    count: usize,
+}
+
+impl<'a> CircuitViewGenerator<'a> {
+    pub fn get(&'a mut self, index: usize) -> CircuitSectionBuilder<'a> {
+        assert!(index < self.count);
+        CircuitSectionBuilder::new(
+            self.builder,
+            self.row_offset,
+            self.width * index,
+            self.width,
+        )
+    }
 }
 
 /// Describes an instance of a gate.
@@ -546,14 +580,29 @@ impl CircuitView for CircuitBuilder {
         None
     }
 
-    fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView {
+    fn spawn_at(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        width: usize,
+    ) -> impl CircuitView {
         CircuitSectionBuilder::new(self, row_offset, column_offset, width)
+    }
+
+    fn auto_spawn<'a>(&'a mut self, width: usize, count: usize) -> CircuitViewGenerator<'a> {
+        let row_offset = self.row_counter;
+        CircuitViewGenerator {
+            builder: self,
+            row_offset,
+            width,
+            count,
+        }
     }
 }
 
 /// Implements [`CircuitView`] for a sub-section of the circuit.
 #[derive(Debug)]
-struct CircuitSectionBuilder<'a> {
+pub struct CircuitSectionBuilder<'a> {
     /// Reference to the parent [`CircuitBuilder`].
     builder: &'a mut CircuitBuilder,
 
@@ -616,13 +665,28 @@ impl<'a> CircuitView for CircuitSectionBuilder<'a> {
         Some(self.width)
     }
 
-    fn spawn(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView {
+    fn spawn_at(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        width: usize,
+    ) -> impl CircuitView {
         CircuitSectionBuilder::new(
             self.builder,
             self.row_offset + row_offset,
             self.column_offset + column_offset,
             width,
         )
+    }
+
+    fn auto_spawn<'b>(&'b mut self, width: usize, count: usize) -> CircuitViewGenerator<'b> {
+        let row_offset = self.row_offset + self.row_counter;
+        CircuitViewGenerator {
+            builder: self.builder,
+            row_offset,
+            width,
+            count,
+        }
     }
 }
 
