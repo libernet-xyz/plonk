@@ -414,13 +414,6 @@ impl<'a> WitnessSection<'a> {
             row_counter: 0,
         }
     }
-
-    fn map_cell(&self, cell: Cell) -> Cell {
-        Cell::new(
-            self.row_offset + cell.row(),
-            self.column_offset + cell.column(),
-        )
-    }
 }
 
 impl<'a> internal::WitnessViewState for WitnessSection<'a> {
