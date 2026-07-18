@@ -166,6 +166,9 @@ mod internal {
         /// Returns the next root cell for [setting auto gates](`Witness::auto_set`), advancing the
         /// internal state to the next row.
         fn step_row(&mut self) -> Cell;
+
+        /// Advances the internal row counter by `n`.
+        fn skip_rows(&mut self, n: usize);
     }
 }
 
@@ -190,6 +193,16 @@ pub trait WitnessView: internal::WitnessViewState {
         self.witness_mut().copy_internal(src_cell, dst_cell)
     }
 
+    /// Skips `n` rows, advancing the internal row counter by `n`.
+    ///
+    /// This is the witness counterpart of [`crate::plonk::CircuitView::skip_rows`].
+    fn skip_rows(&mut self, n: usize) {
+        internal::WitnessViewState::skip_rows(self, n);
+    }
+
+    /// Sets witness values for an auto-gate.
+    ///
+    /// This is the witness counterpart of [`crate::plonk::CircuitView::auto_gate`].
     fn auto_set<C: Into<CellOrUnconstrained>, const N: usize, const M: usize>(
         &mut self,
         expressions: &BTreeMap<Variable, Constraint>,
@@ -249,6 +262,9 @@ pub trait WitnessView: internal::WitnessViewState {
         result
     }
 
+    /// Sets witness values for a NOP gate.
+    ///
+    /// This is the witness counterpart of [`crate::plonk::CircuitView::add_nop_gate`].
     fn nop<C: Copy + Into<CellOrUnconstrained>, const N: usize>(
         &mut self,
         inputs: [C; N],
@@ -416,6 +432,10 @@ impl internal::WitnessViewState for Witness {
         self.row_counter += 1;
         root_cell
     }
+
+    fn skip_rows(&mut self, n: usize) {
+        self.row_counter += n;
+    }
 }
 
 impl WitnessView for Witness {
@@ -490,6 +510,10 @@ impl<'a> internal::WitnessViewState for WitnessSection<'a> {
         let root_cell = cell(self.row_counter, 0);
         self.row_counter += 1;
         root_cell
+    }
+
+    fn skip_rows(&mut self, n: usize) {
+        self.row_counter += n;
     }
 }
 

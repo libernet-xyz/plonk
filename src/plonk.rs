@@ -160,6 +160,9 @@ mod internal {
         /// Returns the next root cell where an [auto gate](`CircuitView::auto_gate`) can be placed,
         /// advancing the internal state to the next row.
         fn step_row(&mut self) -> Cell;
+
+        /// Advances the internal row counter by `n`.
+        fn skip_rows(&mut self, n: usize);
     }
 }
 
@@ -183,6 +186,24 @@ pub trait CircuitView: internal::CircuitViewState {
             cell1.map(|cell| cell.remap(root_cell)),
             cell2.map(|cell| cell.remap(root_cell)),
         );
+    }
+
+    /// Skips `n` rows, advancing the internal row counter by `n`.
+    ///
+    /// This is useful between [`Self::auto_gate`] / [`Self::auto_constraint`] calls because it
+    /// allows the caller to place auto-gates at the correct position and satisfy assumptions about
+    /// rotated variables accessed by the gate. For example:
+    ///
+    /// ```ignore
+    /// let [sum] = view.auto_gate(rvar(0, 0) + rvar(0, 1) - rvar(0, 2), [x, y]);
+    /// view.skip_rows(2);
+    /// let [result] = view.auto_constraint(var(0) - 42, [sum.into()]);
+    /// ```
+    ///
+    /// The above circuit proves knowledge of two numbers whose sum is 42, and the `skip_rows` call
+    /// is required because the second gate must be placed three rows after the first.
+    fn skip_rows(&mut self, n: usize) {
+        internal::CircuitViewState::skip_rows(self, n);
     }
 
     /// Adds a gate with `N` inputs and `M` outputs.
@@ -573,6 +594,10 @@ impl internal::CircuitViewState for CircuitBuilder {
         self.row_counter += 1;
         root_cell
     }
+
+    fn skip_rows(&mut self, n: usize) {
+        self.row_counter += n;
+    }
 }
 
 impl CircuitView for CircuitBuilder {
@@ -657,6 +682,10 @@ impl<'a> internal::CircuitViewState for CircuitSectionBuilder<'a> {
         let root_cell = cell(self.row_counter, 0).remap(self.root_cell());
         self.row_counter += 1;
         root_cell
+    }
+
+    fn skip_rows(&mut self, n: usize) {
+        self.row_counter += n;
     }
 }
 
