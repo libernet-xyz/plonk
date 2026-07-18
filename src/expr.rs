@@ -229,16 +229,9 @@ impl Constraint {
                 )
             })
             .filter(|(_, coefficient)| *coefficient != Scalar::ZERO)
-            .for_each(
-                |(variables, coefficient)| match monomials.get_mut(&variables) {
-                    Some(preexisting_coefficient) => {
-                        *preexisting_coefficient += coefficient;
-                    }
-                    None => {
-                        monomials.insert(variables, coefficient);
-                    }
-                },
-            );
+            .for_each(|(variables, coefficient)| {
+                *monomials.entry(variables).or_default() += coefficient;
+            });
         Constraint { monomials }
     }
 
@@ -252,14 +245,7 @@ impl Constraint {
     ) -> BTreeMap<Variable, isize> {
         let mut result = lhs;
         for (variable, exponent) in rhs {
-            match result.get_mut(&variable) {
-                Some(preexisting_exponent) => {
-                    *preexisting_exponent += exponent;
-                }
-                None => {
-                    result.insert(variable, exponent);
-                }
-            }
+            *result.entry(variable).or_default() += exponent;
         }
         result
     }
@@ -361,10 +347,19 @@ impl Constraint {
         Some(value)
     }
 
+    /// If this constraint is a single monomial with a single [`Variable`], this function returns
+    /// that variable; otherwise it returns `None`. The monomial must have unit coefficient and the
+    /// variable must have unit exponent, otherwise `None` is also returned.
     pub fn get_variable(&self) -> Option<Variable> {
         let mut maybe_variable = None;
-        for (variables, _) in &self.monomials {
-            for (variable, _) in variables {
+        for (variables, &coefficient) in &self.monomials {
+            if coefficient != Scalar::ONE {
+                return None;
+            }
+            for (variable, &exponent) in variables {
+                if exponent != 1 {
+                    return None;
+                }
                 if maybe_variable.is_some() {
                     return None;
                 } else {
@@ -590,14 +585,7 @@ impl FromStr for Constraint {
 impl AddAssign for Constraint {
     fn add_assign(&mut self, rhs: Self) {
         for (variables, coefficient) in rhs.monomials {
-            match self.monomials.get_mut(&variables) {
-                Some(preexisting_coefficient) => {
-                    *preexisting_coefficient += coefficient;
-                }
-                None => {
-                    self.monomials.insert(variables, coefficient);
-                }
-            }
+            *self.monomials.entry(variables).or_default() += coefficient;
         }
         self.normalize();
     }
@@ -605,15 +593,7 @@ impl AddAssign for Constraint {
 
 impl AddAssign<Scalar> for Constraint {
     fn add_assign(&mut self, rhs: Scalar) {
-        let variables = BTreeMap::default();
-        match self.monomials.get_mut(&variables) {
-            Some(coefficient) => {
-                *coefficient += rhs;
-            }
-            None => {
-                self.monomials.insert(variables, rhs);
-            }
-        }
+        *self.monomials.entry(BTreeMap::default()).or_default() += rhs;
         self.normalize();
     }
 }
@@ -664,14 +644,7 @@ impl Neg for Constraint {
 impl SubAssign for Constraint {
     fn sub_assign(&mut self, rhs: Self) {
         for (variables, coefficient) in rhs.monomials {
-            match self.monomials.get_mut(&variables) {
-                Some(preexisting_coefficient) => {
-                    *preexisting_coefficient -= coefficient;
-                }
-                None => {
-                    self.monomials.insert(variables, -coefficient);
-                }
-            }
+            *self.monomials.entry(variables).or_default() -= coefficient;
         }
         self.normalize();
     }
@@ -679,15 +652,7 @@ impl SubAssign for Constraint {
 
 impl SubAssign<Scalar> for Constraint {
     fn sub_assign(&mut self, rhs: Scalar) {
-        let variables = BTreeMap::default();
-        match self.monomials.get_mut(&variables) {
-            Some(coefficient) => {
-                *coefficient -= rhs;
-            }
-            None => {
-                self.monomials.insert(variables, -rhs);
-            }
-        }
+        *self.monomials.entry(BTreeMap::default()).or_default() -= rhs;
         self.normalize();
     }
 }
@@ -739,14 +704,7 @@ impl MulAssign for Constraint {
                                 .map(|(&column_index, &exponent)| (column_index, exponent)),
                         );
                         let coefficient = lhs_coefficient * rhs_coefficient;
-                        match monomials.get_mut(&variables) {
-                            Some(preexisting_coefficient) => {
-                                *preexisting_coefficient += coefficient
-                            }
-                            None => {
-                                monomials.insert(variables, coefficient);
-                            }
-                        }
+                        *monomials.entry(variables).or_default() += coefficient;
                     }
                 }
             }

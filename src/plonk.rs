@@ -32,6 +32,27 @@ const FIAT_SHAMIR_INDEX_XI: Scalar = Scalar::from_const(4);
 /// Domain separator tag used for the main Fiat-Shamir challenge.
 static DST: LazyLock<Scalar> = LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge"));
 
+/// Builds the set of all rotations used in a circuit.
+///
+/// NOTE: we're always including 0 and +1 because we need to open xi and xi*omega regardless;
+/// they're needed for the final algebraic check and for the shifted permutation argument,
+/// respectively.
+fn get_rotation_set<'a, I: IntoIterator<Item = &'a Constraint>>(gates: I) -> BTreeSet<isize> {
+    gates
+        .into_iter()
+        .map(|constraint| {
+            constraint
+                .get_free_variables()
+                .iter()
+                .map(Variable::rotation)
+                .collect::<BTreeSet<isize>>()
+                .into_iter()
+        })
+        .flatten()
+        .chain([0, 1])
+        .collect::<BTreeSet<isize>>()
+}
+
 /// Calculates the degree bound of the PLONK quotient, typically much higher than the circuit's
 /// general [degree bound](`Circuit::degree_bound`) `N` because the constraint equations involve
 /// several polynomial multiplications, such as the gate selectors multiplied by the gate
@@ -851,9 +872,14 @@ impl Circuit {
 
         let xi = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_XI);
 
+        let omega_inv = omega.invert_unwrap();
         let (commitment, prover) = committer.commit(BTreeSet::from_iter(
-            [xi, xi * omega]
+            get_rotation_set(self.gates.iter().map(|(constraint, _)| constraint))
                 .into_iter()
+                .map(|rotation| {
+                    xi * if rotation < 0 { omega_inv } else { omega }
+                        .pow_small(rotation.unsigned_abs())
+                })
                 .chain(self.public_rows.iter().map(|&row| omega.pow_small(row))),
         ));
         let inner_proof = prover.prove(&commitment);
@@ -1065,6 +1091,7 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         }
 
         let omega = Polynomial::domain_element2(1, self.degree_bound);
+        let omega_inv = omega.invert_vartime().unwrap();
 
         let xi = H::hash_two(
             *DST,
@@ -1073,15 +1100,16 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         );
 
         let points = inner_proof.points();
-        if !points.contains_key(&xi) {
-            return Err(anyhow!(
-                "the proof doesn't have an opening for the main Fiat-Shamir challenge"
-            ));
-        }
-        if !points.contains_key(&(xi * omega)) {
-            return Err(anyhow!(
-                "the proof doesn't have an opening for the shifted Fiat-Shamir challenge"
-            ));
+        for rotation in get_rotation_set(self.gates.iter().map(|(constraint, _)| constraint)) {
+            let challenge = xi
+                * if rotation < 0 { omega_inv } else { omega }
+                    .pow_small_vartime(rotation.unsigned_abs());
+            if !points.contains_key(&challenge) {
+                return Err(anyhow!(
+                    "the proof doesn't have an opening for the required rotation {}",
+                    rotation
+                ));
+            }
         }
         for &row in &self.public_rows {
             let z = omega.pow_small(row);
@@ -1120,12 +1148,8 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
                             let offset = num_gate_selectors + num_sigma_polynomials;
                             let rotation = variable.rotation();
                             let challenge = xi
-                                * if rotation < 0 {
-                                    omega.invert_vartime().unwrap()
-                                } else {
-                                    omega
-                                }
-                                .pow_small_vartime(rotation.unsigned_abs());
+                                * if rotation < 0 { omega_inv } else { omega }
+                                    .pow_small_vartime(rotation.unsigned_abs());
                             (
                                 variable,
                                 points[&challenge][offset + variable.column_index()],
@@ -1244,8 +1268,7 @@ mod tests {
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 3);
-        witness.set(x, from_const(3));
-        let square = witness.auto_set_one(var(1), var(0) ^ 2, [x]);
+        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3)]);
         let result = witness.auto_set_one(var(2), var(0) * var(1) + var(0) + 5, [x, square]);
         let [x, result] = witness.nop([x, result]);
         let options = ProvingOptions { blowup_log2 };
