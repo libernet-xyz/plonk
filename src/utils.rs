@@ -82,7 +82,7 @@ pub(crate) fn padded_circuit_size<R: IntoIterator<Item = isize>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use starkom_bluesky::parse_scalar;
+    use starkom_bluesky::{from_const, parse_scalar};
 
     #[test]
     fn test_hash_to_scalar() {
@@ -96,5 +96,65 @@ mod tests {
         );
     }
 
-    // TODO
+    #[test]
+    fn test_isize_to_scalar() {
+        assert_eq!(isize_to_scalar(0), from_const(0));
+        assert_eq!(isize_to_scalar(1), from_const(1));
+        assert_eq!(isize_to_scalar(2), from_const(2));
+        assert_eq!(isize_to_scalar(-1), Scalar::MAX);
+        assert_eq!(isize_to_scalar(-2), Scalar::MAX - from_const(1));
+        assert_eq!(isize_to_scalar(-3), Scalar::MAX - from_const(2));
+    }
+
+    #[test]
+    fn test_is_pseudo_negative() {
+        assert!(!is_pseudo_negative(&from_const(0)));
+        assert!(!is_pseudo_negative(&from_const(1)));
+        assert!(!is_pseudo_negative(&from_const(2)));
+        assert!(is_pseudo_negative(&(Scalar::MAX)));
+        assert!(is_pseudo_negative(&(Scalar::MAX - from_const(1))));
+        assert!(is_pseudo_negative(&(Scalar::MAX - from_const(2))));
+        let half_range = Scalar::MAX * Scalar::TWO_INV;
+        assert!(!is_pseudo_negative(&(half_range - from_const(2))));
+        assert!(!is_pseudo_negative(&(half_range - from_const(1))));
+        assert!(!is_pseudo_negative(&(half_range)));
+        assert!(is_pseudo_negative(&(half_range + from_const(1))));
+        assert!(is_pseudo_negative(&(half_range + from_const(2))));
+    }
+
+    #[test]
+    fn test_scalar_to_isize() {
+        assert_eq!(scalar_to_isize(from_const(0)).unwrap(), 0);
+        assert_eq!(scalar_to_isize(from_const(1)).unwrap(), 1);
+        assert_eq!(scalar_to_isize(from_const(2)).unwrap(), 2);
+        assert_eq!(
+            scalar_to_isize(from_const((isize::MAX - 1) as u64)).unwrap(),
+            isize::MAX - 1
+        );
+        assert_eq!(
+            scalar_to_isize(from_const(isize::MAX as u64)).unwrap(),
+            isize::MAX
+        );
+        assert!(scalar_to_isize(from_const(isize::MAX as u64) + from_const(1)).is_err());
+    }
+
+    #[test]
+    fn test_pseudo_negative_scalar_to_isize() {
+        assert_eq!(scalar_to_isize(-from_const(0)).unwrap(), 0);
+        assert_eq!(scalar_to_isize(-from_const(1)).unwrap(), -1);
+        assert_eq!(scalar_to_isize(-from_const(2)).unwrap(), -2);
+        assert_eq!(scalar_to_isize(-from_const(3)).unwrap(), -3);
+        assert_eq!(-isize::MAX, isize::MIN + 1);
+        let min = -from_const(isize::MAX as u64) - from_const(1);
+        assert_eq!(
+            scalar_to_isize(min + from_const(2)).unwrap(),
+            isize::MIN + 2
+        );
+        assert_eq!(
+            scalar_to_isize(min + from_const(1)).unwrap(),
+            isize::MIN + 1
+        );
+        assert_eq!(scalar_to_isize(min).unwrap(), isize::MIN);
+        assert!(scalar_to_isize(min - from_const(1)).is_err());
+    }
 }
