@@ -829,11 +829,25 @@ impl Circuit {
         options: ProvingOptions,
     ) -> Result<Proof<H>> {
         witness.blind();
+        if witness.num_rows() != self.num_rows {
+            return Err(anyhow!(
+                "incorrect witness size (got {} rows, want {})",
+                witness.num_rows(),
+                self.num_rows
+            ));
+        }
         if witness.degree_bound() != self.degree_bound {
             return Err(anyhow!(
-                "incorrect witness size (got {}, want {})",
+                "incorrect witness degree bound (got {}, want {})",
                 witness.degree_bound(),
                 self.degree_bound
+            ));
+        }
+        if witness.num_columns() != self.num_columns {
+            return Err(anyhow!(
+                "incorrect witness size (got {} columns, want {})",
+                witness.num_columns(),
+                self.num_columns
             ));
         }
 
