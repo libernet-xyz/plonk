@@ -443,7 +443,7 @@ impl CircuitBuilder {
             std::mem::swap(&mut self.gates, &mut old_gates);
             for (constraint, mut root_cells) in old_gates {
                 self.gates
-                    .entry(constraint)
+                    .entry(constraint.canonicalize())
                     .or_default()
                     .append(&mut root_cells);
             }
