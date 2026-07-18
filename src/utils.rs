@@ -73,8 +73,9 @@ pub(crate) fn padded_circuit_size<R: IntoIterator<Item = isize>>(
         .into_iter()
         .chain(rotations.into_iter())
         .collect::<BTreeSet<isize>>()
-        .len();
-    let degree_bound = (num_rows + num_blinding_rows + 1).next_power_of_two();
+        .len()
+        + 1;
+    let degree_bound = (num_rows + num_blinding_rows).next_power_of_two();
     (degree_bound, num_blinding_rows)
 }
 

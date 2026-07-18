@@ -1161,8 +1161,9 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             let mut numerator = Scalar::ONE;
             let mut denominator = Scalar::ONE;
             let mut generator_pow = Scalar::ONE;
+            let offset = num_gate_selectors + num_sigma_polynomials;
             for column_index in 0..self.num_columns {
-                let variable = points[&xi][column_index];
+                let variable = points[&xi][offset + column_index];
                 let sigma = sigma[column_index];
                 numerator *= variable + beta * generator_pow * xi + gamma;
                 denominator *= variable + beta * sigma + gamma;
@@ -1205,9 +1206,10 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             .public_rows
             .iter()
             .map(|&row| {
+                let offset = num_gate_selectors + num_sigma_polynomials;
                 (0..self.num_columns).into_iter().map(move |column| {
                     let x = omega.pow_small_vartime(row);
-                    (cell(row, column), points[&x][column])
+                    (cell(row, column), points[&x][offset + column])
                 })
             })
             .flatten()
@@ -1220,6 +1222,7 @@ mod tests {
     use super::*;
     use crate::expr::var;
     use crate::witness::WitnessView;
+    use starkom_bluesky::from_const;
     use starkom_pcs::hash::{Poseidon2Hash, Sha2Hash};
 
     // This function tests the circuit from Vitalik's PLONK tutorial,
@@ -1231,7 +1234,7 @@ mod tests {
             var(0) * var(1) + var(0) + 5 - var(2),
             [x.into(), square.into()],
         );
-        let [result] = builder.add_nop_gate([result.into()]);
+        let [_, result] = builder.add_nop_gate([x.into(), result.into()]);
         builder.declare_public_rows([result.row()]);
         let circuit = builder.build()?;
         assert_eq!(circuit.num_rows(), 3);
@@ -1241,13 +1244,19 @@ mod tests {
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 3);
+        witness.set(x, from_const(3));
         let square = witness.auto_set_one(var(1), var(0) ^ 2, [x]);
         let result = witness.auto_set_one(var(2), var(0) * var(1) + var(0) + 5, [x, square]);
-        let [result] = witness.nop([result]);
+        let [x, result] = witness.nop([x, result]);
         let options = ProvingOptions { blowup_log2 };
-        let proof = circuit.prove::<Sha2Hash<Scalar>>(witness, options.clone())?;
+        let proof = circuit.prove::<H>(witness, options.clone())?;
+        assert_eq!(proof.degree_bound(), 8);
+        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
+        assert_eq!(proof.num_polys(), 13);
         let public_inputs = circuit.verify(&proof, options)?;
-        // TODO
+        assert_eq!(public_inputs[&x], from_const(3));
+        assert_eq!(public_inputs[&result], from_const(35));
         Ok(())
     }
 
