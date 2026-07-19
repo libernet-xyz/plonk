@@ -1386,13 +1386,14 @@ mod tests {
         blowup_log2: usize,
     ) -> Result<()> {
         let mut builder = CircuitBuilder::default();
-        let [x, square] = builder.auto_gate((var(0) ^ 2) - var(1), []);
-        let [result] = builder.auto_gate(
-            var(0) * var(1) + var(0) + 5 - var(2),
-            [x.into(), square.into()],
-        );
-        let [_, result] = builder.add_nop_gate([x.into(), result.into()]);
-        builder.declare_public_rows([result.row()]);
+        builder.add_gate(0, (var(0) ^ 2) - var(1));
+        builder.connect(cell(0, 0).into(), cell(1, 0).into());
+        builder.connect(cell(0, 1).into(), cell(1, 1).into());
+        builder.add_gate(1, var(0) * var(1) + var(0) + 5 - var(2));
+        builder.connect(cell(0, 0).into(), cell(2, 0).into());
+        builder.connect(cell(1, 2).into(), cell(2, 1).into());
+        builder.add_gate(2, Constraint::nop());
+        builder.declare_public_rows([2]);
         let circuit = builder.build(CompilationOptions {
             canonicalize_constraints,
         })?;
@@ -1403,13 +1404,13 @@ mod tests {
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 3);
-        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
-        let result = witness.auto_set_one(
-            var(2),
-            var(0) * var(1) + var(0) + 5,
-            [x.into(), square.into()],
-        );
-        let [x, result] = witness.nop([x.into(), result.into()]);
+        witness.set(cell(0, 0), from_const(3));
+        witness.set(cell(0, 1), from_const(9));
+        witness.set(cell(1, 0), from_const(3));
+        witness.set(cell(1, 1), from_const(9));
+        witness.set(cell(1, 2), from_const(35));
+        witness.set(cell(2, 0), from_const(3));
+        witness.set(cell(2, 1), from_const(35));
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit.prove::<H>(witness, options.clone())?;
         assert_eq!(proof.degree_bound(), 8);
@@ -1417,8 +1418,8 @@ mod tests {
         assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
         assert_eq!(proof.num_polys(), 13);
         let public_inputs = circuit.verify(&proof, options)?;
-        assert_eq!(public_inputs[&x], from_const(3));
-        assert_eq!(public_inputs[&result], from_const(35));
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
         Ok(())
     }
 
@@ -1456,6 +1457,61 @@ mod tests {
     fn test_vitalik_circuit_poseidon2_blowup_8() {
         assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 3).is_ok());
         assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 3).is_ok());
+    }
+
+    // This function tests the circuit from Vitalik's PLONK tutorial,
+    // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
+    fn test_vitalik_circuit_with_auto_gates_impl<H: Hash<Scalar>>(
+        canonicalize_constraints: bool,
+        blowup_log2: usize,
+    ) -> Result<()> {
+        let mut builder = CircuitBuilder::default();
+        let [x, square] = builder.auto_gate((var(0) ^ 2) - var(1), []);
+        let [result] = builder.auto_gate(
+            var(0) * var(1) + var(0) + 5 - var(2),
+            [x.into(), square.into()],
+        );
+        let [_, result] = builder.add_nop_gate([x.into(), result.into()]);
+        builder.declare_public_rows([result.row()]);
+        let circuit = builder.build(CompilationOptions {
+            canonicalize_constraints,
+        })?;
+        assert_eq!(circuit.num_rows(), 3);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 3);
+        let mut witness = circuit.make_witness();
+        assert_eq!(witness.num_rows(), 3);
+        assert_eq!(witness.degree_bound(), 8);
+        assert_eq!(witness.num_columns(), 3);
+        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
+        let result = witness.auto_set_one(
+            var(2),
+            var(0) * var(1) + var(0) + 5,
+            [x.into(), square.into()],
+        );
+        let [x, result] = witness.nop([x.into(), result.into()]);
+        let options = ProvingOptions { blowup_log2 };
+        let proof = circuit.prove::<H>(witness, options.clone())?;
+        assert_eq!(proof.degree_bound(), 8);
+        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
+        assert_eq!(proof.num_polys(), 13);
+        let public_inputs = circuit.verify(&proof, options)?;
+        assert_eq!(public_inputs[&x], from_const(3));
+        assert_eq!(public_inputs[&result], from_const(35));
+        Ok(())
+    }
+
+    #[test]
+    fn test_vitalik_circuit_with_auto_gates_blowup_2() {
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(false, 1).is_ok());
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(true, 1).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_with_auto_gates_blowup_4() {
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(false, 2).is_ok());
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(true, 2).is_ok());
     }
 
     // TODO
