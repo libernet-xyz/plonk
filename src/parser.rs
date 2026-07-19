@@ -1,12 +1,11 @@
-use crate::Constraint;
+use crate::expr::Constraint;
 use crate::lexer::Token;
+use crate::utils::{is_pseudo_negative, scalar_to_isize};
 use anyhow::{Result, anyhow};
-use regex::Regex;
 use starkom_bluesky::Scalar;
-use starkom_ff::{Field, Field256, PrimeField};
-use std::sync::LazyLock;
+use starkom_ff::{Field, Field256};
 
-static REGEX_VARIABLE_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^w(\d+)$").unwrap());
+static WITNESS_FUNCTION_NAME: &'static str = "var";
 
 /// A recursive descent parser for Starkom's expression syntax.
 #[derive(Debug, Clone)]
@@ -45,16 +44,74 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    fn parse_variable(&mut self) -> Result<Constraint> {
+        self.skip_token(Token::LeftBracket)?;
+        let column_index = {
+            let column_index_expression = self.parse_sum()?;
+            match column_index_expression.get_value_if_constant() {
+                Some(column_index) => {
+                    let column_index = scalar_to_isize(column_index)?;
+                    if column_index < 0 {
+                        Err(anyhow!(
+                            "invalid witness column index {}: must be positive",
+                            column_index
+                        ))
+                    } else {
+                        Ok(column_index.unsigned_abs())
+                    }
+                }
+                None => Err(anyhow!(
+                    "invalid column index `{}`: must be a constant",
+                    column_index_expression
+                )),
+            }
+        }?;
+        let rotation = match self.peek_token()? {
+            Token::Comma => {
+                self.next_token();
+                let negative = match self.consume_token()? {
+                    Token::Plus => Ok(false),
+                    Token::Minus => Ok(true),
+                    _ => Err(anyhow!("syntax error")),
+                }?;
+                let rotation = match self.consume_token()? {
+                    Token::Number10(value) => {
+                        if is_pseudo_negative(&value) {
+                            return Err(anyhow!(
+                                "invalid rotation value {}: must be a small number!",
+                                value
+                            ));
+                        }
+                        match scalar_to_isize(value) {
+                            Ok(value) => Ok(value),
+                            Err(_) => Err(anyhow!(
+                                "invalid rotation value {}: must be a small number!",
+                                value
+                            )),
+                        }
+                    }
+                    _ => Err(anyhow!("syntax error")),
+                }?;
+                if negative { -rotation } else { rotation }
+            }
+            _ => 0,
+        };
+        self.skip_token(Token::RightBracket)?;
+        Ok(Constraint::make_var(column_index, rotation))
+    }
+
     fn parse_leaf(&mut self) -> Result<Constraint> {
         match self.consume_token()? {
-            Token::Number(value) => Ok(Constraint::make_const(value)),
-            Token::Variable(label) => match REGEX_VARIABLE_NAME.captures(label.as_str()) {
-                Some(captures) => Ok(Constraint::make_var(captures[1].parse()?)),
-                None => Err(anyhow!(
-                    "invalid witness column name: `{}` -- all columns are named `w` followed by a number, e.g. `w0`, `w1`, `w2`, ...",
-                    label
-                )),
-            },
+            Token::Number2(value) => Ok(Constraint::make_const(value)),
+            Token::Number8(value) => Ok(Constraint::make_const(value)),
+            Token::Number10(value) => Ok(Constraint::make_const(value)),
+            Token::Number16(value) => Ok(Constraint::make_const(value)),
+            Token::Identifier(label) => {
+                if label != WITNESS_FUNCTION_NAME {
+                    return Err(anyhow!("unknown identifier `{}`", label));
+                }
+                self.parse_variable()
+            }
             Token::LeftBracket => {
                 let inner = self.parse_sum()?;
                 self.skip_token(Token::RightBracket)?;
@@ -78,16 +135,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn is_pseudo_negative(value: &Scalar) -> bool {
-        const HALF_RANGE: LazyLock<Scalar> = LazyLock::new(|| Scalar::MAX * Scalar::TWO_INV);
-        *value > *HALF_RANGE
-    }
-
     fn parse_exponent(&mut self) -> Result<isize> {
         match self.parse_unary_expression()?.get_value_if_constant() {
             Some(value) => {
                 const MAX: Scalar = Scalar::from_const(isize::MAX as u64);
-                if Self::is_pseudo_negative(&value) {
+                if is_pseudo_negative(&value) {
                     let abs = (Scalar::MAX - value + Scalar::ONE).try_to_u128().unwrap() as i128;
                     if abs > -(isize::MIN as i128) {
                         Err(anyhow!("exponent {} is out of range", value))
@@ -183,9 +235,9 @@ pub(crate) fn parse(tokens: &[Token]) -> Result<Constraint> {
 
 #[cfg(test)]
 mod tests {
-    use crate::Constraint;
+    use super::*;
+    use crate::expr::{make_const, rvar, var};
     use crate::lexer;
-    use starkom_bluesky::Scalar;
 
     fn parse(s: &'static str) -> Constraint {
         let tokens = lexer::tokenize(s).unwrap();
@@ -197,16 +249,6 @@ mod tests {
         Constraint::nop()
     }
 
-    #[inline]
-    fn make_const(value: u64) -> Constraint {
-        Constraint::make_const(Scalar::from_const(value))
-    }
-
-    #[inline]
-    fn var(column_index: usize) -> Constraint {
-        Constraint::make_var(column_index)
-    }
-
     #[test]
     fn test_constants() {
         assert_eq!(parse("0 == 0"), make_const(0));
@@ -216,116 +258,145 @@ mod tests {
 
     #[test]
     fn test_variables() {
-        assert_eq!(parse("w0 == 0"), var(0));
-        assert_eq!(parse("w1 == 0"), var(1));
-        assert_eq!(parse("w2 == 0"), var(2));
+        assert_eq!(parse("var(0) == 0"), var(0));
+        assert_eq!(parse("var(1) == 0"), var(1));
+        assert_eq!(parse("var(2) == 0"), var(2));
+        assert_eq!(parse("var(12, +0) == 0"), var(12));
+        assert_eq!(parse("var(34, +1) == 0"), rvar(34, 1));
+        assert_eq!(parse("var(56, -1) == 0"), rvar(56, -1));
+        assert_eq!(parse("var(78, +2) == 0"), rvar(78, 2));
+        assert_eq!(parse("var(90, -2) == 0"), rvar(90, -2));
     }
 
     #[test]
     fn test_unary() {
-        assert_eq!(parse("-w0 == 0"), -var(0));
-        assert_eq!(parse("--w0 == 0"), var(0));
-        assert_eq!(parse("---w0 == 0"), -var(0));
-        assert_eq!(parse("+w0 == 0"), var(0));
-        assert_eq!(parse("++w0 == 0"), var(0));
-        assert_eq!(parse("+-w0 == 0"), -var(0));
-        assert_eq!(parse("-+w0 == 0"), -var(0));
-        assert_eq!(parse("-++w0 == 0"), -var(0));
-        assert_eq!(parse("+-+w0 == 0"), -var(0));
-        assert_eq!(parse("++-w0 == 0"), -var(0));
-        assert_eq!(parse("+-+-+w0 == 0"), var(0));
-        assert_eq!(parse("-+-+-w0 == 0"), -var(0));
+        assert_eq!(parse("-var(0) == 0"), -var(0));
+        assert_eq!(parse("--var(0) == 0"), var(0));
+        assert_eq!(parse("---var(0) == 0"), -var(0));
+        assert_eq!(parse("+var(0) == 0"), var(0));
+        assert_eq!(parse("++var(0) == 0"), var(0));
+        assert_eq!(parse("+-var(0) == 0"), -var(0));
+        assert_eq!(parse("-+var(0) == 0"), -var(0));
+        assert_eq!(parse("-++var(0) == 0"), -var(0));
+        assert_eq!(parse("+-+var(0) == 0"), -var(0));
+        assert_eq!(parse("++-var(0) == 0"), -var(0));
+        assert_eq!(parse("+-+-+var(0) == 0"), var(0));
+        assert_eq!(parse("-+-+-var(0) == 0"), -var(0));
     }
 
     #[test]
     fn test_sum() {
-        assert_eq!(parse("w0 + w0 == 0"), var(0) * 2);
-        assert_eq!(parse("w0 + w1 == 0"), var(0) + var(1));
-        assert_eq!(parse("w1 + w0 == 0"), var(0) + var(1));
-        assert_eq!(parse("w0 + 42 == 0"), var(0) + make_const(42));
-        assert_eq!(parse("42 + w0 == 0"), var(0) + make_const(42));
-        assert_eq!(parse("w0 + w1 + w2 == 0"), var(0) + var(1) + var(2));
-        assert_eq!(parse("w2 + w2 + w3 == 0"), var(2) * 2 + var(3));
-        assert_eq!(parse("w3 + w2 + w3 == 0"), var(3) * 2 + var(2));
-        assert_eq!(parse("w4 + w4 + w4 == 0"), var(4) * 3);
+        assert_eq!(parse("var(0) + var(0) == 0"), var(0) * 2);
+        assert_eq!(parse("var(0) + var(1) == 0"), var(0) + var(1));
+        assert_eq!(parse("var(1) + var(0) == 0"), var(0) + var(1));
+        assert_eq!(parse("var(0) + 42 == 0"), var(0) + make_const(42));
+        assert_eq!(parse("42 + var(0) == 0"), var(0) + make_const(42));
+        assert_eq!(
+            parse("var(0) + var(1) + var(2) == 0"),
+            var(0) + var(1) + var(2)
+        );
+        assert_eq!(parse("var(2) + var(2) + var(3) == 0"), var(2) * 2 + var(3));
+        assert_eq!(parse("var(3) + var(2) + var(3) == 0"), var(3) * 2 + var(2));
+        assert_eq!(parse("var(4) + var(4) + var(4) == 0"), var(4) * 3);
     }
 
     #[test]
     fn test_subtraction() {
-        assert_eq!(parse("w0 - w0 == 0"), nop());
-        assert_eq!(parse("w0 - w1 == 0"), var(0) - var(1));
-        assert_eq!(parse("w1 - w0 == 0"), var(1) - var(0));
-        assert_eq!(parse("w0 - 42 == 0"), var(0) - make_const(42));
-        assert_eq!(parse("42 - w0 == 0"), make_const(42) - var(0));
-        assert_eq!(parse("w0 - w1 - w2 == 0"), var(0) - var(1) - var(2));
-        assert_eq!(parse("w2 - w2 - w3 == 0"), -var(3));
-        assert_eq!(parse("w3 - w2 - w3 == 0"), -var(2));
-        assert_eq!(parse("w4 - w4 - w4 == 0"), -var(4));
+        assert_eq!(parse("var(0) - var(0) == 0"), nop());
+        assert_eq!(parse("var(0) - var(1) == 0"), var(0) - var(1));
+        assert_eq!(parse("var(1) - var(0) == 0"), var(1) - var(0));
+        assert_eq!(parse("var(0) - 42 == 0"), var(0) - make_const(42));
+        assert_eq!(parse("42 - var(0) == 0"), make_const(42) - var(0));
+        assert_eq!(
+            parse("var(0) - var(1) - var(2) == 0"),
+            var(0) - var(1) - var(2)
+        );
+        assert_eq!(parse("var(2) - var(2) - var(3) == 0"), -var(3));
+        assert_eq!(parse("var(3) - var(2) - var(3) == 0"), -var(2));
+        assert_eq!(parse("var(4) - var(4) - var(4) == 0"), -var(4));
     }
 
     #[test]
     fn test_product() {
-        assert_eq!(parse("w0 * w0 == 0"), var(0) ^ 2);
-        assert_eq!(parse("w0 * w1 == 0"), var(0) * var(1));
-        assert_eq!(parse("w1 * w0 == 0"), var(0) * var(1));
-        assert_eq!(parse("w0 * 42 == 0"), var(0) * make_const(42));
-        assert_eq!(parse("42 * w0 == 0"), var(0) * make_const(42));
-        assert_eq!(parse("w0 * w1 * w2 == 0"), var(0) * var(1) * var(2));
-        assert_eq!(parse("w2 * w2 * w3 == 0"), (var(2) ^ 2) * var(3));
-        assert_eq!(parse("w3 * w2 * w3 == 0"), (var(3) ^ 2) * var(2));
-        assert_eq!(parse("w4 * w4 * w4 == 0"), var(4) ^ 3);
+        assert_eq!(parse("var(0) * var(0) == 0"), var(0) ^ 2);
+        assert_eq!(parse("var(0) * var(1) == 0"), var(0) * var(1));
+        assert_eq!(parse("var(1) * var(0) == 0"), var(0) * var(1));
+        assert_eq!(parse("var(0) * 42 == 0"), var(0) * make_const(42));
+        assert_eq!(parse("42 * var(0) == 0"), var(0) * make_const(42));
+        assert_eq!(
+            parse("var(0) * var(1) * var(2) == 0"),
+            var(0) * var(1) * var(2)
+        );
+        assert_eq!(
+            parse("var(2) * var(2) * var(3) == 0"),
+            (var(2) ^ 2) * var(3)
+        );
+        assert_eq!(
+            parse("var(3) * var(2) * var(3) == 0"),
+            (var(3) ^ 2) * var(2)
+        );
+        assert_eq!(parse("var(4) * var(4) * var(4) == 0"), var(4) ^ 3);
     }
 
     #[test]
     fn test_power() {
-        assert_eq!(parse("w0 ^ 0 == 0"), make_const(1));
-        assert_eq!(parse("w0 ^ 1 == 0"), var(0));
-        assert_eq!(parse("w0 ^ 2 == 0"), var(0) ^ 2);
-        assert_eq!(parse("w0 ^ +0 == 0"), make_const(1));
-        assert_eq!(parse("w0 ^ +1 == 0"), var(0));
-        assert_eq!(parse("w0 ^ +2 == 0"), var(0) ^ 2);
-        assert_eq!(parse("w0 ^ -0 == 0"), make_const(1));
-        assert_eq!(parse("w0 ^ -1 == 0"), var(0) ^ -1);
-        assert_eq!(parse("w0 ^ -2 == 0"), var(0) ^ -2);
+        assert_eq!(parse("var(0) ^ 0 == 0"), make_const(1));
+        assert_eq!(parse("var(0) ^ 1 == 0"), var(0));
+        assert_eq!(parse("var(0) ^ 2 == 0"), var(0) ^ 2);
+        assert_eq!(parse("var(0) ^ +0 == 0"), make_const(1));
+        assert_eq!(parse("var(0) ^ +1 == 0"), var(0));
+        assert_eq!(parse("var(0) ^ +2 == 0"), var(0) ^ 2);
+        assert_eq!(parse("var(0) ^ -0 == 0"), make_const(1));
+        assert_eq!(parse("var(0) ^ -1 == 0"), var(0) ^ -1);
+        assert_eq!(parse("var(0) ^ -2 == 0"), var(0) ^ -2);
     }
 
     #[test]
     fn test_division() {
-        assert_eq!(parse("w0 / w0 == 0"), make_const(1));
-        assert_eq!(parse("w0 / w1 == 0"), var(0) / var(1));
-        assert_eq!(parse("w1 / w0 == 0"), var(1) / var(0));
-        assert_eq!(parse("w0 / 42 == 0"), var(0) / make_const(42));
-        assert_eq!(parse("42 / w0 == 0"), make_const(42) / var(0));
-        assert_eq!(parse("w0 / w1 / w2 == 0"), var(0) / var(1) / var(2));
-        assert_eq!(parse("w2 / w2 / w3 == 0"), var(3) ^ -1);
-        assert_eq!(parse("w3 / w2 / w3 == 0"), var(2) ^ -1);
-        assert_eq!(parse("w4 / w4 / w4 == 0"), var(4) ^ -1);
+        assert_eq!(parse("var(0) / var(0) == 0"), make_const(1));
+        assert_eq!(parse("var(0) / var(1) == 0"), var(0) / var(1));
+        assert_eq!(parse("var(1) / var(0) == 0"), var(1) / var(0));
+        assert_eq!(parse("var(0) / 42 == 0"), var(0) / make_const(42));
+        assert_eq!(parse("42 / var(0) == 0"), make_const(42) / var(0));
+        assert_eq!(
+            parse("var(0) / var(1) / var(2) == 0"),
+            var(0) / var(1) / var(2)
+        );
+        assert_eq!(parse("var(2) / var(2) / var(3) == 0"), var(3) ^ -1);
+        assert_eq!(parse("var(3) / var(2) / var(3) == 0"), var(2) ^ -1);
+        assert_eq!(parse("var(4) / var(4) / var(4) == 0"), var(4) ^ -1);
     }
 
     #[test]
     fn test_brackets() {
         assert_eq!(parse("(42) == 0"), make_const(42));
-        assert_eq!(parse("(w0) == 0"), var(0));
-        assert_eq!(parse("(w1) == 0"), var(1));
-        assert_eq!(parse("(w1 + w2) == 0"), var(1) + var(2));
-        assert_eq!(parse("(w1 + w2) * w3 == 0"), (var(1) + var(2)) * var(3));
-        assert_eq!(parse("w3 * (w2 + w1) == 0"), (var(1) + var(2)) * var(3));
-        assert_eq!(parse("w0 ^ (36 + 2 * 3) == 0"), var(0) ^ 42);
-        assert_eq!(parse("w0 ^ -(4 - 2) == 0"), var(0) ^ -2);
+        assert_eq!(parse("(var(0)) == 0"), var(0));
+        assert_eq!(parse("(var(1)) == 0"), var(1));
+        assert_eq!(parse("(var(1) + var(2)) == 0"), var(1) + var(2));
+        assert_eq!(
+            parse("(var(1) + var(2)) * var(3) == 0"),
+            (var(1) + var(2)) * var(3)
+        );
+        assert_eq!(
+            parse("var(3) * (var(2) + var(1)) == 0"),
+            (var(1) + var(2)) * var(3)
+        );
+        assert_eq!(parse("var(0) ^ (36 + 2 * 3) == 0"), var(0) ^ 42);
+        assert_eq!(parse("var(0) ^ -(4 - 2) == 0"), var(0) ^ -2);
     }
 
     #[test]
     fn test_equality() {
         assert_eq!(
-            parse("(w0 + w1) * w2 == 42"),
+            parse("(var(0) + var(1)) * var(2) == 42"),
             (var(0) + var(1)) * var(2) - make_const(42)
         );
         assert_eq!(
-            parse("42 == (w0 + w1) * w2"),
+            parse("42 == (var(0) + var(1)) * var(2)"),
             make_const(42) - (var(0) + var(1)) * var(2)
         );
         assert_eq!(
-            parse("42 * w2 ^ -1 == w0 + w1"),
+            parse("42 * var(2) ^ -1 == var(0) + var(1)"),
             make_const(42) * (var(2) ^ -1) - var(0) - var(1)
         );
     }

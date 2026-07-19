@@ -1,15 +1,13 @@
-use crate::Constraint;
-use crate::WireOrUnconstrained;
-use crate::utils;
-use crate::wires::{Wire, WirePartitioner};
+use crate::expr::{Constraint, Variable};
+use crate::utils::{hash_to_scalar, padded_circuit_size};
+use crate::witness::{Cell, Partitioner, Witness, WitnessView, cell};
 use anyhow::{Result, anyhow};
 use starkom_bluesky::Scalar;
-use starkom_ff::Field;
-use starkom_ff::PrimeField;
+use starkom_ff::{Field, PrimeField};
 use starkom_pcs::{self as pcs, hash::Hash};
+use starkom_poly;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
-use std::ops::{Index, IndexMut};
 use std::sync::LazyLock;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
@@ -18,17 +16,6 @@ type Polynomial = starkom_poly::Polynomial<Scalar>;
 ///
 /// Used with the underlying PCS to compute low-degree extensions.
 pub const OPTIONS_DEFAULT_BLOWUP_LOG2: usize = 4;
-
-/// Number of extra rows that are implicitly added to all circuits and witnesses for blinding.
-///
-/// Blinding rows are appended at the end using NOP gates and random scalars in the witness.
-///
-/// The reason why PLONK requires 3 of them is that they must be strictly more than the number of
-/// off-domain locations opened in the underlying polynomial commitment scheme, and PLONK requires
-/// opening two such locations: the Fiat-Shamir challenge xi and the shifted point xi*omega (the
-/// latter is for the coordinate pair accumulator polynomial of the permutation argument, which
-/// contains the witness columns in its definition).
-pub const NUM_BLINDING_ROWS: usize = 3;
 
 const COMMIT_INDEX_CIRCUIT: usize = 0;
 const COMMIT_INDEX_WITNESS: usize = 1;
@@ -43,11 +30,27 @@ const FIAT_SHAMIR_INDEX_DELTA: Scalar = Scalar::from_const(3);
 const FIAT_SHAMIR_INDEX_XI: Scalar = Scalar::from_const(4);
 
 /// Domain separator tag used for the main Fiat-Shamir challenge.
-static DST: LazyLock<Scalar> = LazyLock::new(|| utils::hash_to_scalar(b"starkom/plonk/challenge"));
+static DST: LazyLock<Scalar> = LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge"));
 
-fn padded_size(mut n: usize) -> usize {
-    n += NUM_BLINDING_ROWS;
-    std::cmp::max(2, n.next_power_of_two())
+/// Builds the set of all rotations used in a circuit.
+///
+/// NOTE: we're always including 0 and +1 because we need to open xi and xi*omega regardless;
+/// they're needed for the final algebraic check and for the shifted permutation argument,
+/// respectively.
+fn get_rotation_set<'a, I: IntoIterator<Item = &'a Constraint>>(gates: I) -> BTreeSet<isize> {
+    gates
+        .into_iter()
+        .map(|constraint| {
+            constraint
+                .get_free_variables()
+                .iter()
+                .map(Variable::rotation)
+                .collect::<BTreeSet<isize>>()
+                .into_iter()
+        })
+        .flatten()
+        .chain([0, 1])
+        .collect::<BTreeSet<isize>>()
 }
 
 /// Calculates the degree bound of the PLONK quotient, typically much higher than the circuit's
@@ -82,38 +85,6 @@ fn quotient_degree_bound<'a, I: Iterator<Item = &'a Constraint>>(
         .max()
         .unwrap_or(0);
     (degree_bound - 1) * std::cmp::max(max_gate_degree, num_columns)
-}
-
-/// Convenience function for constructing a [`Constraint`] representing a single variable (witness
-/// column) on the fly.
-#[inline]
-pub fn var(column_index: usize) -> Constraint {
-    Constraint::make_var(column_index)
-}
-
-/// Convenience function for constructing a constant [`Constraint`] expression on the fly.
-///
-/// You actually don't need this function in most cases because [`Constraint`] instances naturally
-/// compose with [`Scalar`]s and integers. For example:
-///
-///   var(0) * 3 + var(1) * Scalar::from_const(5)  // no need for `make_const` here
-///
-/// One case where you do need `make_const` is when your constraint expression _begins_ with a
-/// constant:
-///
-///   make_const(42) + var(0)
-///
-/// In the above example, `42 + var(0)` wouldn't work because integers and [`Scalar`]s can't compose
-/// with [`Constraint`]s.
-#[inline]
-pub fn make_const(value: Scalar) -> Constraint {
-    Constraint::make_const(value)
-}
-
-/// Convenience function for constructing a [`Wire`].
-#[inline]
-pub fn wire(gate: usize, column: usize) -> Wire {
-    Wire::new(gate, column)
 }
 
 /// Circuit compilation & proving options.
@@ -156,100 +127,304 @@ impl Default for ProvingOptions {
     }
 }
 
-/// Allows building PLONK [`Circuit`]s.
-#[derive(Debug, Default, Clone)]
-pub struct CircuitBuilder {
-    /// Current number of gates/rows in the circuit.
-    num_rows: usize,
+mod internal {
+    use super::*;
 
-    /// Current number of columns in the circuit.
-    num_columns: usize,
-
-    /// The gates of the circuit, indexed by constraint.
+    /// Provides access to the internal state of a circuit view.
     ///
-    /// For every gate type (that is, for every unique gate constraint) this map associates the list
-    /// of rows where the gate is active. During circuit compilation (triggered by
-    /// [`Self::build`]) each list of rows will be converted to a Lagrange basis that activates on
-    /// those rows, aka a "selector".
-    gates: BTreeMap<Constraint, Vec<usize>>,
+    /// This is used to implement the provided methods of the [`CircuitView`] trait.
+    pub trait CircuitViewState {
+        /// Returns a reference to the [`CircuitBuilder`].
+        fn builder(&self) -> &CircuitBuilder;
 
-    /// Wire partitioning inferred from the connections made with [`Self::connect`].
-    wires: WirePartitioner,
+        /// Returns a mutable reference to the [`CircuitBuilder`].
+        fn builder_mut(&mut self) -> &mut CircuitBuilder;
 
-    /// List of gates that are revealed in the proofs. Each element is a row index.
-    public_gates: BTreeSet<usize>,
+        /// Returns the row offset of the view (0 for the [`CircuitBuilder`] itself).
+        ///
+        /// This is always an absolute value even for transitive sub-views. It is not relative to
+        /// the parent view.
+        fn row_offset(&self) -> usize;
+
+        /// Returns the column offset of the view (0 for the [`CircuitBuilder`] itself).
+        ///
+        /// This is always an absolute value even for transitive sub-views. It is not relative to
+        /// the parent view.
+        fn column_offset(&self) -> usize;
+
+        /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
+        fn root_cell(&self) -> Cell {
+            cell(self.row_offset(), self.column_offset())
+        }
+
+        /// Returns the next root cell where an [auto gate](`CircuitView::auto_gate`) can be placed,
+        /// advancing the internal state to the next row.
+        fn step_row(&mut self) -> Cell;
+
+        /// Advances the internal row counter by `n`.
+        fn skip_rows(&mut self, n: usize);
+    }
 }
 
-impl CircuitBuilder {
-    /// Adds a gate with the specified [`Constraint`] to the circuit.
+pub trait CircuitView: internal::CircuitViewState {
+    /// Returns the number of columns included in the view.
     ///
-    /// Constraints are polynomial expressions that are implicitly equalled to 0, e.g.
-    /// `w0 ^ 3 + w0 - 30 == 0`. All variables within constraint expressions are named `w` followed
-    /// by a number and represent witness columns: `w0` refers to the 0-th witness column, `w1` to
-    /// the first, and so on.
-    pub fn add_gate(&mut self, constraint: Constraint) -> usize {
-        self.num_columns = std::cmp::max(
-            self.num_columns,
-            1 + constraint
-                .get_free_variables()
-                .into_iter()
-                .max()
-                .unwrap_or(0),
+    /// If this is the root view, that is the raw [`CircuitBuilder`] instance, the width is
+    /// unbounded and `None` is returned.
+    fn width(&self) -> Option<usize>;
+
+    /// Adds a gate to the circuit.
+    fn add_gate(&mut self, row: usize, constraint: Constraint) {
+        let root_cell = cell(row, 0).remap(self.root_cell());
+        self.builder_mut().add_gate_internal(root_cell, constraint);
+    }
+
+    /// "Connects" two circuit [`Cell`]s, meaning they will be constrained to have the same value.
+    fn connect(&mut self, cell1: Option<Cell>, cell2: Option<Cell>) {
+        let root_cell = self.root_cell();
+        self.builder_mut().connect_internal(
+            cell1.map(|cell| cell.remap(root_cell)),
+            cell2.map(|cell| cell.remap(root_cell)),
         );
-        let row = self.num_rows;
-        self.num_rows += 1;
-        match self.gates.get_mut(&constraint) {
-            Some(rows) => {
-                rows.push(row);
-            }
-            None => {
-                self.gates.insert(constraint, vec![row]);
-            }
-        }
-        row
     }
 
-    /// Adds a gate from a parsed constraint expression, panicking if parsing fails.
+    /// Skips `n` rows, advancing the internal row counter by `n`.
     ///
-    /// Equivalent to `builder.add_gate(expr.parse().unwrap())`.
-    pub fn parse_and_add_gate(&mut self, expr: &'static str) -> usize {
-        self.add_gate(expr.parse().unwrap())
-    }
-
-    /// Connects two [`Wire`]s of the circuit.
-    pub fn connect(&mut self, wire1: Option<Wire>, wire2: Option<Wire>) {
-        match (wire1, wire2) {
-            (Some(wire1), Some(wire2)) => {
-                self.wires.connect(wire1, wire2);
-            }
-            _ => {}
-        }
+    /// This is useful between [`Self::auto_gate`] / [`Self::auto_constraint`] calls because it
+    /// allows the caller to place auto-gates at the correct position and satisfy assumptions about
+    /// rotated variables accessed by the gate. For example:
+    ///
+    /// ```ignore
+    /// let [sum] = view.auto_gate(rvar(0, 0) + rvar(0, 1) - rvar(0, 2), [x, y]);
+    /// view.skip_rows(2);
+    /// let [result] = view.auto_constraint(var(0) - 42, [sum.into()]);
+    /// ```
+    ///
+    /// The above circuit proves knowledge of two numbers whose sum is 42, and the `skip_rows` call
+    /// is required because the second gate must be placed three rows after the first.
+    fn skip_rows(&mut self, n: usize) {
+        internal::CircuitViewState::skip_rows(self, n);
     }
 
     /// Adds a gate with `N` inputs and `M` outputs.
     ///
     /// The provided `constraint` must use exactly `N+M` variables, or the function will panic. The
-    /// provided inputs wires are wrapped in `Option`s because `None` means the corresponding input
-    /// wire of the gate must remain unconstrained.
+    /// provided input cells are wrapped in `Option`s because `None` means the corresponding input
+    /// is unconstrained.
     ///
     /// The first `N` variables used in the constraint (those with the lowest column numbers) will
-    /// be automatically connected to the specified input wires unless they're unconstrained / None,
+    /// be automatically connected to the specified `inputs` unless they're unconstrained / None,
     /// while the last `M` variables (those with the highest column numbers) will be returned as
-    /// output wires.
-    pub fn auto_gate<const N: usize, const M: usize>(
+    /// outputs.
+    ///
+    /// NOTE: variables with the same column number but different rotations are considered different
+    /// variables for the purpose of counting against `N` and `M`. For example, the constraint
+    /// `var(0,+1) == var(0,-1) + var(0)` uses three variables, not one. Variables with the same
+    /// column number are ordered by rotation, so for example if you set `N=2` and `M=1` the above
+    /// constraint would associate the 2 inputs to `var(0,-1)` and `var(0)`, and the output to
+    /// `var(0,+1)`.
+    fn auto_gate<const N: usize, const M: usize>(
         &mut self,
         constraint: Constraint,
-        inputs: [Option<Wire>; N],
-    ) -> [Wire; M] {
-        let variables: Vec<usize> = constraint.get_free_variables().into_iter().collect();
+        inputs: [Option<Cell>; N],
+    ) -> [Cell; M] {
+        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
         assert_eq!(variables.len(), N + M);
-        let gate = self.add_gate(constraint);
+
+        let root_cell = self.step_row();
+
         for i in 0..N {
             if let Some(input) = inputs[i] {
-                self.connect(Some(input), Some(wire(gate, variables[i])));
+                self.builder_mut()
+                    .connect_internal(Some(input), Some(variables[i].map_to_cell(root_cell)));
             }
         }
-        std::array::from_fn(|i| wire(gate, variables[N + i]))
+
+        self.builder_mut().add_gate_internal(root_cell, constraint);
+
+        std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
+    }
+
+    /// Adds a gate with `N` terminations.
+    ///
+    /// Unlike [`Self::auto_gate`] this method doesn't make a distinction between input and output
+    /// terminations; it simply enforces a polynomial relation among `N` terminations.
+    ///
+    /// The provided `constraint` must use exactly `N` variables, or the function will panic. The
+    /// provided input cells are wrapped in `Option`s because `None` means the corresponding input
+    /// is unconstrained.
+    ///
+    /// The `N` variables used in the constraint will be automatically connected to the specified
+    /// `inputs` unless they're unconstrained / None.
+    ///
+    /// NOTE: variables with the same column number but different rotations are considered different
+    /// variables for the purpose of counting against `N`. For example, the constraint
+    /// `var(0,+1) == var(0,-1) + var(0)` uses three variables, not one. Variables with the same
+    /// column number are ordered by rotation, so for example the above constraint would associate
+    /// the 3 inputs to `var(0,-1)`, `var(0)`, and `var(0,+1)`, respectively.
+    fn auto_constraint<const N: usize>(
+        &mut self,
+        constraint: Constraint,
+        inputs: [Option<Cell>; N],
+    ) -> [Cell; N] {
+        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
+        assert_eq!(variables.len(), N);
+
+        let root_cell = self.step_row();
+
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.connect(Some(input), Some(variables[i].map_to_cell(root_cell)));
+            }
+        }
+
+        self.builder_mut().add_gate_internal(root_cell, constraint);
+
+        std::array::from_fn(|i| variables[i].map_to_cell(root_cell))
+    }
+
+    /// Adds a NOP gate with `N` terminations; the constraint of the gate is `0 == 0`.
+    ///
+    /// This is conceptually equivalent to calling:
+    ///
+    /// ```ignore
+    /// witness.auto_constraint::<N>(Constraint::nop(), inputs);
+    /// ```
+    ///
+    /// except that the above call wouldn't work because the nop constraint uses 0 variables, so it
+    /// would panic because `0 != N`.
+    fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N] {
+        let root_cell = self.step_row();
+        let outputs = std::array::from_fn(|i| cell(0, i).remap(root_cell));
+
+        for i in 0..N {
+            if let Some(input) = inputs[i] {
+                self.connect(Some(input), Some(outputs[i]));
+            }
+        }
+
+        self.builder_mut()
+            .add_gate_internal(root_cell, Constraint::nop());
+
+        outputs
+    }
+
+    /// Spawns a child `CircuitView` at the given coordinates.
+    fn spawn_at(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        width: usize,
+    ) -> impl CircuitView;
+
+    fn auto_spawn<'a>(&'a mut self, width: usize, count: usize) -> CircuitViewGenerator<'a>;
+}
+
+#[derive(Debug)]
+pub struct CircuitViewGenerator<'a> {
+    /// Reference to the [`CircuitBuilder`].
+    builder: &'a mut CircuitBuilder,
+
+    /// Row offset where all sub-sections are rooted.
+    row_offset: usize,
+
+    /// Width of each sub-section.
+    width: usize,
+
+    /// Number of sub-sections to generate.
+    count: usize,
+}
+
+impl<'a> CircuitViewGenerator<'a> {
+    pub fn get(&'a mut self, index: usize) -> CircuitSectionBuilder<'a> {
+        assert!(index < self.count);
+        CircuitSectionBuilder::new(
+            self.builder,
+            self.row_offset,
+            self.width * index,
+            self.width,
+        )
+    }
+}
+
+/// Describes an instance of a gate.
+///
+/// NOTE: this struct doesn't specify the row of the root cell where the gate was placed because
+/// activating a gate at the correct rows is the gate selector's job. The column of the root cell,
+/// on the other hand, is specified by [`Self::column_index`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GateInstance {
+    /// Column of the root cell where the gate was placed.
+    column_index: usize,
+
+    /// Index of the gate selector polynomial within the [selector pool](`Circuit::selectors`).
+    selector_index: usize,
+}
+
+/// Allows building PLONK [`Circuit`]s.
+#[derive(Debug, Default, Clone)]
+pub struct CircuitBuilder {
+    /// Current number of rows in the circuit.
+    num_rows: usize,
+
+    /// Current number of columns in the circuit.
+    num_columns: usize,
+
+    /// Used by [`Self::auto_gate`] to keep track of the current row;
+    row_counter: usize,
+
+    /// The gates of the circuit, indexed by constraint.
+    ///
+    /// For every gate type (that is, for every unique gate constraint) this map associates the list
+    /// of places where the gate has been instantiated. Such list is represented as an array of
+    /// "root cells", each root cell being the reference cell for the gate instance: the row of the
+    /// root cell corresponds to rotation 0 of all variables referenced by the gate, and the column
+    /// corresponds to the column offset of the [`CircuitView`] used to instantiate the gate.
+    ///
+    /// NOTE: in order to minimize the number of different gate types stored in a circuit, the
+    /// constraints stored in this map are _not_ [remapped](`Constraint::remap_variables`). This map
+    /// basically keeps "raw gate types".
+    gates: BTreeMap<Constraint, Vec<Cell>>,
+
+    /// Cell partitioning inferred from the connections made with [`Self::connect`].
+    partitioner: Partitioner,
+
+    /// List of rows that are revealed in the proofs.
+    public_rows: BTreeSet<usize>,
+}
+
+impl CircuitBuilder {
+    fn add_gate_internal(&mut self, root_cell: Cell, constraint: Constraint) {
+        let row = root_cell.row();
+        let column = root_cell.column();
+        {
+            self.num_rows = std::cmp::max(self.num_rows, row + 1);
+            self.num_columns = std::cmp::max(self.num_columns, column + 1);
+            for variable in constraint.get_free_variables() {
+                let rotation = variable.rotation();
+                self.num_rows = std::cmp::max(
+                    self.num_rows,
+                    if rotation < 0 {
+                        assert!(rotation.unsigned_abs() <= row);
+                        row - rotation.unsigned_abs()
+                    } else {
+                        row + rotation.unsigned_abs()
+                    } + 1,
+                );
+                self.num_columns =
+                    std::cmp::max(self.num_columns, column + variable.column_index() + 1);
+            }
+        }
+        self.gates.entry(constraint).or_default().push(root_cell);
+    }
+
+    fn connect_internal(&mut self, cell1: Option<Cell>, cell2: Option<Cell>) {
+        match (cell1, cell2) {
+            (Some(cell1), Some(cell2)) => {
+                self.partitioner.connect(cell1, cell2);
+            }
+            _ => {}
+        }
     }
 
     /// Updates the list of witness rows that are revealed.
@@ -258,36 +433,96 @@ impl CircuitBuilder {
     /// list provided in the last call is used.
     ///
     /// Ideally you should call this method only once after adding all gates, right before
-    /// [`CircuitBuilder::build`].
-    pub fn declare_public_gates<I: IntoIterator<Item = usize>>(&mut self, gates: I) {
-        self.public_gates = BTreeSet::from_iter(gates);
+    /// [`Self::build`].
+    pub fn declare_public_rows<I: IntoIterator<Item = usize>>(&mut self, gates: I) {
+        self.public_rows = BTreeSet::from_iter(gates);
+    }
+
+    fn make_selector(degree_bound: usize, activation_row_set: BTreeSet<usize>) -> Polynomial {
+        let mut selector_values = vec![Scalar::ZERO; degree_bound];
+        for row in activation_row_set {
+            selector_values[row] = Scalar::ONE;
+        }
+        Polynomial::encode2(selector_values)
+    }
+
+    fn build_gates_and_selectors(
+        &self,
+        degree_bound: usize,
+    ) -> (
+        BTreeMap<Constraint, BTreeSet<GateInstance>>,
+        Vec<Polynomial>,
+    ) {
+        // Keys are (constraint, column_index) pairs; values are activation row sets.
+        let mut row_set_map: BTreeMap<(Constraint, usize), BTreeSet<usize>> = BTreeMap::default();
+        for (constraint, root_cells) in &self.gates {
+            for root_cell in root_cells.as_slice() {
+                let key = (constraint.clone(), root_cell.column());
+                let row = root_cell.row();
+                row_set_map.entry(key).or_default().insert(row);
+            }
+        }
+
+        // Roughly the inverse of `row_set_map`: keys are activation row sets, values are the list
+        // of (constraint, column_index) instances that activate at those rows.
+        let mut gates_by_row_set: BTreeMap<BTreeSet<usize>, Vec<(Constraint, usize)>> =
+            BTreeMap::default();
+        for ((constraint, column_index), row_set) in row_set_map {
+            gates_by_row_set
+                .entry(row_set)
+                .or_default()
+                .push((constraint, column_index));
+        }
+
+        let mut gates: BTreeMap<Constraint, BTreeSet<GateInstance>> = BTreeMap::default();
+        let mut selectors: Vec<Polynomial> = vec![];
+
+        for (selector_index, (activation_row_set, gate_instances)) in
+            gates_by_row_set.into_iter().enumerate()
+        {
+            selectors.push(Self::make_selector(degree_bound, activation_row_set));
+            for (constraint, column_index) in gate_instances {
+                gates.entry(constraint).or_default().insert(GateInstance {
+                    column_index,
+                    selector_index,
+                });
+            }
+        }
+
+        (gates, selectors)
     }
 
     /// Compiles the circuit built so far into a [`Circuit`] object.
-    pub fn build(self, options: CompilationOptions) -> Result<Circuit> {
-        let degree_bound = padded_size(self.num_rows);
-
-        let gates = self
-            .gates
-            .into_iter()
-            .map(|(mut constraint, rows)| {
+    pub fn build(mut self, options: CompilationOptions) -> Result<Circuit> {
+        if options.canonicalize_constraints {
+            let mut old_gates: BTreeMap<Constraint, Vec<Cell>> = BTreeMap::default();
+            std::mem::swap(&mut self.gates, &mut old_gates);
+            for (constraint, mut root_cells) in old_gates {
+                self.gates
+                    .entry(constraint.canonicalize())
+                    .or_default()
+                    .append(&mut root_cells);
+            }
+        } else {
+            for (constraint, _) in &self.gates {
                 if !constraint.is_canonical() {
-                    if options.canonicalize_constraints {
-                        constraint = constraint.canonicalize();
-                    } else {
-                        return Err(anyhow!(
-                            "constraint `{}` is not in canonical form",
-                            constraint
-                        ));
-                    }
+                    return Err(anyhow!("constraint `{}` is not canonical", constraint));
                 }
-                let mut data = vec![Scalar::ZERO; degree_bound];
-                for row in rows {
-                    data[row] = Scalar::ONE;
-                }
-                Ok((constraint, Polynomial::encode2(data)))
-            })
-            .collect::<Result<_>>()?;
+            }
+        }
+
+        let (degree_bound, num_blinding_rows) = padded_circuit_size(
+            self.num_rows,
+            self.gates.iter().flat_map(|(constraint, _)| {
+                constraint
+                    .get_free_variables()
+                    .iter()
+                    .map(Variable::rotation)
+                    .collect::<BTreeSet<isize>>()
+            }),
+        );
+
+        let (gates, selectors) = Self::build_gates_and_selectors(&self, degree_bound);
 
         let sigma_values: Vec<Vec<Scalar>> = {
             let mut sigma = vec![Scalar::ZERO; degree_bound * self.num_columns];
@@ -301,10 +536,10 @@ impl CircuitBuilder {
                 }
                 k *= Scalar::MULTIPLICATIVE_GENERATOR;
             }
-            for node in self.wires.iter_nodes() {
+            for node in self.partitioner.iter_nodes() {
                 let indices: Vec<usize> = node
                     .iter()
-                    .map(|wire| wire.column() * degree_bound + wire.row())
+                    .map(|cell| cell.column() * degree_bound + cell.row())
                     .collect();
                 let mut permuted: Vec<Scalar> = indices.iter().map(|&i| sigma[i]).collect();
                 permuted.rotate_left(1);
@@ -325,161 +560,169 @@ impl CircuitBuilder {
 
         Ok(Circuit {
             num_rows: self.num_rows,
+            num_blinding_rows,
             degree_bound,
             num_columns: self.num_columns,
+            selectors,
             gates,
             sigma,
             sigma_values,
-            public_gates: self.public_gates,
+            public_rows: self.public_rows,
         })
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Witness {
-    /// The number of witness rows *not* including the blinding rows.
-    num_rows: usize,
+impl internal::CircuitViewState for CircuitBuilder {
+    fn builder(&self) -> &CircuitBuilder {
+        self
+    }
 
-    /// Used by [`Self::auto_set`] to identify the row to update.
-    gate_counter: usize,
+    fn builder_mut(&mut self) -> &mut CircuitBuilder {
+        self
+    }
 
-    /// Witness table cells, indexed column-first.
-    ///
-    /// The column-first indexing allows quickly interpolating polynomials for the columns.
-    data: Vec<Vec<Scalar>>,
+    fn row_offset(&self) -> usize {
+        0
+    }
+
+    fn column_offset(&self) -> usize {
+        0
+    }
+
+    fn step_row(&mut self) -> Cell {
+        let root_cell = cell(self.row_counter, 0);
+        self.row_counter += 1;
+        root_cell
+    }
+
+    fn skip_rows(&mut self, n: usize) {
+        self.row_counter += n;
+    }
 }
 
-impl Witness {
-    pub fn num_rows(&self) -> usize {
-        self.num_rows
+impl CircuitView for CircuitBuilder {
+    fn width(&self) -> Option<usize> {
+        None
     }
 
-    pub fn degree_bound(&self) -> usize {
-        padded_size(self.num_rows)
-    }
-
-    pub fn num_columns(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Reads a witness cell.
-    pub fn get(&self, wire: Wire) -> Scalar {
-        let row = wire.row();
-        assert!(row < self.num_rows);
-        self.data[wire.column()][row]
-    }
-
-    /// Updates a witness cell.
-    pub fn set(&mut self, wire: Wire, value: Scalar) {
-        let row = wire.row();
-        assert!(row < self.num_rows);
-        self.data[wire.column()][row] = value;
-    }
-
-    /// Copies a witness cell to another.
-    pub fn copy<W: Into<WireOrUnconstrained>>(&mut self, src_wire: W, dst_wire: Wire) -> Scalar {
-        match src_wire.into() {
-            WireOrUnconstrained::Wire(src_wire) => {
-                let src_row = src_wire.row();
-                let dst_row = dst_wire.row();
-                assert!(src_row < self.num_rows);
-                assert!(dst_row < self.num_rows);
-                let value = self.data[src_wire.column()][src_row];
-                self.data[dst_wire.column()][dst_row] = value;
-                value
-            }
-            WireOrUnconstrained::Unconstrained(src_value) => {
-                let dst_row = dst_wire.row();
-                assert!(dst_row < self.num_rows);
-                self.data[dst_wire.column()][dst_row] = src_value;
-                src_value
-            }
-        }
-    }
-
-    /// Sets output variables in the current witness row to the values computed by the provided
-    /// `expressions`, evaluated in the specified `inputs`.
-    ///
-    /// The "current witness row" is kept track of by `Witness` using an internal counter, and
-    /// requires that the auto-set API is used consistently throughout the entire circuit. Only
-    /// [`Self::auto_set`] and [`Self::auto_set_one`] read and update the internal gate counter, so
-    /// if you mix APIs (i.e. set some cells with `auto_set` and some others with [`Self::set`]) the
-    /// counter will loose track of the current row and the witness will be incorrect.
-    ///
-    /// The generic parameter `N` is the number of input wires while `M` is the number of output
-    /// wires. The number of `expressions` entries MUST be equal to `M`, and the union of the
-    /// [free variables](`Constraint::get_free_variables`) of all expressions MUST have exactly `N`
-    /// elements.
-    pub fn auto_set<W: Into<WireOrUnconstrained>, const N: usize, const M: usize>(
+    fn spawn_at(
         &mut self,
-        expressions: BTreeMap<usize, Constraint>,
-        inputs: [W; N],
-    ) -> [Wire; M] {
-        assert_eq!(expressions.len(), M);
-        let free_variables = expressions
-            .iter()
-            .map(|(_, expression)| expression.get_free_variables())
-            .fold(BTreeSet::default(), |mut accumulator, mut variables| {
-                accumulator.append(&mut variables);
-                accumulator
-            });
-        assert_eq!(free_variables.len(), N);
-        let row_index = self.gate_counter;
-        self.gate_counter += 1;
-        let mut variables = vec![Scalar::ZERO; self.data.len()];
-        for (column_index, input) in free_variables.into_iter().zip(inputs.into_iter()) {
-            let value = match input.into() {
-                WireOrUnconstrained::Wire(wire) => self.data[wire.column()][wire.row()],
-                WireOrUnconstrained::Unconstrained(value) => value,
-            };
-            self.data[column_index][row_index] = value;
-            variables[column_index] = value;
-        }
-        expressions
-            .into_iter()
-            .map(|(column_index, expression)| {
-                self.data[column_index][row_index] = expression.evaluate(variables.as_slice());
-                wire(row_index, column_index)
-            })
-            .collect::<Vec<Wire>>()
-            .try_into()
-            .unwrap()
+        row_offset: usize,
+        column_offset: usize,
+        width: usize,
+    ) -> impl CircuitView {
+        CircuitSectionBuilder::new(self, row_offset, column_offset, width)
     }
 
-    /// Like [`Self::auto_set`], but produces only one output.
-    pub fn auto_set_one<W: Into<WireOrUnconstrained>, const N: usize>(
+    fn auto_spawn<'a>(&'a mut self, width: usize, count: usize) -> CircuitViewGenerator<'a> {
+        let row_offset = self.row_counter;
+        CircuitViewGenerator {
+            builder: self,
+            row_offset,
+            width,
+            count,
+        }
+    }
+}
+
+/// Implements [`CircuitView`] for a sub-section of the circuit.
+#[derive(Debug)]
+pub struct CircuitSectionBuilder<'a> {
+    /// Reference to the parent [`CircuitBuilder`].
+    builder: &'a mut CircuitBuilder,
+
+    /// Row offset of the sub-section.
+    row_offset: usize,
+
+    /// Column offset of the sub-section.
+    column_offset: usize,
+
+    /// Width (number of columns) of the sub-section.
+    width: usize,
+
+    /// Row counter for [`Self::auto_gate`].
+    row_counter: usize,
+}
+
+impl<'a> CircuitSectionBuilder<'a> {
+    fn new(
+        builder: &'a mut CircuitBuilder,
+        row_offset: usize,
+        column_offset: usize,
+        width: usize,
+    ) -> Self {
+        Self {
+            builder,
+            row_offset,
+            column_offset,
+            width,
+            row_counter: 0,
+        }
+    }
+}
+
+impl<'a> internal::CircuitViewState for CircuitSectionBuilder<'a> {
+    fn builder(&self) -> &CircuitBuilder {
+        self.builder
+    }
+
+    fn builder_mut(&mut self) -> &mut CircuitBuilder {
+        self.builder
+    }
+
+    fn row_offset(&self) -> usize {
+        self.row_offset
+    }
+
+    fn column_offset(&self) -> usize {
+        self.column_offset
+    }
+
+    fn step_row(&mut self) -> Cell {
+        let root_cell = cell(self.row_counter, 0).remap(self.root_cell());
+        self.row_counter += 1;
+        root_cell
+    }
+
+    fn skip_rows(&mut self, n: usize) {
+        self.row_counter += n;
+    }
+}
+
+impl<'a> CircuitView for CircuitSectionBuilder<'a> {
+    fn width(&self) -> Option<usize> {
+        Some(self.width)
+    }
+
+    fn spawn_at(
         &mut self,
-        column_index: usize,
-        expression: Constraint,
-        inputs: [W; N],
-    ) -> Wire {
-        let [result] = self.auto_set(BTreeMap::from([(column_index, expression)]), inputs);
-        result
+        row_offset: usize,
+        column_offset: usize,
+        width: usize,
+    ) -> impl CircuitView {
+        CircuitSectionBuilder::new(
+            self.builder,
+            self.row_offset + row_offset,
+            self.column_offset + column_offset,
+            width,
+        )
     }
 
-    /// Adds blinding rows to the polynomial.
-    ///
-    /// This is for internal use, [`Circuit::prove`] calls it automatically.
-    fn blind(&mut self) {
-        for column in &mut self.data {
-            for i in 0..NUM_BLINDING_ROWS {
-                column[self.num_rows + i] = Scalar::random_default();
-            }
+    fn auto_spawn<'b>(&'b mut self, width: usize, count: usize) -> CircuitViewGenerator<'b> {
+        let row_offset = self.row_offset + self.row_counter;
+        CircuitViewGenerator {
+            builder: self.builder,
+            row_offset,
+            width,
+            count,
         }
     }
 }
 
-impl Index<Wire> for Witness {
-    type Output = Scalar;
-
-    fn index(&self, index: Wire) -> &Self::Output {
-        &self.data[index.column()][index.row()]
-    }
-}
-
-impl IndexMut<Wire> for Witness {
-    fn index_mut(&mut self, index: Wire) -> &mut Self::Output {
-        &mut self.data[index.column()][index.row()]
+impl<'a> Drop for CircuitSectionBuilder<'a> {
+    fn drop(&mut self) {
+        self.builder.row_counter =
+            std::cmp::max(self.builder.row_counter, self.row_offset + self.row_counter);
     }
 }
 
@@ -526,16 +769,32 @@ pub struct Circuit {
     /// padded to the next power of 2.
     num_rows: usize,
 
+    /// Number of blinding rows used in the circuit.
+    ///
+    /// This is calculated by [`padded_circuit_size`] and depends on how many different variable
+    /// rotations were used across all constraints.
+    num_blinding_rows: usize,
+
     /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
+    ///
+    /// This is the direct result of [`padded_circuit_size`].
     degree_bound: usize,
 
     /// Number of witness columns.
     num_columns: usize,
 
+    /// Gate selectors.
+    ///
+    /// This is a pool of Lagrange bases that the grand gate constraint uses to selectively activate
+    /// gates at the rows where they're used.
+    ///
+    /// The size of this pool is not (necessarily) the number of rows: [`CircuitBuilder`]'s
+    /// algorithm tries to reuse selectors as much as possible.
+    selectors: Vec<Polynomial>,
+
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
-    /// second component is the selector / Lagrange basis polynomial that activates on the rows
-    /// where that gate was used.
-    gates: Vec<(Constraint, Polynomial)>,
+    /// second component is the set of instances of that gate across the circuit.
+    gates: BTreeMap<Constraint, BTreeSet<GateInstance>>,
 
     /// Sigma polynomials of the permutation argument, one for every witness column.
     sigma: Vec<Polynomial>,
@@ -546,7 +805,7 @@ pub struct Circuit {
     sigma_values: Vec<Vec<Scalar>>,
 
     /// List of gates that are revealed in the proofs. Each element is a row index.
-    public_gates: BTreeSet<usize>,
+    public_rows: BTreeSet<usize>,
 }
 
 impl Circuit {
@@ -562,13 +821,23 @@ impl Circuit {
         self.num_columns
     }
 
+    pub fn public_rows(&self) -> &BTreeSet<usize> {
+        &self.public_rows
+    }
+
     /// Makes an empty [`Witness`] objects suitable for use with this circuit.
     pub fn make_witness(&self) -> Witness {
-        Witness {
-            num_rows: self.num_rows,
-            gate_counter: 0,
-            data: vec![vec![Scalar::ZERO; self.degree_bound]; self.num_columns],
-        }
+        Witness::new(
+            self.num_rows,
+            self.num_columns,
+            self.gates.iter().flat_map(|(constraint, _)| {
+                constraint
+                    .get_free_variables()
+                    .iter()
+                    .map(Variable::rotation)
+                    .collect::<BTreeSet<isize>>()
+            }),
+        )
     }
 
     /// Builds the three polynomials used in the permutation argument. The components of the
@@ -592,11 +861,10 @@ impl Circuit {
                 let mut generator_pow = Scalar::ONE;
                 accumulator[i + 1] = accumulator[i];
                 for j in 0..self.num_columns {
+                    let witness_value = witness.get(cell(i, j));
+                    accumulator[i + 1] *= witness_value + beta * generator_pow * omega_pow + gamma;
                     accumulator[i + 1] *=
-                        witness.data[j][i] + beta * generator_pow * omega_pow + gamma;
-                    accumulator[i + 1] *=
-                        (witness.data[j][i] + beta * self.sigma_values[j][i] + gamma)
-                            .invert_unwrap();
+                        (witness_value + beta * self.sigma_values[j][i] + gamma).invert_unwrap();
                     generator_pow *= Scalar::MULTIPLICATIVE_GENERATOR;
                 }
                 omega_pow *= omega;
@@ -609,15 +877,7 @@ impl Circuit {
             Polynomial::encode2(accumulator)
         };
 
-        let shifted = {
-            let mut coefficients = accumulator.clone().take();
-            let mut x = Scalar::ONE;
-            for coefficient in coefficients.iter_mut() {
-                *coefficient *= x;
-                x *= omega;
-            }
-            Polynomial::with_coefficients(coefficients)
-        };
+        let shifted = accumulator.clone().shift_domain_by(omega);
 
         let recurrence_constraint = {
             let mut lhs = shifted;
@@ -639,7 +899,7 @@ impl Circuit {
         Ok((accumulator, fixpoint_constraint, recurrence_constraint))
     }
 
-    /// Splits the quotient polynomial in chunks so that it can be batch-committed even if its
+    /// Splits the quotient polynomial in chunks so that it can be batch-committed even though its
     /// degree is much higher than the bound configured in the underlying PCS.
     fn split_quotient(&self, quotient: Polynomial) -> Vec<Polynomial> {
         let degree_bound = quotient_degree_bound(
@@ -656,7 +916,7 @@ impl Circuit {
             .collect()
     }
 
-    /// Proves correctness for the given witness, or returns an error in case of a constraint
+    /// Proves correctness of the given witness, or returns an error in case of a constraint
     /// violation.
     pub fn prove<H: Hash<Scalar>>(
         &self,
@@ -664,39 +924,55 @@ impl Circuit {
         options: ProvingOptions,
     ) -> Result<Proof<H>> {
         witness.blind();
+        if witness.num_rows() != self.num_rows {
+            return Err(anyhow!(
+                "incorrect witness size (got {} rows, want {})",
+                witness.num_rows(),
+                self.num_rows
+            ));
+        }
         if witness.degree_bound() != self.degree_bound {
             return Err(anyhow!(
-                "incorrect witness size (got {}, want {})",
+                "incorrect witness degree bound (got {}, want {})",
                 witness.degree_bound(),
                 self.degree_bound
             ));
         }
+        if witness.num_columns() != self.num_columns {
+            return Err(anyhow!(
+                "incorrect witness size (got {} columns, want {})",
+                witness.num_columns(),
+                self.num_columns
+            ));
+        }
 
         let circuit_polynomials = self
-            .gates
+            .selectors
             .iter()
-            .map(|(_, selector)| selector.clone())
+            .cloned()
             .chain(self.sigma.iter().cloned())
             .collect();
 
         let mut committer =
             pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, circuit_polynomials);
 
-        let columns: Vec<Polynomial> = witness
-            .data
-            .iter()
-            .map(|data| Polynomial::encode2(data.clone()))
-            .collect();
-
+        let columns = witness.clone().encode();
         committer.add_batch(columns.clone());
+
+        let omega = Polynomial::domain_element2(1, self.degree_bound);
 
         let gate_constraint = {
             let delta = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_DELTA);
             let mut gate_constraint = Polynomial::default();
             let mut pow = Scalar::ONE;
-            for (constraint, selector) in &self.gates {
-                gate_constraint += selector.clone() * constraint.compose(columns.as_slice()) * pow;
-                pow *= delta;
+            for (constraint, instances) in &self.gates {
+                for instance in instances {
+                    let constraint = constraint.clone().remap_variables(instance.column_index);
+                    let selector = self.selectors[instance.selector_index].clone();
+                    gate_constraint +=
+                        selector * constraint.compose(omega, columns.as_slice()) * pow;
+                    pow *= delta;
+                }
             }
             gate_constraint
         };
@@ -722,12 +998,15 @@ impl Circuit {
 
         let xi = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_XI);
 
-        let omega = Polynomial::domain_element2(1, self.degree_bound);
-
+        let omega_inv = omega.invert_unwrap();
         let (commitment, prover) = committer.commit(BTreeSet::from_iter(
-            [xi, xi * omega]
+            get_rotation_set(self.gates.iter().map(|(constraint, _)| constraint))
                 .into_iter()
-                .chain(self.public_gates.iter().map(|&row| omega.pow_small(row))),
+                .map(|rotation| {
+                    xi * if rotation < 0 { omega_inv } else { omega }
+                        .pow_small(rotation.unsigned_abs())
+                })
+                .chain(self.public_rows.iter().map(|&row| omega.pow_small(row))),
         ));
         let inner_proof = prover.prove(&commitment);
 
@@ -738,50 +1017,65 @@ impl Circuit {
     }
 
     pub fn to_compressed<H: Hash<Scalar>>(self, options: ProvingOptions) -> CompressedCircuit<H> {
-        let (gates, selectors): (Vec<Constraint>, Vec<Polynomial>) = self.gates.into_iter().unzip();
-        let sigma = self.sigma;
         let committer = pcs::Committer::<H>::new(
             self.degree_bound,
             options.blowup_log2,
-            selectors.into_iter().chain(sigma.into_iter()).collect(),
+            self.selectors
+                .into_iter()
+                .chain(self.sigma.into_iter())
+                .collect(),
         );
         CompressedCircuit {
             num_rows: self.num_rows,
+            num_blinding_rows: self.num_blinding_rows,
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
             options,
-            gates,
-            public_gates: self.public_gates,
+            gates: self
+                .gates
+                .into_iter()
+                .map(|(constraint, instances)| (constraint, instances.into_iter().collect()))
+                .collect(),
+            public_rows: self.public_rows,
             circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
             _data: Default::default(),
         }
     }
 
     pub fn as_compressed<H: Hash<Scalar>>(&self, options: ProvingOptions) -> CompressedCircuit<H> {
-        let (gates, selectors): (Vec<Constraint>, Vec<Polynomial>) = self
-            .gates
-            .iter()
-            .map(|(constraint, selector)| (constraint.clone(), selector.clone()))
-            .unzip();
-        let sigma = self.sigma.clone();
         let committer = pcs::Committer::<H>::new(
             self.degree_bound,
             options.blowup_log2,
-            selectors.into_iter().chain(sigma.into_iter()).collect(),
+            self.selectors
+                .iter()
+                .cloned()
+                .chain(self.sigma.iter().cloned())
+                .collect(),
         );
         CompressedCircuit {
             num_rows: self.num_rows,
+            num_blinding_rows: self.num_blinding_rows,
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
             options,
-            gates,
-            public_gates: self.public_gates.clone(),
+            gates: self
+                .gates
+                .iter()
+                .map(|(constraint, instances)| {
+                    (constraint.clone(), instances.iter().cloned().collect())
+                })
+                .collect(),
+            public_rows: self.public_rows.clone(),
             circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
             _data: Default::default(),
         }
     }
 
-    pub fn verify<H: Hash<Scalar>>(&self, proof: &Proof<H>, options: ProvingOptions) -> Result<()> {
+    pub fn verify<H: Hash<Scalar>>(
+        &self,
+        proof: &Proof<H>,
+        options: ProvingOptions,
+    ) -> Result<BTreeMap<Cell, Scalar>> {
         self.as_compressed::<H>(options).verify(proof)
     }
 }
@@ -798,6 +1092,9 @@ pub struct CompressedCircuit<H: Hash<Scalar>> {
     /// padded to the next power of 2.
     num_rows: usize,
 
+    /// Number of blinding rows used in the circuit.
+    num_blinding_rows: usize,
+
     /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
     degree_bound: usize,
 
@@ -808,11 +1105,12 @@ pub struct CompressedCircuit<H: Hash<Scalar>> {
     /// [`Circuit::to_compressed`]).
     options: ProvingOptions,
 
-    /// Gates used in the original circuit.
-    gates: Vec<Constraint>,
+    /// Gates used in the circuit: the first component of each pair is the gate constraint and the
+    /// second component is the set of instances of that gate across the circuit.
+    gates: Vec<(Constraint, Vec<GateInstance>)>,
 
-    /// List of gates that are revealed in the proofs.
-    public_gates: BTreeSet<usize>,
+    /// List of rows that are revealed in the proofs.
+    public_rows: BTreeSet<usize>,
 
     /// Merkle root of the circuit selectors.
     circuit_commitment: Scalar,
@@ -833,12 +1131,20 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         self.num_columns
     }
 
+    pub fn public_rows(&self) -> &BTreeSet<usize> {
+        &self.public_rows
+    }
+
     /// Calculates the number of chunks the quotient was split into.
     ///
     /// See [`quotient_degree_bound`] for details.
     fn get_num_quotient_chunks(&self) -> usize {
-        quotient_degree_bound(self.degree_bound, self.num_columns, self.gates.iter())
-            .div_ceil(self.degree_bound)
+        quotient_degree_bound(
+            self.degree_bound,
+            self.num_columns,
+            self.gates.iter().map(|(constraint, _)| constraint),
+        )
+        .div_ceil(self.degree_bound)
     }
 
     fn lagrange0(x: Scalar, n: usize) -> Scalar {
@@ -846,7 +1152,12 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             * (Scalar::from(n as u64) * (x - Scalar::ONE)).invert_unwrap()
     }
 
-    pub fn verify(&self, proof: &Proof<H>) -> Result<()> {
+    /// Verifies a [`Proof`], returning the map of proven public values if successful or an error
+    /// otherwise.
+    ///
+    /// The returned map will have exactly `N` entries for every row in [`Self::public_rows`], with
+    /// `N` being the [number of columns](`Self::num_columns`).
+    pub fn verify(&self, proof: &Proof<H>) -> Result<BTreeMap<Cell, Scalar>> {
         let commitment = &proof.commitment;
         let inner_proof = &proof.inner_proof;
 
@@ -880,7 +1191,17 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             ));
         }
 
-        let num_gate_selectors = self.gates.len();
+        let num_gate_selectors = self
+            .gates
+            .iter()
+            .map(|(_, gate_instances)| {
+                gate_instances
+                    .iter()
+                    .map(|instance| instance.selector_index)
+            })
+            .flatten()
+            .collect::<BTreeSet<usize>>()
+            .len();
         let num_sigma_polynomials = self.num_columns;
         let num_witness_columns = self.num_columns;
         let num_permutation_accumulator_polynomial = 1usize;
@@ -900,6 +1221,7 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         }
 
         let omega = Polynomial::domain_element2(1, self.degree_bound);
+        let omega_inv = omega.invert_vartime().unwrap();
 
         let xi = H::hash_two(
             *DST,
@@ -908,21 +1230,22 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         );
 
         let points = inner_proof.points();
-        if !points.contains_key(&xi) {
-            return Err(anyhow!(
-                "the proof doesn't have an opening for the main Fiat-Shamir challenge"
-            ));
+        for rotation in get_rotation_set(self.gates.iter().map(|(constraint, _)| constraint)) {
+            let challenge = xi
+                * if rotation < 0 { omega_inv } else { omega }
+                    .pow_small_vartime(rotation.unsigned_abs());
+            if !points.contains_key(&challenge) {
+                return Err(anyhow!(
+                    "the proof doesn't have an opening for the required rotation {}",
+                    rotation
+                ));
+            }
         }
-        if !points.contains_key(&(xi * omega)) {
-            return Err(anyhow!(
-                "the proof doesn't have an opening for the shifted Fiat-Shamir challenge"
-            ));
-        }
-        for &gate in &self.public_gates {
-            let z = omega.pow_small(gate);
+        for &row in &self.public_rows {
+            let z = omega.pow_small(row);
             if !points.contains_key(&z) {
                 return Err(anyhow!(
-                    "the proof doesn't have an opening for public gate {gate}"
+                    "the proof doesn't have an opening for public row {row}"
                 ));
             }
         }
@@ -935,25 +1258,9 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
                 .map(|i| points[&xi][offset + i])
                 .collect()
         };
-        let variables: Vec<Scalar> = {
-            let offset = num_gate_selectors + num_sigma_polynomials;
-            (0..self.num_columns)
-                .map(|i| points[&xi][offset + i])
-                .collect()
-        };
 
         let gate_constraint: Scalar = {
-            let selectors: Vec<Scalar> = self
-                .gates
-                .iter()
-                .enumerate()
-                .map(|(i, _)| points[&xi][i])
-                .collect();
-            let constraints: Vec<Scalar> = self
-                .gates
-                .iter()
-                .map(|constraint| constraint.evaluate(variables.as_slice()))
-                .collect();
+            let selectors: Vec<Scalar> = (0..num_gate_selectors).map(|i| points[&xi][i]).collect();
             let delta = H::hash_two(
                 *DST,
                 commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
@@ -961,9 +1268,29 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             );
             let mut result = Scalar::ZERO;
             let mut pow = Scalar::ONE;
-            for (selector, constraint) in selectors.into_iter().zip(constraints.into_iter()) {
-                result += selector * constraint * pow;
-                pow *= delta;
+            for (constraint, gate_instances) in &self.gates {
+                for instance in gate_instances {
+                    let constraint = constraint.clone().remap_variables(instance.column_index);
+                    let substitution: BTreeMap<Variable, Scalar> = constraint
+                        .get_free_variables()
+                        .into_iter()
+                        .map(|variable| {
+                            let offset = num_gate_selectors + num_sigma_polynomials;
+                            let rotation = variable.rotation();
+                            let challenge = xi
+                                * if rotation < 0 { omega_inv } else { omega }
+                                    .pow_small_vartime(rotation.unsigned_abs());
+                            (
+                                variable,
+                                points[&challenge][offset + variable.column_index()],
+                            )
+                        })
+                        .collect();
+                    result += selectors[instance.selector_index]
+                        * constraint.evaluate(&substitution)
+                        * pow;
+                    pow *= delta;
+                }
             }
             result
         };
@@ -988,7 +1315,10 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             let mut numerator = Scalar::ONE;
             let mut denominator = Scalar::ONE;
             let mut generator_pow = Scalar::ONE;
-            for (&variable, &sigma) in variables.iter().zip(sigma.iter()) {
+            let offset = num_gate_selectors + num_sigma_polynomials;
+            for column_index in 0..self.num_columns {
+                let variable = points[&xi][offset + column_index];
+                let sigma = sigma[column_index];
                 numerator *= variable + beta * generator_pow * xi + gamma;
                 denominator *= variable + beta * sigma + gamma;
                 generator_pow *= Scalar::MULTIPLICATIVE_GENERATOR;
@@ -1026,370 +1356,222 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             return Err(anyhow!("constraint violation"));
         }
 
-        Ok(())
+        Ok(self
+            .public_rows
+            .iter()
+            .map(|&row| {
+                let offset = num_gate_selectors + num_sigma_polynomials;
+                (0..self.num_columns).into_iter().map(move |column| {
+                    let x = omega.pow_small_vartime(row);
+                    (cell(row, column), points[&x][offset + column])
+                })
+            })
+            .flatten()
+            .collect())
     }
-}
-
-/// Represents a reusable PLONK chip that you can use to build circuits.
-pub trait Chip<const I: usize, const O: usize> {
-    fn build(
-        &self,
-        builder: &mut CircuitBuilder,
-        inputs: [Option<Wire>; I],
-    ) -> Result<[Option<Wire>; O]>;
-
-    fn witness(
-        &self,
-        witness: &mut Witness,
-        inputs: [WireOrUnconstrained; I],
-    ) -> Result<[WireOrUnconstrained; O]>;
-}
-
-/// A reusable PLONK chip with a variable number of inputs and outputs.
-///
-/// NOTE: PLONK circuits have a fixed structure, so the number of inputs and outputs must be known
-/// at circuit build time; but this trait doesn't require knowing it when compiling the Rust source.
-pub trait DynamicChip {
-    fn build(
-        &self,
-        builder: &mut CircuitBuilder,
-        inputs: &[Option<Wire>],
-    ) -> Result<Vec<Option<Wire>>>;
-
-    fn witness(
-        &self,
-        witness: &mut Witness,
-        inputs: &[WireOrUnconstrained],
-    ) -> Result<Vec<WireOrUnconstrained>>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::var;
+    use crate::witness::WitnessView;
     use starkom_bluesky::from_const;
     use starkom_pcs::hash::{Poseidon2Hash, Sha2Hash};
 
     // This function tests the circuit from Vitalik's PLONK tutorial,
     // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
-    fn test_vitalik_circuit_impl<H: Hash<Scalar>>(blowup_log2: usize) -> Result<()> {
+    fn test_vitalik_circuit_impl<H: Hash<Scalar>>(
+        canonicalize_constraints: bool,
+        blowup_log2: usize,
+    ) -> Result<()> {
         let mut builder = CircuitBuilder::default();
-        let square = builder.add_gate((var(0) ^ 2) - var(1));
-        let result = builder.add_gate(var(0) * var(1) + var(0) + 5 - var(2));
-        builder.connect(wire(square, 0).into(), wire(result, 0).into());
-        builder.connect(wire(square, 1).into(), wire(result, 1).into());
-        let nop = builder.add_gate(Constraint::default());
-        builder.connect(wire(result, 2).into(), wire(nop, 0).into());
-        builder.declare_public_gates([nop]);
+        builder.add_gate(0, (var(0) ^ 2) - var(1));
+        builder.connect(cell(0, 0).into(), cell(1, 0).into());
+        builder.connect(cell(0, 1).into(), cell(1, 1).into());
+        builder.add_gate(1, var(0) * var(1) + var(0) + 5 - var(2));
+        builder.connect(cell(0, 0).into(), cell(2, 0).into());
+        builder.connect(cell(1, 2).into(), cell(2, 1).into());
+        builder.add_gate(2, Constraint::nop());
+        builder.declare_public_rows([2]);
         let circuit = builder.build(CompilationOptions {
-            canonicalize_constraints: false,
+            canonicalize_constraints,
         })?;
         assert_eq!(circuit.num_rows(), 3);
         assert_eq!(circuit.degree_bound(), 8);
         assert_eq!(circuit.num_columns(), 3);
         let mut witness = circuit.make_witness();
-        let x = from_const(3);
-        witness.set(wire(square, 0), x);
-        witness.set(wire(square, 1), x.square());
-        witness.copy(wire(square, 0), wire(result, 0));
-        witness.copy(wire(square, 1), wire(result, 1));
-        witness.set(wire(result, 2), x.cube() + x + from_const(5));
-        witness.copy(wire(result, 2), wire(nop, 0));
-        let proof = circuit.prove::<H>(witness, ProvingOptions { blowup_log2 })?;
-        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        assert_eq!(witness.num_rows(), 3);
+        assert_eq!(witness.degree_bound(), 8);
+        assert_eq!(witness.num_columns(), 3);
+        witness.set(cell(0, 0), from_const(3));
+        witness.set(cell(0, 1), from_const(9));
+        witness.set(cell(1, 0), from_const(3));
+        witness.set(cell(1, 1), from_const(9));
+        witness.set(cell(1, 2), from_const(35));
+        witness.set(cell(2, 0), from_const(3));
+        witness.set(cell(2, 1), from_const(35));
+        let options = ProvingOptions { blowup_log2 };
+        let proof = circuit.prove::<H>(witness, options.clone())?;
+        assert_eq!(proof.degree_bound(), 8);
         assert_eq!(proof.blowup_log2(), blowup_log2);
-        assert_eq!(
-            proof.extended_domain_size(),
-            circuit.degree_bound() << blowup_log2
-        );
-        circuit.verify::<H>(&proof, ProvingOptions { blowup_log2 })?;
+        assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
+        assert_eq!(proof.num_polys(), 13);
+        let public_inputs = circuit.verify(&proof, options)?;
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
         Ok(())
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_2() {
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(1).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 1).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 1).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_2() {
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(1).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 1).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 1).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_4() {
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(2).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 2).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 2).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_4() {
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(2).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 2).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 2).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_8() {
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(3).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 3).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 3).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_8() {
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(3).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 3).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 3).is_ok());
     }
 
-    const DEFAULT_BLOWUP_LOG2: usize = 1;
-
-    #[test]
-    fn test_vitalik_circuit_with_expressions() {
+    fn test_vitalik_circuit_with_auto_gates_impl<H: Hash<Scalar>>(
+        canonicalize_constraints: bool,
+        blowup_log2: usize,
+    ) -> Result<()> {
         let mut builder = CircuitBuilder::default();
-        let square = builder.parse_and_add_gate("w1 == w0 ^ 2");
-        let result = builder.parse_and_add_gate("w2 == w0 * w1 + w0 + 5");
-        builder.connect(wire(square, 0).into(), wire(result, 0).into());
-        builder.connect(wire(square, 1).into(), wire(result, 1).into());
-        let nop = builder.add_gate(Constraint::nop());
-        builder.connect(wire(result, 2).into(), wire(nop, 0).into());
-        builder.declare_public_gates([nop]);
-        let circuit = builder
-            .build(CompilationOptions {
-                canonicalize_constraints: false,
-            })
-            .unwrap();
-        assert_eq!(circuit.num_rows(), 3);
-        assert_eq!(circuit.degree_bound(), 8);
-        assert_eq!(circuit.num_columns(), 3);
-        let mut witness = circuit.make_witness();
-        let x = from_const(3);
-        witness.set(wire(square, 0), x);
-        witness.set(wire(square, 1), x.square());
-        witness.copy(wire(square, 0), wire(result, 0));
-        witness.copy(wire(square, 1), wire(result, 1));
-        witness.set(wire(result, 2), x.cube() + x + from_const(5));
-        witness.copy(wire(result, 2), wire(nop, 0));
-        let blowup_log2 = DEFAULT_BLOWUP_LOG2;
-        let options = ProvingOptions { blowup_log2 };
-        let proof = circuit
-            .prove::<Sha2Hash<Scalar>>(witness, options.clone())
-            .unwrap();
-        assert_eq!(proof.degree_bound(), circuit.degree_bound());
-        assert_eq!(proof.blowup_log2(), blowup_log2);
-        assert_eq!(
-            proof.extended_domain_size(),
-            circuit.degree_bound() << blowup_log2
-        );
-        assert!(circuit.verify::<Sha2Hash<Scalar>>(&proof, options).is_ok());
-    }
-
-    #[test]
-    fn test_vitalik_circuit_with_auto_gates() {
-        let mut builder = CircuitBuilder::default();
-        let [x, square] = builder.auto_gate("w1 == w0 ^ 2".parse().unwrap(), []);
+        let [x, square] = builder.auto_gate((var(0) ^ 2) - var(1), []);
         let [result] = builder.auto_gate(
-            "w2 == w0 * w1 + w0 + 5".parse().unwrap(),
+            var(0) * var(1) + var(0) + 5 - var(2),
             [x.into(), square.into()],
         );
-        let nop = builder.add_gate(Constraint::nop());
-        builder.connect(result.into(), wire(nop, 0).into());
-        builder.declare_public_gates([nop]);
-        let circuit = builder
-            .build(CompilationOptions {
-                canonicalize_constraints: false,
-            })
-            .unwrap();
+        let [_, result] = builder.add_nop_gate([x.into(), result.into()]);
+        builder.declare_public_rows([result.row()]);
+        let circuit = builder.build(CompilationOptions {
+            canonicalize_constraints,
+        })?;
         assert_eq!(circuit.num_rows(), 3);
         assert_eq!(circuit.degree_bound(), 8);
         assert_eq!(circuit.num_columns(), 3);
         let mut witness = circuit.make_witness();
-        let value = from_const(3);
-        let x = wire(0, 0);
-        witness.set(x, value);
-        let square = witness.auto_set_one(1, var(0) ^ 2, [x]);
-        let result = witness.auto_set_one(2, var(0) * var(1) + var(0) + 5, [x, square]);
-        witness.auto_set_one(0, var(0), [result]);
-        let blowup_log2 = DEFAULT_BLOWUP_LOG2;
-        let options = ProvingOptions { blowup_log2 };
-        let proof = circuit
-            .prove::<Sha2Hash<Scalar>>(witness, options.clone())
-            .unwrap();
-        assert_eq!(proof.degree_bound(), circuit.degree_bound());
-        assert_eq!(proof.blowup_log2(), blowup_log2);
-        assert_eq!(
-            proof.extended_domain_size(),
-            circuit.degree_bound() << blowup_log2
+        assert_eq!(witness.num_rows(), 3);
+        assert_eq!(witness.degree_bound(), 8);
+        assert_eq!(witness.num_columns(), 3);
+        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
+        let result = witness.auto_set_one(
+            var(2),
+            var(0) * var(1) + var(0) + 5,
+            [x.into(), square.into()],
         );
-        assert!(circuit.verify::<Sha2Hash<Scalar>>(&proof, options).is_ok());
-    }
-
-    fn test_vitalik_circuit_with_third_degree_constraint_impl<H: Hash<Scalar>>(blowup_log2: usize) {
-        let mut builder = CircuitBuilder::default();
-        let result = builder.parse_and_add_gate("w1 == w0 ^ 3 + w0 + 5");
-        let nop = builder.add_gate(Constraint::nop());
-        builder.connect(wire(result, 1).into(), wire(nop, 0).into());
-        builder.declare_public_gates([nop]);
-        let circuit = builder
-            .build(CompilationOptions {
-                canonicalize_constraints: false,
-            })
-            .unwrap();
-        assert_eq!(circuit.num_rows(), 2);
-        assert_eq!(circuit.degree_bound(), 8);
-        assert_eq!(circuit.num_columns(), 2);
-        let mut witness = circuit.make_witness();
-        let x = from_const(3);
-        witness.set(wire(result, 0), x);
-        witness.set(wire(result, 1), x.cube() + x + from_const(5));
-        witness.copy(wire(result, 1), wire(nop, 0));
+        let [x, result] = witness.nop([x.into(), result.into()]);
         let options = ProvingOptions { blowup_log2 };
-        let proof = circuit.prove::<H>(witness, options.clone()).unwrap();
-        assert_eq!(proof.degree_bound(), circuit.degree_bound());
+        let proof = circuit.prove::<H>(witness, options.clone())?;
+        assert_eq!(proof.degree_bound(), 8);
         assert_eq!(proof.blowup_log2(), blowup_log2);
-        assert_eq!(
-            proof.extended_domain_size(),
-            circuit.degree_bound() << blowup_log2
-        );
-        assert!(circuit.verify::<H>(&proof, options).is_ok());
+        assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
+        assert_eq!(proof.num_polys(), 13);
+        let public_inputs = circuit.verify(&proof, options)?;
+        assert_eq!(public_inputs[&x], from_const(3));
+        assert_eq!(public_inputs[&result], from_const(35));
+        Ok(())
     }
 
     #[test]
-    fn test_vitalik_circuit_with_third_degree_constraint_sha2_blowup_2() {
-        test_vitalik_circuit_with_third_degree_constraint_impl::<Sha2Hash<Scalar>>(1);
+    fn test_vitalik_circuit_with_auto_gates_blowup_2() {
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(false, 1).is_ok());
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(true, 1).is_ok());
     }
 
     #[test]
-    fn test_vitalik_circuit_with_third_degree_constraint_poseidon2_blowup_2() {
-        test_vitalik_circuit_with_third_degree_constraint_impl::<Poseidon2Hash<Scalar>>(1);
-    }
-
-    #[test]
-    fn test_vitalik_circuit_with_third_degree_constraint_sha2_blowup_4() {
-        test_vitalik_circuit_with_third_degree_constraint_impl::<Sha2Hash<Scalar>>(2);
-    }
-
-    #[test]
-    fn test_vitalik_circuit_with_third_degree_constraint_poseidon2_blowup_4() {
-        test_vitalik_circuit_with_third_degree_constraint_impl::<Poseidon2Hash<Scalar>>(2);
-    }
-
-    #[test]
-    fn test_vitalik_circuit_with_third_degree_constraint_sha2_blowup_8() {
-        test_vitalik_circuit_with_third_degree_constraint_impl::<Sha2Hash<Scalar>>(3);
-    }
-
-    #[test]
-    fn test_vitalik_circuit_with_third_degree_constraint_poseidon2_blowup_8() {
-        test_vitalik_circuit_with_third_degree_constraint_impl::<Poseidon2Hash<Scalar>>(3);
+    fn test_vitalik_circuit_with_auto_gates_blowup_4() {
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(false, 2).is_ok());
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(true, 2).is_ok());
     }
 
     /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
     /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81).
-    fn test_vitalik_circuit_variation_1_impl<H: Hash<Scalar>>(blowup_log2: usize) {
+    fn test_vitalik_circuit_variation_impl<H: Hash<Scalar>>(
+        canonicalize_constraints: bool,
+        blowup_log2: usize,
+    ) -> Result<()> {
         let mut builder = CircuitBuilder::default();
-        let square = builder.parse_and_add_gate("w1 == w0 ^ 2");
-        let mul = builder.parse_and_add_gate("w2 == w0 * w1");
-        builder.connect(wire(square, 0).into(), wire(mul, 0).into());
-        let result = builder.parse_and_add_gate("w3 == w0 * w1 + w2 + 5");
-        builder.connect(wire(square, 0).into(), wire(result, 0).into());
-        builder.connect(wire(square, 1).into(), wire(result, 1).into());
-        builder.connect(wire(mul, 2).into(), wire(result, 2).into());
-        let nop = builder.add_gate(Constraint::nop());
-        builder.connect(wire(result, 3).into(), wire(nop, 0).into());
-        builder.declare_public_gates([nop]);
-        let circuit = builder
-            .build(CompilationOptions {
-                canonicalize_constraints: false,
-            })
-            .unwrap();
+        let [x, square] = builder.auto_gate((var(0) ^ 2) - var(1), []);
+        let [y, mul] = builder.auto_gate(var(0) * var(1) - var(2), [x.into()]);
+        let [result] = builder.auto_gate(
+            var(0) * var(1) + var(2) + 5 - var(3),
+            [x.into(), square.into(), mul.into()],
+        );
+        let [_, _, result] = builder.add_nop_gate([x.into(), y.into(), result.into()]);
+        builder.declare_public_rows([result.row()]);
+        let circuit = builder.build(CompilationOptions {
+            canonicalize_constraints,
+        })?;
         assert_eq!(circuit.num_rows(), 4);
         assert_eq!(circuit.degree_bound(), 8);
         assert_eq!(circuit.num_columns(), 4);
         let mut witness = circuit.make_witness();
-        let x = from_const(3);
-        let y = from_const(4);
-        witness.set(wire(square, 0), x);
-        witness.set(wire(square, 1), x.square());
-        witness.set(wire(mul, 0), x);
-        witness.set(wire(mul, 1), y);
-        witness.set(wire(mul, 2), x * y);
-        witness.copy(wire(square, 0), wire(result, 0));
-        witness.copy(wire(square, 1), wire(result, 1));
-        witness.copy(wire(mul, 2), wire(result, 2));
-        witness.set(wire(result, 3), x.cube() + x * y + Scalar::from_const(5));
-        witness.copy(wire(result, 3), wire(nop, 0));
-        let options = ProvingOptions { blowup_log2 };
-        let proof = circuit.prove::<H>(witness, options.clone()).unwrap();
-        assert_eq!(proof.degree_bound(), circuit.degree_bound());
-        assert_eq!(proof.blowup_log2(), blowup_log2);
-        assert_eq!(
-            proof.extended_domain_size(),
-            circuit.degree_bound() << blowup_log2
+        assert_eq!(witness.num_rows(), 4);
+        assert_eq!(witness.degree_bound(), 8);
+        assert_eq!(witness.num_columns(), 4);
+        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
+        let mul = witness.auto_set_one(
+            var(2),
+            var(0) * var(1),
+            [from_const(3).into(), from_const(4).into()],
         );
-        assert!(circuit.verify::<H>(&proof, options).is_ok());
+        let result = witness.auto_set_one(
+            var(3),
+            var(0) * var(1) + var(2) + 5,
+            [x.into(), square.into(), mul.into()],
+        );
+        let [x, y, result] = witness.nop([x.into(), y.into(), result.into()]);
+        let options = ProvingOptions { blowup_log2 };
+        let proof = circuit.prove::<H>(witness, options.clone())?;
+        assert_eq!(proof.degree_bound(), 8);
+        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
+        assert_eq!(proof.num_polys(), 17);
+        let public_inputs = circuit.verify(&proof, options)?;
+        assert_eq!(public_inputs[&x], from_const(3));
+        assert_eq!(public_inputs[&y], from_const(4));
+        assert_eq!(public_inputs[&result], from_const(44));
+        Ok(())
     }
 
     #[test]
-    fn test_vitalik_circuit_variation_1_sha2_blowup_2() {
-        test_vitalik_circuit_variation_1_impl::<Sha2Hash<Scalar>>(1);
+    fn test_vitalik_circuit_variation_blowup_2() {
+        test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 1).unwrap();
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 1).is_ok());
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 1).is_ok());
     }
 
     #[test]
-    fn test_vitalik_circuit_variation_1_poseidon2_blowup_2() {
-        test_vitalik_circuit_variation_1_impl::<Poseidon2Hash<Scalar>>(1);
-    }
-
-    #[test]
-    fn test_vitalik_circuit_variation_1_sha2_blowup_4() {
-        test_vitalik_circuit_variation_1_impl::<Sha2Hash<Scalar>>(2);
-    }
-
-    #[test]
-    fn test_vitalik_circuit_variation_1_poseidon2_blowup_4() {
-        test_vitalik_circuit_variation_1_impl::<Poseidon2Hash<Scalar>>(2);
-    }
-
-    #[test]
-    fn test_vitalik_circuit_variation_1_sha2_blowup_8() {
-        test_vitalik_circuit_variation_1_impl::<Sha2Hash<Scalar>>(3);
-    }
-
-    #[test]
-    fn test_vitalik_circuit_variation_1_poseidon2_blowup_8() {
-        test_vitalik_circuit_variation_1_impl::<Poseidon2Hash<Scalar>>(3);
-    }
-
-    fn test_wide_circuit_more_columns_than_degree_bound_impl<H: Hash<Scalar>>() {
-        const NUM_COLUMNS: usize = 10;
-
-        let mut builder = CircuitBuilder::default();
-        let mut constraint = Constraint::default();
-        for i in 0..NUM_COLUMNS {
-            constraint += var(i);
-        }
-        let gate = builder.add_gate(constraint);
-        let circuit = builder
-            .build(CompilationOptions {
-                canonicalize_constraints: false,
-            })
-            .unwrap();
-        assert_eq!(circuit.num_rows(), 1);
-        assert_eq!(circuit.num_columns(), NUM_COLUMNS);
-        assert!(circuit.num_columns() > circuit.degree_bound());
-
-        let mut witness = circuit.make_witness();
-        let mut sum = Scalar::ZERO;
-        for i in 0..NUM_COLUMNS - 1 {
-            let value = from_const((i + 1) as u64);
-            witness.set(wire(gate, i), value);
-            sum += value;
-        }
-        witness.set(wire(gate, NUM_COLUMNS - 1), -sum);
-
-        let options = ProvingOptions {
-            blowup_log2: DEFAULT_BLOWUP_LOG2,
-        };
-        let proof = circuit.prove::<H>(witness, options.clone()).unwrap();
-        assert!(circuit.verify::<H>(&proof, options).is_ok());
-    }
-
-    #[test]
-    fn test_wide_circuit_more_columns_than_degree_bound() {
-        test_wide_circuit_more_columns_than_degree_bound_impl::<Sha2Hash<Scalar>>();
-        test_wide_circuit_more_columns_than_degree_bound_impl::<Poseidon2Hash<Scalar>>();
+    fn test_vitalik_circuit_variation_blowup_4() {
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 2).is_ok());
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 2).is_ok());
     }
 }
