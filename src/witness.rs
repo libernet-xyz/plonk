@@ -902,6 +902,30 @@ mod tests {
     }
 
     #[test]
+    fn test_blind() {
+        let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 1), from_const(44));
+        assert_eq!(witness.copy(cell(0, 1), cell(1, 2)), from_const(44));
+        witness.blind();
+        assert_eq!(witness.get(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get(cell(0, 1)), from_const(44));
+        assert_eq!(witness.get(cell(0, 2)), from_const(0));
+        assert_eq!(witness.get(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get(cell(1, 1)), from_const(0));
+        assert_eq!(witness.get(cell(1, 2)), from_const(44));
+        let max = from_const(u64::MAX);
+        assert!(witness.get(cell(2, 0)) > max);
+        assert!(witness.get(cell(2, 1)) > max);
+        assert!(witness.get(cell(2, 2)) > max);
+        assert!(witness.get(cell(3, 0)) > max);
+        assert!(witness.get(cell(3, 1)) > max);
+        assert!(witness.get(cell(3, 2)) > max);
+        assert!(witness.get(cell(4, 0)) > max);
+        assert!(witness.get(cell(4, 1)) > max);
+        assert!(witness.get(cell(4, 2)) > max);
+    }
+
+    #[test]
     fn test_auto_gates() {
         let mut witness = Witness::new(3, 3, DEFAULT_ROTATIONS);
         let x = cell(0, 0);
