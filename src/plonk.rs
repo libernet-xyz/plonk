@@ -760,6 +760,7 @@ impl<H: Hash<Scalar>> Proof<H> {
     }
 }
 
+/// A PLONK circuit.
 #[derive(Debug, Clone)]
 pub struct Circuit {
     /// The raw number of rows of the circuit.
@@ -1079,6 +1080,10 @@ impl Circuit {
     }
 }
 
+/// A PLONK circuit in committed form.
+///
+/// This struct is much smaller than the original circuit but still allows full verification of a
+/// proof for the circuit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompressedCircuit<H: Hash<Scalar>> {
     /// The raw number of rows of the circuit.
@@ -1398,9 +1403,13 @@ mod tests {
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 3);
-        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3)]);
-        let result = witness.auto_set_one(var(2), var(0) * var(1) + var(0) + 5, [x, square]);
-        let [x, result] = witness.nop([x, result]);
+        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
+        let result = witness.auto_set_one(
+            var(2),
+            var(0) * var(1) + var(0) + 5,
+            [x.into(), square.into()],
+        );
+        let [x, result] = witness.nop([x.into(), result.into()]);
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit.prove::<H>(witness, options.clone())?;
         assert_eq!(proof.degree_bound(), 8);

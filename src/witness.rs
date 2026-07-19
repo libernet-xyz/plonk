@@ -203,12 +203,20 @@ pub trait WitnessView: internal::WitnessViewState {
     /// Sets witness values for an auto-gate.
     ///
     /// This is the witness counterpart of [`crate::plonk::CircuitView::auto_gate`].
-    fn auto_set<C: Into<CellOrUnconstrained>, const N: usize, const M: usize>(
+    fn auto_set<const N: usize, const M: usize>(
         &mut self,
-        expressions: &BTreeMap<Variable, Constraint>,
-        inputs: [C; N],
+        expressions: BTreeMap<Constraint, Constraint>,
+        inputs: [CellOrUnconstrained; N],
     ) -> [Cell; M] {
         assert_eq!(expressions.len(), M);
+
+        let expressions: BTreeMap<Variable, Constraint> = expressions
+            .into_iter()
+            .map(|(variable, constraint)| match variable.get_variable() {
+                Some(variable) => (variable, constraint),
+                None => panic!("the keys of the expression set must be single variables"),
+            })
+            .collect();
 
         let root_cell = self.step_row();
 
@@ -249,26 +257,20 @@ pub trait WitnessView: internal::WitnessViewState {
             .unwrap()
     }
 
-    fn auto_set_one<C: Into<CellOrUnconstrained>, const N: usize>(
+    fn auto_set_one<const N: usize>(
         &mut self,
         output: Constraint,
         expression: Constraint,
-        inputs: [C; N],
+        inputs: [CellOrUnconstrained; N],
     ) -> Cell {
-        let [result] = self.auto_set(
-            &BTreeMap::from([(output.get_variable().unwrap(), expression)]),
-            inputs,
-        );
+        let [result] = self.auto_set(BTreeMap::from([(output, expression)]), inputs);
         result
     }
 
     /// Sets witness values for a NOP gate.
     ///
     /// This is the witness counterpart of [`crate::plonk::CircuitView::add_nop_gate`].
-    fn nop<C: Copy + Into<CellOrUnconstrained>, const N: usize>(
-        &mut self,
-        inputs: [C; N],
-    ) -> [Cell; N] {
+    fn nop<const N: usize>(&mut self, inputs: [CellOrUnconstrained; N]) -> [Cell; N] {
         let root_cell = self.step_row();
         std::array::from_fn(|i| {
             let cell = cell(0, i).remap(root_cell);
@@ -557,6 +559,7 @@ impl<'a> Drop for WitnessSection<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::var;
     use starkom_bluesky::from_const;
 
     #[inline]
@@ -898,5 +901,27 @@ mod tests {
         assert_eq!(witness.get(cell(1, 2)), from_const(44));
     }
 
-    // TODO
+    #[test]
+    fn test_auto_gates() {
+        let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
+        let x = cell(0, 0);
+        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
+        let [result] = witness.auto_set(
+            BTreeMap::from([(var(2), var(0) * var(1) + var(0) + 5)]),
+            [x.into(), square.into()],
+        );
+        let [public_result] = witness.nop([result.into()]);
+        assert_eq!(square, cell(0, 1));
+        assert_eq!(result, cell(1, 2));
+        assert_eq!(public_result, cell(2, 0));
+        assert_eq!(witness.get(cell(0, 0)), from_const(3));
+        assert_eq!(witness.get(cell(0, 1)), from_const(9));
+        assert_eq!(witness.get(cell(0, 2)), from_const(0));
+        assert_eq!(witness.get(cell(1, 0)), from_const(3));
+        assert_eq!(witness.get(cell(1, 1)), from_const(9));
+        assert_eq!(witness.get(cell(1, 2)), from_const(35));
+        assert_eq!(witness.get(cell(1, 0)), from_const(35));
+        assert_eq!(witness.get(cell(1, 1)), from_const(0));
+        assert_eq!(witness.get(cell(1, 2)), from_const(0));
+    }
 }
