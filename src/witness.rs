@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn test_auto_gates() {
-        let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(3, 3, DEFAULT_ROTATIONS);
         let x = cell(0, 0);
         let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
         let [result] = witness.auto_set(
@@ -911,6 +911,7 @@ mod tests {
             [x.into(), square.into()],
         );
         let [public_result] = witness.nop([result.into()]);
+        witness.blind();
         assert_eq!(square, cell(0, 1));
         assert_eq!(result, cell(1, 2));
         assert_eq!(public_result, cell(2, 0));
@@ -920,8 +921,18 @@ mod tests {
         assert_eq!(witness.get(cell(1, 0)), from_const(3));
         assert_eq!(witness.get(cell(1, 1)), from_const(9));
         assert_eq!(witness.get(cell(1, 2)), from_const(35));
-        assert_eq!(witness.get(cell(1, 0)), from_const(35));
-        assert_eq!(witness.get(cell(1, 1)), from_const(0));
-        assert_eq!(witness.get(cell(1, 2)), from_const(0));
+        assert_eq!(witness.get(cell(2, 0)), from_const(35));
+        assert_eq!(witness.get(cell(2, 1)), from_const(0));
+        assert_eq!(witness.get(cell(2, 2)), from_const(0));
+        let max = from_const(u64::MAX);
+        assert!(witness.get(cell(3, 0)) > max);
+        assert!(witness.get(cell(3, 1)) > max);
+        assert!(witness.get(cell(3, 2)) > max);
+        assert!(witness.get(cell(4, 0)) > max);
+        assert!(witness.get(cell(4, 1)) > max);
+        assert!(witness.get(cell(4, 2)) > max);
+        assert!(witness.get(cell(5, 0)) > max);
+        assert!(witness.get(cell(5, 1)) > max);
+        assert!(witness.get(cell(5, 2)) > max);
     }
 }
