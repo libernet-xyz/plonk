@@ -2,9 +2,10 @@ use crate::expr::{Constraint, Variable};
 use crate::utils::{hash_to_scalar, padded_circuit_size};
 use crate::witness::{Cell, Partitioner, Witness, WitnessView, cell};
 use anyhow::{Result, anyhow};
+use primitive_types::H256;
 use starkom_bluesky::Scalar;
 use starkom_ff::{Field, PrimeField};
-use starkom_pcs::{self as pcs, hash::Hash};
+use starkom_pcs::{self as pcs, hash::HashBackend};
 use starkom_poly;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
@@ -23,14 +24,16 @@ const COMMIT_INDEX_PERMUTATION_ARGUMENT: usize = 2;
 const COMMIT_INDEX_QUOTIENT: usize = 3;
 const NUM_COMMIT_INDICES: usize = 4;
 
-const FIAT_SHAMIR_INDEX_ALPHA: Scalar = Scalar::from_const(0);
-const FIAT_SHAMIR_INDEX_BETA: Scalar = Scalar::from_const(1);
-const FIAT_SHAMIR_INDEX_GAMMA: Scalar = Scalar::from_const(2);
-const FIAT_SHAMIR_INDEX_DELTA: Scalar = Scalar::from_const(3);
-const FIAT_SHAMIR_INDEX_XI: Scalar = Scalar::from_const(4);
-
-/// Domain separator tag used for the main Fiat-Shamir challenge.
-static DST: LazyLock<Scalar> = LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge"));
+// Domain separator tags used for various Fiat-Shamir challenges.
+static DST_ALPHA: LazyLock<Scalar> =
+    LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge/alpha"));
+static DST_BETA: LazyLock<Scalar> =
+    LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge/beta"));
+static DST_GAMMA: LazyLock<Scalar> =
+    LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge/gamma"));
+static DST_DELTA: LazyLock<Scalar> =
+    LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge/delta"));
+static DST_XI: LazyLock<Scalar> = LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge/xi"));
 
 /// Builds the set of all rotations used in a circuit.
 ///
@@ -730,12 +733,12 @@ impl<'a> Drop for CircuitSectionBuilder<'a> {
 ///
 /// The API in the implementation mostly mirrors that of the underlying PCS proof.
 #[derive(Debug, Clone)]
-pub struct Proof<H: Hash<Scalar>> {
+pub struct Proof<H: HashBackend<Scalar>> {
     commitment: pcs::Commitment<H>,
     inner_proof: pcs::Proof<H>,
 }
 
-impl<H: Hash<Scalar>> Proof<H> {
+impl<H: HashBackend<Scalar>> Proof<H> {
     /// Returns the proven degree bound.
     pub fn degree_bound(&self) -> usize {
         self.inner_proof.degree_bound()
@@ -918,7 +921,7 @@ impl Circuit {
 
     /// Proves correctness of the given witness, or returns an error in case of a constraint
     /// violation.
-    pub fn prove<H: Hash<Scalar>>(
+    pub fn prove<H: HashBackend<Scalar>>(
         &self,
         mut witness: Witness,
         options: ProvingOptions,
@@ -962,7 +965,7 @@ impl Circuit {
         let omega = Polynomial::domain_element2(1, self.degree_bound);
 
         let gate_constraint = {
-            let delta = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_DELTA);
+            let delta = H::challenge(*DST_DELTA, [committer.transcript_hash()]);
             let mut gate_constraint = Polynomial::default();
             let mut pow = Scalar::ONE;
             for (constraint, instances) in &self.gates {
@@ -982,13 +985,13 @@ impl Circuit {
             permutation_fixpoint_constraint,
             permutation_recurrence_constraint,
         ) = {
-            let beta = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_BETA);
-            let gamma = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_GAMMA);
+            let beta = H::challenge(*DST_BETA, [committer.transcript_hash()]);
+            let gamma = H::challenge(*DST_GAMMA, [committer.transcript_hash()]);
             self.build_permutation_argument(&witness, columns.as_slice(), beta, gamma)?
         };
         committer.add_batch(vec![permutation_accumulator]);
 
-        let alpha = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_ALPHA);
+        let alpha = H::challenge(*DST_ALPHA, [committer.transcript_hash()]);
 
         let quotient = (gate_constraint
             + permutation_fixpoint_constraint * alpha
@@ -996,7 +999,7 @@ impl Circuit {
         .divide_by_zero(self.degree_bound)?;
         committer.add_batch(self.split_quotient(quotient));
 
-        let xi = H::hash_two(*DST, committer.transcript_hash(), FIAT_SHAMIR_INDEX_XI);
+        let xi = H::challenge(*DST_XI, [committer.transcript_hash()]);
 
         let omega_inv = omega.invert_unwrap();
         let (commitment, prover) = committer.commit(BTreeSet::from_iter(
@@ -1016,7 +1019,10 @@ impl Circuit {
         })
     }
 
-    pub fn to_compressed<H: Hash<Scalar>>(self, options: ProvingOptions) -> CompressedCircuit<H> {
+    pub fn to_compressed<H: HashBackend<Scalar>>(
+        self,
+        options: ProvingOptions,
+    ) -> CompressedCircuit<H> {
         let committer = pcs::Committer::<H>::new(
             self.degree_bound,
             options.blowup_log2,
@@ -1042,7 +1048,10 @@ impl Circuit {
         }
     }
 
-    pub fn as_compressed<H: Hash<Scalar>>(&self, options: ProvingOptions) -> CompressedCircuit<H> {
+    pub fn as_compressed<H: HashBackend<Scalar>>(
+        &self,
+        options: ProvingOptions,
+    ) -> CompressedCircuit<H> {
         let committer = pcs::Committer::<H>::new(
             self.degree_bound,
             options.blowup_log2,
@@ -1071,7 +1080,7 @@ impl Circuit {
         }
     }
 
-    pub fn verify<H: Hash<Scalar>>(
+    pub fn verify<H: HashBackend<Scalar>>(
         &self,
         proof: &Proof<H>,
         options: ProvingOptions,
@@ -1085,7 +1094,7 @@ impl Circuit {
 /// This struct is much smaller than the original circuit but still allows full verification of a
 /// proof for the circuit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompressedCircuit<H: Hash<Scalar>> {
+pub struct CompressedCircuit<H: HashBackend<Scalar>> {
     /// The raw number of rows of the circuit.
     ///
     /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
@@ -1113,12 +1122,12 @@ pub struct CompressedCircuit<H: Hash<Scalar>> {
     public_rows: BTreeSet<usize>,
 
     /// Merkle root of the circuit selectors.
-    circuit_commitment: Scalar,
+    circuit_commitment: H256,
 
     _data: PhantomData<H>,
 }
 
-impl<H: Hash<Scalar>> CompressedCircuit<H> {
+impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
     pub fn num_rows(&self) -> usize {
         self.num_rows
     }
@@ -1223,10 +1232,9 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         let omega = Polynomial::domain_element2(1, self.degree_bound);
         let omega_inv = omega.invert_vartime().unwrap();
 
-        let xi = H::hash_two(
-            *DST,
-            commitment.transcript_hash(COMMIT_INDEX_QUOTIENT + 1),
-            FIAT_SHAMIR_INDEX_XI,
+        let xi = H::challenge(
+            *DST_XI,
+            [commitment.transcript_hash(COMMIT_INDEX_QUOTIENT + 1)],
         );
 
         let points = inner_proof.points();
@@ -1261,10 +1269,9 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
 
         let gate_constraint: Scalar = {
             let selectors: Vec<Scalar> = (0..num_gate_selectors).map(|i| points[&xi][i]).collect();
-            let delta = H::hash_two(
-                *DST,
-                commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
-                FIAT_SHAMIR_INDEX_DELTA,
+            let delta = H::challenge(
+                *DST_DELTA,
+                [commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
             );
             let mut result = Scalar::ZERO;
             let mut pow = Scalar::ONE;
@@ -1300,15 +1307,13 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
             (points[&xi][offset], points[&(xi * omega)][offset])
         };
 
-        let beta = H::hash_two(
-            *DST,
-            commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
-            FIAT_SHAMIR_INDEX_BETA,
+        let beta = H::challenge(
+            *DST_BETA,
+            [commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
         );
-        let gamma = H::hash_two(
-            *DST,
-            commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1),
-            FIAT_SHAMIR_INDEX_GAMMA,
+        let gamma = H::challenge(
+            *DST_GAMMA,
+            [commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
         );
 
         let (permutation_numerator, permutation_denominator) = {
@@ -1337,10 +1342,9 @@ impl<H: Hash<Scalar>> CompressedCircuit<H> {
         };
         let zero = xi.pow_small(self.degree_bound) - Scalar::ONE;
 
-        let alpha = H::hash_two(
-            *DST,
-            commitment.transcript_hash(COMMIT_INDEX_PERMUTATION_ARGUMENT + 1),
-            FIAT_SHAMIR_INDEX_ALPHA,
+        let alpha = H::challenge(
+            *DST_ALPHA,
+            [commitment.transcript_hash(COMMIT_INDEX_PERMUTATION_ARGUMENT + 1)],
         );
 
         let permutation_recurrence_constraint = shifted_permutation_accumulator
@@ -1381,7 +1385,7 @@ mod tests {
 
     // This function tests the circuit from Vitalik's PLONK tutorial,
     // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
-    fn test_vitalik_circuit_impl<H: Hash<Scalar>>(
+    fn test_vitalik_circuit_impl<H: HashBackend<Scalar>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
     ) -> Result<()> {
@@ -1459,7 +1463,7 @@ mod tests {
         assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 3).is_ok());
     }
 
-    fn test_vitalik_circuit_with_auto_gates_impl<H: Hash<Scalar>>(
+    fn test_vitalik_circuit_with_auto_gates_impl<H: HashBackend<Scalar>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
     ) -> Result<()> {
@@ -1514,7 +1518,7 @@ mod tests {
 
     /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
     /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81).
-    fn test_vitalik_circuit_variation_impl<H: Hash<Scalar>>(
+    fn test_vitalik_circuit_variation_impl<H: HashBackend<Scalar>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
     ) -> Result<()> {
