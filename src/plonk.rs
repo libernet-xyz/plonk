@@ -176,6 +176,18 @@ pub trait CircuitView: internal::CircuitViewState {
     /// unbounded and `None` is returned.
     fn width(&self) -> Option<usize>;
 
+    /// Creates a [`Cell`] relative to this view.
+    ///
+    /// For example, if this view is at row offset 3 and column offset 5, then `cell(6, 2)` will
+    /// return the cell at row 9 and column 7.
+    fn cell(&self, row_offset: isize, column_offset: isize) -> Cell {
+        let row = self.row_offset() as isize + row_offset;
+        let column = self.column_offset() as isize + column_offset;
+        debug_assert!(row >= 0);
+        debug_assert!(column >= 0);
+        Cell::new(row as usize, column as usize)
+    }
+
     /// Adds a gate to the circuit.
     fn add_gate(&mut self, row: usize, constraint: Constraint) {
         let root_cell = cell(row, 0).remap(self.root_cell());
