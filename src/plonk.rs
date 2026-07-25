@@ -1,6 +1,6 @@
 use crate::expr::{Constraint, Variable};
 use crate::utils::{hash_to_scalar, padded_circuit_size};
-use crate::witness::{Cell, Partitioner, Witness, WitnessView, cell};
+use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView, cell};
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
 use starkom_bluesky::Scalar;
@@ -180,9 +180,9 @@ pub trait CircuitView: internal::CircuitViewState {
     ///
     /// For example, if this view is at row offset 3 and column offset 5, then `cell(6, 2)` will
     /// return the cell at row 9 and column 7.
-    fn cell(&self, row_offset: isize, column_offset: isize) -> Cell {
-        let row = self.row_offset() as isize + row_offset;
-        let column = self.column_offset() as isize + column_offset;
+    fn cell(&self, row_offset: impl CellOffset, column_offset: impl CellOffset) -> Cell {
+        let row = self.row_offset() as isize + row_offset.into_offset();
+        let column = self.column_offset() as isize + column_offset.into_offset();
         debug_assert!(row >= 0);
         debug_assert!(column >= 0);
         Cell::new(row as usize, column as usize)
