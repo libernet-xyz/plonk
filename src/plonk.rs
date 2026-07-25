@@ -1,6 +1,6 @@
 use crate::expr::{Constraint, Variable};
 use crate::utils::{hash_to_scalar, padded_circuit_size};
-use crate::witness::{Cell, Partitioner, Witness, WitnessView, cell};
+use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView, cell};
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
 use starkom_bluesky::Scalar;
@@ -180,9 +180,9 @@ pub trait CircuitView: internal::CircuitViewState {
     ///
     /// For example, if this view is at row offset 3 and column offset 5, then `cell(6, 2)` will
     /// return the cell at row 9 and column 7.
-    fn cell(&self, row_offset: isize, column_offset: isize) -> Cell {
-        let row = self.row_offset() as isize + row_offset;
-        let column = self.column_offset() as isize + column_offset;
+    fn cell(&self, row_offset: impl CellOffset, column_offset: impl CellOffset) -> Cell {
+        let row = self.row_offset() as isize + row_offset.into_offset();
+        let column = self.column_offset() as isize + column_offset.into_offset();
         debug_assert!(row >= 0);
         debug_assert!(column >= 0);
         Cell::new(row as usize, column as usize)
@@ -1720,5 +1720,91 @@ mod tests {
     fn test_vitalik_circuit_variation_blowup_4() {
         assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 2).is_ok());
         assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 2).is_ok());
+    }
+
+    fn build_vitalik_circuit() -> Circuit {
+        let mut builder = CircuitBuilder::default();
+        builder.add_gate(0, (var(0) ^ 2) - var(1));
+        builder.connect(cell(0, 0).into(), cell(1, 0).into());
+        builder.connect(cell(0, 1).into(), cell(1, 1).into());
+        builder.add_gate(1, var(0) * var(1) + var(0) + 5 - var(2));
+        builder.connect(cell(0, 0).into(), cell(2, 0).into());
+        builder.connect(cell(1, 2).into(), cell(2, 1).into());
+        builder.add_gate(2, Constraint::nop());
+        builder.declare_public_rows([2]);
+        builder
+            .build(CompilationOptions {
+                canonicalize_constraints: false,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn test_check_witness_detects_wrong_number_of_rows() {
+        let circuit = build_vitalik_circuit();
+        let witness = Witness::new(4, 3, [0, 1]);
+        let error = circuit.check_witness(&witness).unwrap_err();
+        assert!(error.to_string().contains("wrong number of rows"));
+    }
+
+    #[test]
+    fn test_check_witness_detects_wrong_number_of_columns() {
+        let circuit = build_vitalik_circuit();
+        let witness = Witness::new(3, 4, [0, 1]);
+        let error = circuit.check_witness(&witness).unwrap_err();
+        assert!(error.to_string().contains("wrong number of columns"));
+    }
+
+    #[test]
+    fn test_check_witness_detects_wrong_degree_bound() {
+        let circuit = build_vitalik_circuit();
+        let witness = Witness::new(3, 3, [-2, -1, 0, 1, 2]);
+        let error = circuit.check_witness(&witness).unwrap_err();
+        assert!(error.to_string().contains("incorrect degree bound"));
+    }
+
+    #[test]
+    fn test_check_witness_detects_gate_constraint_violation() {
+        let circuit = build_vitalik_circuit();
+        let mut witness = circuit.make_witness();
+        witness.set(cell(0, 0), from_const(3));
+        witness.set(cell(0, 1), from_const(10));
+        witness.set(cell(1, 0), from_const(3));
+        witness.set(cell(1, 1), from_const(9));
+        witness.set(cell(1, 2), from_const(35));
+        witness.set(cell(2, 0), from_const(3));
+        witness.set(cell(2, 1), from_const(35));
+        let error = circuit.check_witness(&witness).unwrap_err();
+        assert!(error.to_string().contains("gate constraint"));
+    }
+
+    #[test]
+    fn test_check_witness_detects_direct_wire_constraint_violation() {
+        let circuit = build_vitalik_circuit();
+        let mut witness = circuit.make_witness();
+        witness.set(cell(0, 0), from_const(3));
+        witness.set(cell(0, 1), from_const(9));
+        witness.set(cell(1, 0), from_const(4));
+        witness.set(cell(1, 1), from_const(9));
+        witness.set(cell(1, 2), from_const(45));
+        witness.set(cell(2, 0), from_const(3));
+        witness.set(cell(2, 1), from_const(45));
+        let error = circuit.check_witness(&witness).unwrap_err();
+        assert!(error.to_string().contains("wire constraint violated"));
+    }
+
+    #[test]
+    fn test_check_witness_detects_transitive_wire_constraint_violation() {
+        let circuit = build_vitalik_circuit();
+        let mut witness = circuit.make_witness();
+        witness.set(cell(0, 0), from_const(3));
+        witness.set(cell(0, 1), from_const(9));
+        witness.set(cell(1, 0), from_const(3));
+        witness.set(cell(1, 1), from_const(9));
+        witness.set(cell(1, 2), from_const(35));
+        witness.set(cell(2, 0), from_const(99));
+        witness.set(cell(2, 1), from_const(35));
+        let error = circuit.check_witness(&witness).unwrap_err();
+        assert!(error.to_string().contains("wire constraint violated"));
     }
 }

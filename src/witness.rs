@@ -43,6 +43,35 @@ pub const fn cell(row: usize, column: usize) -> Cell {
     Cell::new(row, column)
 }
 
+/// A value that can be used as a relative row or column offset in [`WitnessView::cell`] and
+/// [`CircuitView::cell`](`crate::plonk::CircuitView::cell`).
+///
+/// This is implemented for [`isize`] and [`usize`] so that call sites don't need to cast
+/// explicitly, plus [`i32`] because that is the type bare integer literals (e.g. `0`) default to
+/// when nothing else constrains them.
+pub trait CellOffset {
+    /// Converts this value to a signed offset.
+    fn into_offset(self) -> isize;
+}
+
+impl CellOffset for isize {
+    fn into_offset(self) -> isize {
+        self
+    }
+}
+
+impl CellOffset for usize {
+    fn into_offset(self) -> isize {
+        self as isize
+    }
+}
+
+impl CellOffset for i32 {
+    fn into_offset(self) -> isize {
+        self as isize
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CellOrUnconstrained {
     Cell(Cell),
@@ -182,9 +211,9 @@ pub trait WitnessView: internal::WitnessViewState {
     ///
     /// For example, if this view is at row offset 3 and column offset 5, then `cell(6, 2)` will
     /// return the cell at row 9 and column 7.
-    fn cell(&self, row_offset: isize, column_offset: isize) -> Cell {
-        let row = self.row_offset() as isize + row_offset;
-        let column = self.column_offset() as isize + column_offset;
+    fn cell(&self, row_offset: impl CellOffset, column_offset: impl CellOffset) -> Cell {
+        let row = self.row_offset() as isize + row_offset.into_offset();
+        let column = self.column_offset() as isize + column_offset.into_offset();
         debug_assert!(row >= 0);
         debug_assert!(column >= 0);
         Cell::new(row as usize, column as usize)
