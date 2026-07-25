@@ -859,6 +859,76 @@ impl Circuit {
         )
     }
 
+    /// Performs various checks to verify that the provided `witness` is compatible with this
+    /// circuit and doesn't violate any constraints.
+    pub fn check_witness(&self, witness: &Witness) -> Result<()> {
+        if witness.num_rows() != self.num_rows {
+            return Err(anyhow!(
+                "wrong number of rows: got {}, want {}",
+                witness.num_rows(),
+                self.num_rows
+            ));
+        }
+        if witness.num_columns() != self.num_columns {
+            return Err(anyhow!(
+                "wrong number of columns: got {}, want {}",
+                witness.num_columns(),
+                self.num_columns
+            ));
+        }
+        if witness.degree_bound() != self.degree_bound {
+            return Err(anyhow!(
+                "incorrect degree bound: got {}, want {}",
+                witness.degree_bound(),
+                self.degree_bound
+            ));
+        }
+
+        let active_row_set: Vec<BTreeSet<usize>> = self
+            .selectors
+            .iter()
+            .map(|selector| {
+                selector
+                    .clone()
+                    .decode2()
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, value)| *value != Scalar::ZERO)
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .collect();
+        for (constraint, gate_instances) in &self.gates {
+            for gate_instance in gate_instances {
+                let variables = constraint.get_free_variables();
+                for &row in &active_row_set[gate_instance.selector_index] {
+                    let root_cell = cell(row, gate_instance.column_index);
+                    let substitution: BTreeMap<Variable, Scalar> = variables
+                        .iter()
+                        .map(|variable| {
+                            (
+                                variable.clone(),
+                                witness.get(variable.map_to_cell(root_cell)),
+                            )
+                        })
+                        .collect();
+                    if constraint.evaluate(&substitution) != Scalar::ZERO {
+                        return Err(anyhow!(
+                            "Constraint {} violated at row {}, column {}",
+                            constraint,
+                            row,
+                            gate_instance.column_index
+                        ));
+                    }
+                }
+            }
+        }
+
+        // TODO: check wire constraints.
+
+        Ok(())
+    }
+
     /// Builds the three polynomials used in the permutation argument. The components of the
     /// returned tuple are, respectively: the coordinate pair accumulator, the fixpoint constraint,
     /// and the recurrence constraint.
@@ -1397,7 +1467,7 @@ mod tests {
     use crate::expr::var;
     use crate::witness::WitnessView;
     use starkom_bluesky::from_const;
-    use starkom_pcs::hash::{Poseidon2Hash, Sha2Hash};
+    use starkom_pcs::hash::{Poseidon1Hash, Poseidon2Hash, Sha2Hash};
 
     // This function tests the circuit from Vitalik's PLONK tutorial,
     // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
@@ -1431,6 +1501,7 @@ mod tests {
         witness.set(cell(1, 2), from_const(35));
         witness.set(cell(2, 0), from_const(3));
         witness.set(cell(2, 1), from_const(35));
+        assert!(circuit.check_witness(&witness).is_ok());
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit.prove::<H>(witness, options.clone())?;
         assert_eq!(proof.degree_bound(), 8);
@@ -1450,6 +1521,12 @@ mod tests {
     }
 
     #[test]
+    fn test_vitalik_circuit_poseidon1_blowup_2() {
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 1).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 1).is_ok());
+    }
+
+    #[test]
     fn test_vitalik_circuit_poseidon2_blowup_2() {
         assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 1).is_ok());
         assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 1).is_ok());
@@ -1462,6 +1539,12 @@ mod tests {
     }
 
     #[test]
+    fn test_vitalik_circuit_poseidon1_blowup_4() {
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 2).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 2).is_ok());
+    }
+
+    #[test]
     fn test_vitalik_circuit_poseidon2_blowup_4() {
         assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 2).is_ok());
         assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 2).is_ok());
@@ -1471,6 +1554,12 @@ mod tests {
     fn test_vitalik_circuit_sha2_blowup_8() {
         assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 3).is_ok());
         assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 3).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_poseidon1_blowup_8() {
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 3).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 3).is_ok());
     }
 
     #[test]
@@ -1508,6 +1597,7 @@ mod tests {
             [x.into(), square.into()],
         );
         let [x, result] = witness.nop([x.into(), result.into()]);
+        assert!(circuit.check_witness(&witness).is_ok());
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit.prove::<H>(witness, options.clone())?;
         assert_eq!(proof.degree_bound(), 8);
@@ -1569,6 +1659,7 @@ mod tests {
             [x.into(), square.into(), mul.into()],
         );
         let [x, y, result] = witness.nop([x.into(), y.into(), result.into()]);
+        assert!(circuit.check_witness(&witness).is_ok());
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit.prove::<H>(witness, options.clone())?;
         assert_eq!(proof.degree_bound(), 8);
