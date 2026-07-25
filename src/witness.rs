@@ -304,6 +304,11 @@ pub trait WitnessView: internal::WitnessViewState {
         WitnessSection::new(self.witness_mut(), row_offset, column_offset, width)
     }
 
+    /// Spawns a child `WitnessView` at the given coordinates and runs the provided `callback` on
+    /// it.
+    ///
+    /// `sub_fn` returns `self`, not the child view. The child view is only valid for the duration
+    /// of the callback, while `self` is returned to make `sub_fn` chainable.
     fn sub_fn(
         &mut self,
         row_offset: usize,
