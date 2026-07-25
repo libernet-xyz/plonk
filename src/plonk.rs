@@ -914,7 +914,7 @@ impl Circuit {
                         .collect();
                     if constraint.evaluate(&substitution) != Scalar::ZERO {
                         return Err(anyhow!(
-                            "Constraint {} violated at row {}, column {}",
+                            "gate constraint `{}` violated at row {}, column {}",
                             constraint,
                             row,
                             gate_instance.column_index
@@ -924,7 +924,42 @@ impl Circuit {
             }
         }
 
-        // TODO: check wire constraints.
+        let cell_by_identity_value: BTreeMap<Scalar, Cell> = {
+            let mut cell_by_identity_value = BTreeMap::default();
+            let omega = Polynomial::domain_element2(1, self.degree_bound);
+            let mut generator_power = Scalar::ONE;
+            for column_index in 0..self.num_columns {
+                let mut omega_power = Scalar::ONE;
+                for row in 0..self.degree_bound {
+                    cell_by_identity_value
+                        .insert(generator_power * omega_power, cell(row, column_index));
+                    omega_power *= omega;
+                }
+                generator_power *= Scalar::MULTIPLICATIVE_GENERATOR;
+            }
+            cell_by_identity_value
+        };
+        for column_index in 0..self.num_columns {
+            for row in 0..self.num_rows {
+                let source_cell = cell(row, column_index);
+                let target_cell = *cell_by_identity_value
+                    .get(&self.sigma_values[column_index][row])
+                    .unwrap();
+                let source_value = witness.get(source_cell);
+                let target_value = witness.get(target_cell);
+                if source_value != target_value {
+                    return Err(anyhow!(
+                        "wire constraint violated: cell({}, {}) = {}, cell({}, {}) = {}",
+                        source_cell.row(),
+                        source_cell.column(),
+                        source_value,
+                        target_cell.row(),
+                        target_cell.column(),
+                        target_value,
+                    ));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -945,18 +980,19 @@ impl Circuit {
             let mut accumulator = vec![Scalar::ZERO; self.degree_bound + 1];
 
             accumulator[0] = Scalar::ONE;
-            let mut omega_pow = Scalar::ONE;
+            let mut omega_power = Scalar::ONE;
             for i in 0..self.degree_bound {
-                let mut generator_pow = Scalar::ONE;
+                let mut generator_power = Scalar::ONE;
                 accumulator[i + 1] = accumulator[i];
                 for j in 0..self.num_columns {
                     let witness_value = witness.get(cell(i, j));
-                    accumulator[i + 1] *= witness_value + beta * generator_pow * omega_pow + gamma;
+                    accumulator[i + 1] *=
+                        witness_value + beta * generator_power * omega_power + gamma;
                     accumulator[i + 1] *=
                         (witness_value + beta * self.sigma_values[j][i] + gamma).invert_unwrap();
-                    generator_pow *= Scalar::MULTIPLICATIVE_GENERATOR;
+                    generator_power *= Scalar::MULTIPLICATIVE_GENERATOR;
                 }
-                omega_pow *= omega;
+                omega_power *= omega;
             }
 
             if accumulator.pop().unwrap() != Scalar::ONE {
@@ -974,10 +1010,10 @@ impl Circuit {
                 lhs *= column.clone() + sigma.clone() * beta + gamma;
             }
             let mut rhs = accumulator.clone();
-            let mut pow = Scalar::ONE;
+            let mut power = Scalar::ONE;
             for column in columns {
-                rhs *= column.clone() + Polynomial::with_coefficients(vec![gamma, beta * pow]);
-                pow *= Scalar::MULTIPLICATIVE_GENERATOR;
+                rhs *= column.clone() + Polynomial::with_coefficients(vec![gamma, beta * power]);
+                power *= Scalar::MULTIPLICATIVE_GENERATOR;
             }
             lhs - rhs
         };
@@ -1053,14 +1089,14 @@ impl Circuit {
         let gate_constraint = {
             let delta = H::challenge(*DST_DELTA, [committer.transcript_hash()]);
             let mut gate_constraint = Polynomial::default();
-            let mut pow = Scalar::ONE;
+            let mut power = Scalar::ONE;
             for (constraint, instances) in &self.gates {
                 for instance in instances {
                     let constraint = constraint.clone().remap_variables(instance.column_index);
                     let selector = self.selectors[instance.selector_index].clone();
                     gate_constraint +=
-                        selector * constraint.compose(omega, columns.as_slice()) * pow;
-                    pow *= delta;
+                        selector * constraint.compose(omega, columns.as_slice()) * power;
+                    power *= delta;
                 }
             }
             gate_constraint
@@ -1360,7 +1396,7 @@ impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
                 [commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
             );
             let mut result = Scalar::ZERO;
-            let mut pow = Scalar::ONE;
+            let mut power = Scalar::ONE;
             for (constraint, gate_instances) in &self.gates {
                 for instance in gate_instances {
                     let constraint = constraint.clone().remap_variables(instance.column_index);
@@ -1381,8 +1417,8 @@ impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
                         .collect();
                     result += selectors[instance.selector_index]
                         * constraint.evaluate(&substitution)
-                        * pow;
-                    pow *= delta;
+                        * power;
+                    power *= delta;
                 }
             }
             result
@@ -1405,14 +1441,14 @@ impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
         let (permutation_numerator, permutation_denominator) = {
             let mut numerator = Scalar::ONE;
             let mut denominator = Scalar::ONE;
-            let mut generator_pow = Scalar::ONE;
+            let mut generator_power = Scalar::ONE;
             let offset = num_gate_selectors + num_sigma_polynomials;
             for column_index in 0..self.num_columns {
                 let variable = points[&xi][offset + column_index];
                 let sigma = sigma[column_index];
-                numerator *= variable + beta * generator_pow * xi + gamma;
+                numerator *= variable + beta * generator_power * xi + gamma;
                 denominator *= variable + beta * sigma + gamma;
-                generator_pow *= Scalar::MULTIPLICATIVE_GENERATOR;
+                generator_power *= Scalar::MULTIPLICATIVE_GENERATOR;
             }
             (numerator, denominator)
         };
