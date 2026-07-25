@@ -8,6 +8,7 @@ use starkom_poly;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display};
+use std::iter::{Product, Sum};
 use std::ops::{
     Add, AddAssign, BitXor, BitXorAssign, Div, DivAssign, Index, Mul, MulAssign, Neg, Sub,
     SubAssign,
@@ -870,6 +871,18 @@ impl Div<isize> for Constraint {
     }
 }
 
+impl Sum for Constraint {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Constraint::default(), |a, b| a + b)
+    }
+}
+
+impl Product for Constraint {
+    fn product<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Constraint::make_const(Scalar::ONE), |a, b| a * b)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1557,5 +1570,73 @@ mod tests {
         let c3: Constraint = format!("{} == 0", c2).parse().unwrap();
         assert_eq!(c1, c2);
         assert_eq!(c1, c3);
+    }
+
+    #[test]
+    fn test_iter_sum_empty() {
+        let constraint: Constraint = std::iter::empty::<Constraint>().sum();
+        assert_eq!(constraint, Constraint::default());
+        assert_eq!(constraint.to_string(), "0");
+    }
+
+    #[test]
+    fn test_iter_sum_single() {
+        let constraint: Constraint = vec![var(0)].into_iter().sum();
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
+        assert_eq!(constraint.to_string(), "var(0)");
+    }
+
+    #[test]
+    fn test_iter_sum() {
+        let constraint: Constraint = vec![var(0), var(1), var(2)].into_iter().sum();
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(12), from_const(34), from_const(56)]
+            ),
+            from_const(102)
+        );
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(34), from_const(56), from_const(78)]
+            ),
+            from_const(168)
+        );
+        assert_eq!(constraint.to_string(), "var(0) + var(1) + var(2)");
+    }
+
+    #[test]
+    fn test_iter_product_empty() {
+        let constraint: Constraint = std::iter::empty::<Constraint>().product();
+        assert_eq!(constraint.get_value_if_constant(), Some(Scalar::ONE));
+        assert_eq!(constraint.to_string(), "1");
+    }
+
+    #[test]
+    fn test_iter_product_single() {
+        let constraint: Constraint = vec![var(0)].into_iter().product();
+        assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
+        assert_eq!(constraint.to_string(), "var(0)");
+    }
+
+    #[test]
+    fn test_iter_product() {
+        let constraint: Constraint = vec![var(0), var(1), var(2)].into_iter().product();
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(12), from_const(34), from_const(56)]
+            ),
+            from_const(22848)
+        );
+        assert_eq!(
+            evaluate(
+                &constraint,
+                [from_const(34), from_const(56), from_const(78)]
+            ),
+            from_const(148512)
+        );
+        assert_eq!(constraint.to_string(), "var(0) * var(1) * var(2)");
     }
 }

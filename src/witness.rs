@@ -178,6 +178,18 @@ pub trait WitnessView: internal::WitnessViewState {
     /// For the root view this is the same as [`Witness::num_columns`].
     fn width(&self) -> usize;
 
+    /// Creates a [`Cell`] relative to this view.
+    ///
+    /// For example, if this view is at row offset 3 and column offset 5, then `cell(6, 2)` will
+    /// return the cell at row 9 and column 7.
+    fn cell(&self, row_offset: isize, column_offset: isize) -> Cell {
+        let row = self.row_offset() as isize + row_offset;
+        let column = self.column_offset() as isize + column_offset;
+        debug_assert!(row >= 0);
+        debug_assert!(column >= 0);
+        Cell::new(row as usize, column as usize)
+    }
+
     /// Reads a witness cell.
     fn get(&self, cell: Cell) -> Scalar {
         self.witness().get_internal(cell)
@@ -287,14 +299,36 @@ pub trait WitnessView: internal::WitnessViewState {
     }
 
     /// Spawns a child `WitnessView` at the given coordinates.
-    fn spawn_at(
+    fn sub(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView {
+        let row_offset = self.row_offset() + row_offset;
+        let column_offset = self.column_offset() + column_offset;
+        WitnessSection::new(self.witness_mut(), row_offset, column_offset, width)
+    }
+
+    /// Spawns a child `WitnessView` at the given coordinates and runs the provided `callback` on
+    /// it.
+    ///
+    /// `sub_fn` returns `self`, not the child view. The child view is only valid for the duration
+    /// of the callback, while `self` is returned to make `sub_fn` chainable.
+    fn sub_fn(
         &mut self,
         row_offset: usize,
         column_offset: usize,
         width: usize,
-    ) -> impl WitnessView;
+        callback: impl FnOnce(&mut WitnessSection),
+    ) -> &mut Self {
+        let row_offset = self.row_offset() + row_offset;
+        let column_offset = self.column_offset() + column_offset;
+        callback(&mut WitnessSection::new(
+            self.witness_mut(),
+            row_offset,
+            column_offset,
+            width,
+        ));
+        self
+    }
 
-    fn auto_spawn<'a>(&'a mut self, width: usize, count: usize) -> WitnessViewGenerator<'a>;
+    fn auto_sub<'a>(&'a mut self, width: usize, count: usize) -> WitnessViewGenerator<'a>;
 }
 
 #[derive(Debug)]
@@ -445,16 +479,27 @@ impl WitnessView for Witness {
         self.data.len()
     }
 
-    fn spawn_at(
+    fn sub(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView {
+        WitnessSection::new(self, row_offset, column_offset, width)
+    }
+
+    fn sub_fn(
         &mut self,
         row_offset: usize,
         column_offset: usize,
         width: usize,
-    ) -> impl WitnessView {
-        WitnessSection::new(self, row_offset, column_offset, width)
+        callback: impl FnOnce(&mut WitnessSection),
+    ) -> &mut Self {
+        callback(&mut WitnessSection::new(
+            self,
+            row_offset,
+            column_offset,
+            width,
+        ));
+        self
     }
 
-    fn auto_spawn<'a>(&'a mut self, width: usize, count: usize) -> WitnessViewGenerator<'a> {
+    fn auto_sub<'a>(&'a mut self, width: usize, count: usize) -> WitnessViewGenerator<'a> {
         let row_offset = self.row_counter;
         WitnessViewGenerator {
             witness: self,
@@ -524,21 +569,7 @@ impl<'a> WitnessView for WitnessSection<'a> {
         self.width
     }
 
-    fn spawn_at(
-        &mut self,
-        row_offset: usize,
-        column_offset: usize,
-        width: usize,
-    ) -> impl WitnessView {
-        WitnessSection::new(
-            self.witness,
-            self.row_offset + row_offset,
-            self.column_offset + column_offset,
-            width,
-        )
-    }
-
-    fn auto_spawn<'b>(&'b mut self, width: usize, count: usize) -> WitnessViewGenerator<'b> {
+    fn auto_sub<'b>(&'b mut self, width: usize, count: usize) -> WitnessViewGenerator<'b> {
         let row_offset = self.row_offset + self.row_counter;
         WitnessViewGenerator {
             witness: self.witness,
@@ -926,6 +957,20 @@ mod tests {
     }
 
     #[test]
+    fn test_root_view_cells() {
+        let witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        assert_eq!(witness.cell(0, 0), cell(0, 0));
+        assert_eq!(witness.cell(0, 1), cell(0, 1));
+        assert_eq!(witness.cell(0, 2), cell(0, 2));
+        assert_eq!(witness.cell(1, 0), cell(1, 0));
+        assert_eq!(witness.cell(1, 1), cell(1, 1));
+        assert_eq!(witness.cell(1, 2), cell(1, 2));
+        assert_eq!(witness.cell(2, 0), cell(2, 0));
+        assert_eq!(witness.cell(2, 1), cell(2, 1));
+        assert_eq!(witness.cell(2, 2), cell(2, 2));
+    }
+
+    #[test]
     fn test_auto_gates() {
         let mut witness = Witness::new(3, 3, DEFAULT_ROTATIONS);
         let x = cell(0, 0);
@@ -958,5 +1003,107 @@ mod tests {
         assert!(witness.get(cell(5, 0)) > max);
         assert!(witness.get(cell(5, 1)) > max);
         assert!(witness.get(cell(5, 2)) > max);
+    }
+
+    #[test]
+    fn test_sub_view_1() {
+        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 0), from_const(1));
+        witness.set(cell(0, 1), from_const(2));
+        witness.set(cell(0, 2), from_const(3));
+        witness.set(cell(0, 3), from_const(4));
+        witness.set(cell(1, 0), from_const(5));
+        witness.set(cell(1, 1), from_const(6));
+        witness.set(cell(1, 2), from_const(7));
+        witness.set(cell(1, 3), from_const(8));
+        witness.set(cell(2, 0), from_const(9));
+        witness.set(cell(2, 1), from_const(10));
+        witness.set(cell(2, 2), from_const(11));
+        witness.set(cell(2, 3), from_const(12));
+        let view = witness.sub(1, 2, 2);
+        assert_eq!(view.width(), 2);
+        assert_eq!(view.cell(0, 0), cell(1, 2));
+        assert_eq!(view.cell(0, 1), cell(1, 3));
+        assert_eq!(view.cell(1, 0), cell(2, 2));
+        assert_eq!(view.cell(1, 1), cell(2, 3));
+        assert_eq!(view.get(cell(1, 2)), from_const(7));
+        assert_eq!(view.get(cell(1, 3)), from_const(8));
+        assert_eq!(view.get(cell(2, 2)), from_const(11));
+        assert_eq!(view.get(cell(2, 3)), from_const(12));
+    }
+
+    #[test]
+    fn test_sub_view_2() {
+        let mut witness = Witness::new(4, 3, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 0), from_const(1));
+        witness.set(cell(0, 1), from_const(2));
+        witness.set(cell(0, 2), from_const(3));
+        witness.set(cell(1, 0), from_const(4));
+        witness.set(cell(1, 1), from_const(5));
+        witness.set(cell(1, 2), from_const(6));
+        witness.set(cell(2, 0), from_const(7));
+        witness.set(cell(2, 1), from_const(8));
+        witness.set(cell(2, 2), from_const(9));
+        witness.set(cell(3, 0), from_const(10));
+        witness.set(cell(3, 1), from_const(11));
+        witness.set(cell(3, 2), from_const(12));
+        let view = witness.sub(2, 1, 1);
+        assert_eq!(view.width(), 1);
+        assert_eq!(view.cell(0, 0), cell(2, 1));
+        assert_eq!(view.cell(1, 0), cell(3, 1));
+        assert_eq!(view.get(cell(2, 1)), from_const(8));
+        assert_eq!(view.get(cell(3, 1)), from_const(11));
+    }
+
+    #[test]
+    fn test_update_sub_view_1() {
+        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 0), from_const(1));
+        witness.set(cell(0, 1), from_const(2));
+        witness.set(cell(0, 2), from_const(3));
+        witness.set(cell(0, 3), from_const(4));
+        witness.set(cell(1, 0), from_const(5));
+        witness.set(cell(1, 1), from_const(6));
+        witness.set(cell(1, 2), from_const(7));
+        witness.set(cell(1, 3), from_const(8));
+        witness.set(cell(2, 0), from_const(9));
+        witness.set(cell(2, 1), from_const(10));
+        witness.set(cell(2, 2), from_const(11));
+        witness.set(cell(2, 3), from_const(12));
+        {
+            let mut view = witness.sub(1, 2, 2);
+            view.set(cell(1, 2), from_const(42));
+            view.set(cell(1, 3), from_const(43));
+            view.set(cell(2, 2), from_const(44));
+            view.set(cell(2, 3), from_const(45));
+        }
+        assert_eq!(witness.get(cell(1, 2)), from_const(42));
+        assert_eq!(witness.get(cell(1, 3)), from_const(43));
+        assert_eq!(witness.get(cell(2, 2)), from_const(44));
+        assert_eq!(witness.get(cell(2, 3)), from_const(45));
+    }
+
+    #[test]
+    fn test_update_sub_view_2() {
+        let mut witness = Witness::new(4, 3, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 0), from_const(1));
+        witness.set(cell(0, 1), from_const(2));
+        witness.set(cell(0, 2), from_const(3));
+        witness.set(cell(1, 0), from_const(4));
+        witness.set(cell(1, 1), from_const(5));
+        witness.set(cell(1, 2), from_const(6));
+        witness.set(cell(2, 0), from_const(7));
+        witness.set(cell(2, 1), from_const(8));
+        witness.set(cell(2, 2), from_const(9));
+        witness.set(cell(3, 0), from_const(10));
+        witness.set(cell(3, 1), from_const(11));
+        witness.set(cell(3, 2), from_const(12));
+        {
+            let mut view = witness.sub(2, 1, 1);
+            view.set(cell(2, 1), from_const(42));
+            view.set(cell(3, 1), from_const(43));
+        }
+        assert_eq!(witness.get(cell(2, 1)), from_const(42));
+        assert_eq!(witness.get(cell(3, 1)), from_const(43));
     }
 }
