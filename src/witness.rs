@@ -224,8 +224,16 @@ pub trait WitnessView: internal::WitnessViewState {
     }
 
     /// Copies a witness cell to another and returns the copied value.
-    fn copy(&mut self, src_cell: Cell, dst_cell: Cell) -> Scalar {
-        self.witness_mut().copy_internal(src_cell, dst_cell)
+    fn copy(&mut self, src_cell: CellOrUnconstrained, dst_cell: Cell) -> Scalar {
+        match src_cell {
+            CellOrUnconstrained::Cell(src_cell) => {
+                self.witness_mut().copy_internal(src_cell, dst_cell)
+            }
+            CellOrUnconstrained::Unconstrained(value) => {
+                self.witness_mut().set(dst_cell, value);
+                value
+            }
+        }
     }
 
     /// Skips `n` rows, advancing the internal row counter by `n`.
@@ -269,13 +277,7 @@ pub trait WitnessView: internal::WitnessViewState {
             .zip(inputs.into_iter())
             .map(|(variable, input)| {
                 let dst_cell = variable.map_to_cell(root_cell);
-                let value = match input.into() {
-                    CellOrUnconstrained::Cell(cell) => self.copy(cell, dst_cell),
-                    CellOrUnconstrained::Unconstrained(value) => {
-                        self.set(dst_cell, value);
-                        value
-                    }
-                };
+                let value = self.copy(input, dst_cell);
                 (variable, value)
             })
             .collect();
@@ -951,7 +953,7 @@ mod tests {
     fn test_copy_cell() {
         let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
         witness.set(cell(0, 1), from_const(44));
-        assert_eq!(witness.copy(cell(0, 1), cell(1, 2)), from_const(44));
+        assert_eq!(witness.copy(cell(0, 1).into(), cell(1, 2)), from_const(44));
         assert_eq!(witness.get(cell(0, 0)), from_const(0));
         assert_eq!(witness.get(cell(0, 1)), from_const(44));
         assert_eq!(witness.get(cell(0, 2)), from_const(0));
@@ -964,7 +966,7 @@ mod tests {
     fn test_blind() {
         let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
         witness.set(cell(0, 1), from_const(44));
-        assert_eq!(witness.copy(cell(0, 1), cell(1, 2)), from_const(44));
+        assert_eq!(witness.copy(cell(0, 1).into(), cell(1, 2)), from_const(44));
         witness.blind();
         assert_eq!(witness.get(cell(0, 0)), from_const(0));
         assert_eq!(witness.get(cell(0, 1)), from_const(44));
