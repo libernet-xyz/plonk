@@ -37,12 +37,6 @@ impl Cell {
     }
 }
 
-/// Shorthand for [`Cell::new`].
-#[inline]
-pub const fn cell(row: usize, column: usize) -> Cell {
-    Cell::new(row, column)
-}
-
 /// A value that can be used as a relative row or column offset in [`WitnessView::cell`] and
 /// [`CircuitView::cell`](`crate::plonk::CircuitView::cell`).
 ///
@@ -189,7 +183,7 @@ mod internal {
 
         /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
         fn root_cell(&self) -> Cell {
-            cell(self.row_offset(), self.column_offset())
+            Cell::new(self.row_offset(), self.column_offset())
         }
 
         /// Returns the next root cell for [setting auto gates](`Witness::auto_set`), advancing the
@@ -314,7 +308,7 @@ pub trait WitnessView: internal::WitnessViewState {
     fn nop<const N: usize>(&mut self, inputs: [CellOrUnconstrained; N]) -> [Cell; N] {
         let root_cell = self.step_row();
         std::array::from_fn(|i| {
-            let cell = cell(0, i).remap(root_cell);
+            let cell = Cell::new(0, i).remap(root_cell);
             match inputs[i].into() {
                 CellOrUnconstrained::Cell(input) => {
                     self.witness_mut().copy_internal(input, cell);
@@ -493,7 +487,7 @@ impl internal::WitnessViewState for Witness {
     }
 
     fn step_row(&mut self) -> Cell {
-        let root_cell = cell(self.row_counter, 0);
+        let root_cell = Cell::new(self.row_counter, 0);
         self.row_counter += 1;
         root_cell
     }
@@ -583,7 +577,7 @@ impl<'a> internal::WitnessViewState for WitnessSection<'a> {
     }
 
     fn step_row(&mut self) -> Cell {
-        let root_cell = cell(self.row_counter, 0);
+        let root_cell = Cell::new(self.row_counter, 0);
         self.row_counter += 1;
         root_cell
     }
@@ -621,6 +615,11 @@ mod tests {
     use super::*;
     use crate::expr::var;
     use starkom_bluesky::from_const;
+
+    #[inline]
+    fn cell(row: usize, column: usize) -> Cell {
+        Cell::new(row, column)
+    }
 
     #[inline]
     fn node<const N: usize>(cells: [Cell; N]) -> BTreeSet<Cell> {
