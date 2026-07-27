@@ -1,3 +1,4 @@
+use crate::chip::Chip;
 use crate::expr::{Constraint, Variable};
 use crate::utils::{hash_to_scalar, padded_circuit_size};
 use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
@@ -348,6 +349,21 @@ pub trait CircuitView: internal::CircuitViewState {
             width,
         ));
         self
+    }
+
+    /// Spawns a child `WitnessView` at the given coordinates and runs the provided `chip` on it.
+    fn sub_chip<const I: usize, const O: usize>(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        chip: &impl Chip<I, O>,
+        inputs: [Option<Cell>; I],
+    ) -> Result<[Option<Cell>; O]> {
+        let row_offset = self.row_offset() + row_offset;
+        let column_offset = self.column_offset() + column_offset;
+        let mut child =
+            CircuitSectionBuilder::new(self.builder_mut(), row_offset, column_offset, chip.width());
+        chip.build(&mut child, inputs)
     }
 
     fn auto_sub<'a>(&'a mut self, width: usize, count: usize) -> CircuitViewGenerator<'a>;
