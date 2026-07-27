@@ -23,3 +23,26 @@ pub trait Chip<const I: usize, const O: usize> {
         inputs: [CellOrUnconstrained; I],
     ) -> Result<[CellOrUnconstrained; O]>;
 }
+
+/// A reusable chip whose number of inputs and outputs is not known at compile time.
+///
+/// Note that dynamically sized circuits need to be recompiled on both the prover and verifier side
+/// for every different shape used, so it's recommended to avoid this kind of chips.
+pub trait DynamicChip {
+    /// Returns the number of columns required by the chip.
+    fn width(&self) -> usize;
+
+    /// Builds the chip on the provided [`CircuitView`].
+    fn build(
+        &self,
+        view: &mut impl CircuitView,
+        inputs: Vec<Option<Cell>>,
+    ) -> Result<Vec<Option<Cell>>>;
+
+    /// Witnesses execution of the chip in the provided [`WitnessView`].
+    fn witness(
+        &self,
+        view: &mut impl WitnessView,
+        inputs: Vec<CellOrUnconstrained>,
+    ) -> Result<Vec<CellOrUnconstrained>>;
+}

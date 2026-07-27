@@ -1,5 +1,7 @@
+use crate::chip::Chip;
 use crate::expr::{Constraint, Variable};
 use crate::utils::padded_circuit_size;
+use anyhow::Result;
 use starkom_bluesky::Scalar;
 use starkom_ff::Field;
 use std::collections::{BTreeMap, BTreeSet, btree_map};
@@ -351,6 +353,21 @@ pub trait WitnessView: internal::WitnessViewState {
             width,
         ));
         self
+    }
+
+    /// Spawns a child `WitnessView` at the given coordinates and runs the provided `chip` on it.
+    fn sub_chip<const I: usize, const O: usize>(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        chip: &impl Chip<I, O>,
+        inputs: [CellOrUnconstrained; I],
+    ) -> Result<[CellOrUnconstrained; O]> {
+        let row_offset = self.row_offset() + row_offset;
+        let column_offset = self.column_offset() + column_offset;
+        let mut child =
+            WitnessSection::new(self.witness_mut(), row_offset, column_offset, chip.width());
+        chip.witness(&mut child, inputs)
     }
 
     fn auto_sub<'a>(&'a mut self, width: usize, count: usize) -> WitnessViewGenerator<'a>;
