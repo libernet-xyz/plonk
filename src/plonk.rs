@@ -321,12 +321,7 @@ pub trait CircuitView: internal::CircuitViewState {
     }
 
     /// Spawns a child `CircuitView` at the given coordinates.
-    fn sub_at(
-        &mut self,
-        row_offset: usize,
-        column_offset: usize,
-        width: usize,
-    ) -> impl CircuitView {
+    fn sub(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView {
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
         CircuitSectionBuilder::new(self.builder_mut(), row_offset, column_offset, width)
