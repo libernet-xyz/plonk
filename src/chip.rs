@@ -12,14 +12,14 @@ pub trait Chip<const I: usize, const O: usize> {
     /// Builds the chip on the provided [`CircuitView`].
     fn build(
         &self,
-        builder: &mut impl CircuitView,
+        view: &mut impl CircuitView,
         inputs: [Option<Cell>; I],
     ) -> Result<[Option<Cell>; O]>;
 
     /// Witnesses execution of the chip in the provided [`WitnessView`].
     fn witness(
         &self,
-        witness: &mut impl WitnessView,
+        view: &mut impl WitnessView,
         inputs: [CellOrUnconstrained; I],
     ) -> Result<[CellOrUnconstrained; O]>;
 }

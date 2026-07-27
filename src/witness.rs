@@ -37,12 +37,6 @@ impl Cell {
     }
 }
 
-/// Shorthand for [`Cell::new`].
-#[inline]
-pub const fn cell(row: usize, column: usize) -> Cell {
-    Cell::new(row, column)
-}
-
 /// A value that can be used as a relative row or column offset in [`WitnessView::cell`] and
 /// [`CircuitView::cell`](`crate::plonk::CircuitView::cell`).
 ///
@@ -189,7 +183,7 @@ mod internal {
 
         /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
         fn root_cell(&self) -> Cell {
-            cell(self.row_offset(), self.column_offset())
+            Cell::new(self.row_offset(), self.column_offset())
         }
 
         /// Returns the next root cell for [setting auto gates](`Witness::auto_set`), advancing the
@@ -230,8 +224,16 @@ pub trait WitnessView: internal::WitnessViewState {
     }
 
     /// Copies a witness cell to another and returns the copied value.
-    fn copy(&mut self, src_cell: Cell, dst_cell: Cell) -> Scalar {
-        self.witness_mut().copy_internal(src_cell, dst_cell)
+    fn copy(&mut self, src_cell: CellOrUnconstrained, dst_cell: Cell) -> Scalar {
+        match src_cell {
+            CellOrUnconstrained::Cell(src_cell) => {
+                self.witness_mut().copy_internal(src_cell, dst_cell)
+            }
+            CellOrUnconstrained::Unconstrained(value) => {
+                self.witness_mut().set(dst_cell, value);
+                value
+            }
+        }
     }
 
     /// Skips `n` rows, advancing the internal row counter by `n`.
@@ -275,13 +277,7 @@ pub trait WitnessView: internal::WitnessViewState {
             .zip(inputs.into_iter())
             .map(|(variable, input)| {
                 let dst_cell = variable.map_to_cell(root_cell);
-                let value = match input.into() {
-                    CellOrUnconstrained::Cell(cell) => self.copy(cell, dst_cell),
-                    CellOrUnconstrained::Unconstrained(value) => {
-                        self.set(dst_cell, value);
-                        value
-                    }
-                };
+                let value = self.copy(input, dst_cell);
                 (variable, value)
             })
             .collect();
@@ -314,7 +310,7 @@ pub trait WitnessView: internal::WitnessViewState {
     fn nop<const N: usize>(&mut self, inputs: [CellOrUnconstrained; N]) -> [Cell; N] {
         let root_cell = self.step_row();
         std::array::from_fn(|i| {
-            let cell = cell(0, i).remap(root_cell);
+            let cell = Cell::new(0, i).remap(root_cell);
             match inputs[i].into() {
                 CellOrUnconstrained::Cell(input) => {
                     self.witness_mut().copy_internal(input, cell);
@@ -493,7 +489,7 @@ impl internal::WitnessViewState for Witness {
     }
 
     fn step_row(&mut self) -> Cell {
-        let root_cell = cell(self.row_counter, 0);
+        let root_cell = Cell::new(self.row_counter, 0);
         self.row_counter += 1;
         root_cell
     }
@@ -583,7 +579,7 @@ impl<'a> internal::WitnessViewState for WitnessSection<'a> {
     }
 
     fn step_row(&mut self) -> Cell {
-        let root_cell = cell(self.row_counter, 0);
+        let root_cell = Cell::new(self.row_counter, 0);
         self.row_counter += 1;
         root_cell
     }
@@ -621,6 +617,11 @@ mod tests {
     use super::*;
     use crate::expr::var;
     use starkom_bluesky::from_const;
+
+    #[inline]
+    fn cell(row: usize, column: usize) -> Cell {
+        Cell::new(row, column)
+    }
 
     #[inline]
     fn node<const N: usize>(cells: [Cell; N]) -> BTreeSet<Cell> {
@@ -952,7 +953,7 @@ mod tests {
     fn test_copy_cell() {
         let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
         witness.set(cell(0, 1), from_const(44));
-        assert_eq!(witness.copy(cell(0, 1), cell(1, 2)), from_const(44));
+        assert_eq!(witness.copy(cell(0, 1).into(), cell(1, 2)), from_const(44));
         assert_eq!(witness.get(cell(0, 0)), from_const(0));
         assert_eq!(witness.get(cell(0, 1)), from_const(44));
         assert_eq!(witness.get(cell(0, 2)), from_const(0));
@@ -965,7 +966,7 @@ mod tests {
     fn test_blind() {
         let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
         witness.set(cell(0, 1), from_const(44));
-        assert_eq!(witness.copy(cell(0, 1), cell(1, 2)), from_const(44));
+        assert_eq!(witness.copy(cell(0, 1).into(), cell(1, 2)), from_const(44));
         witness.blind();
         assert_eq!(witness.get(cell(0, 0)), from_const(0));
         assert_eq!(witness.get(cell(0, 1)), from_const(44));

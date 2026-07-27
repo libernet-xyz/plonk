@@ -886,8 +886,12 @@ impl Product for Constraint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::witness::cell;
     use starkom_bluesky::from_const;
+
+    #[inline]
+    fn cell(row: usize, column: usize) -> Cell {
+        Cell::new(row, column)
+    }
 
     #[test]
     fn test_raw_variable_1() {

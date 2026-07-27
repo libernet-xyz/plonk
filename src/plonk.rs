@@ -1,6 +1,6 @@
 use crate::expr::{Constraint, Variable};
 use crate::utils::{hash_to_scalar, padded_circuit_size};
-use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView, cell};
+use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
 use starkom_bluesky::Scalar;
@@ -157,7 +157,7 @@ mod internal {
 
         /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
         fn root_cell(&self) -> Cell {
-            cell(self.row_offset(), self.column_offset())
+            Cell::new(self.row_offset(), self.column_offset())
         }
 
         /// Returns the next root cell where an [auto gate](`CircuitView::auto_gate`) can be placed,
@@ -190,17 +190,13 @@ pub trait CircuitView: internal::CircuitViewState {
 
     /// Adds a gate to the circuit.
     fn add_gate(&mut self, row: usize, constraint: Constraint) {
-        let root_cell = cell(row, 0).remap(self.root_cell());
+        let root_cell = self.cell(row, 0);
         self.builder_mut().add_gate_internal(root_cell, constraint);
     }
 
     /// "Connects" two circuit [`Cell`]s, meaning they will be constrained to have the same value.
     fn connect(&mut self, cell1: Option<Cell>, cell2: Option<Cell>) {
-        let root_cell = self.root_cell();
-        self.builder_mut().connect_internal(
-            cell1.map(|cell| cell.remap(root_cell)),
-            cell2.map(|cell| cell.remap(root_cell)),
-        );
+        self.builder_mut().connect_internal(cell1, cell2);
     }
 
     /// Skips `n` rows, advancing the internal row counter by `n`.
@@ -310,7 +306,7 @@ pub trait CircuitView: internal::CircuitViewState {
     /// would panic because `0 != N`.
     fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N] {
         let root_cell = self.step_row();
-        let outputs = std::array::from_fn(|i| cell(0, i).remap(root_cell));
+        let outputs = std::array::from_fn(|i| Cell::new(0, i).remap(root_cell));
 
         for i in 0..N {
             if let Some(input) = inputs[i] {
@@ -325,12 +321,7 @@ pub trait CircuitView: internal::CircuitViewState {
     }
 
     /// Spawns a child `CircuitView` at the given coordinates.
-    fn sub_at(
-        &mut self,
-        row_offset: usize,
-        column_offset: usize,
-        width: usize,
-    ) -> impl CircuitView {
+    fn sub(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView {
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
         CircuitSectionBuilder::new(self.builder_mut(), row_offset, column_offset, width)
@@ -632,7 +623,7 @@ impl internal::CircuitViewState for CircuitBuilder {
     }
 
     fn step_row(&mut self) -> Cell {
-        let root_cell = cell(self.row_counter, 0);
+        let root_cell = self.cell(self.row_counter, 0);
         self.row_counter += 1;
         root_cell
     }
@@ -712,7 +703,7 @@ impl<'a> internal::CircuitViewState for CircuitSectionBuilder<'a> {
     }
 
     fn step_row(&mut self) -> Cell {
-        let root_cell = cell(self.row_counter, 0).remap(self.root_cell());
+        let root_cell = self.cell(self.row_counter, 0);
         self.row_counter += 1;
         root_cell
     }
@@ -902,7 +893,7 @@ impl Circuit {
             for gate_instance in gate_instances {
                 let variables = constraint.get_free_variables();
                 for &row in &active_row_set[gate_instance.selector_index] {
-                    let root_cell = cell(row, gate_instance.column_index);
+                    let root_cell = Cell::new(row, gate_instance.column_index);
                     let substitution: BTreeMap<Variable, Scalar> = variables
                         .iter()
                         .map(|variable| {
@@ -928,22 +919,22 @@ impl Circuit {
             let mut cell_by_identity_value = BTreeMap::default();
             let omega = Polynomial::domain_element2(1, self.degree_bound);
             let mut generator_power = Scalar::ONE;
-            for column_index in 0..self.num_columns {
+            for column in 0..self.num_columns {
                 let mut omega_power = Scalar::ONE;
                 for row in 0..self.degree_bound {
                     cell_by_identity_value
-                        .insert(generator_power * omega_power, cell(row, column_index));
+                        .insert(generator_power * omega_power, Cell::new(row, column));
                     omega_power *= omega;
                 }
                 generator_power *= Scalar::MULTIPLICATIVE_GENERATOR;
             }
             cell_by_identity_value
         };
-        for column_index in 0..self.num_columns {
+        for column in 0..self.num_columns {
             for row in 0..self.num_rows {
-                let source_cell = cell(row, column_index);
+                let source_cell = Cell::new(row, column);
                 let target_cell = *cell_by_identity_value
-                    .get(&self.sigma_values[column_index][row])
+                    .get(&self.sigma_values[column][row])
                     .unwrap();
                 let source_value = witness.get(source_cell);
                 let target_value = witness.get(target_cell);
@@ -985,7 +976,7 @@ impl Circuit {
                 let mut generator_power = Scalar::ONE;
                 accumulator[i + 1] = accumulator[i];
                 for j in 0..self.num_columns {
-                    let witness_value = witness.get(cell(i, j));
+                    let witness_value = witness.get(Cell::new(i, j));
                     accumulator[i + 1] *=
                         witness_value + beta * generator_power * omega_power + gamma;
                     accumulator[i + 1] *=
@@ -1489,7 +1480,7 @@ impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
                 let offset = num_gate_selectors + num_sigma_polynomials;
                 (0..self.num_columns).into_iter().map(move |column| {
                     let x = omega.pow_small_vartime(row);
-                    (cell(row, column), points[&x][offset + column])
+                    (Cell::new(row, column), points[&x][offset + column])
                 })
             })
             .flatten()
@@ -1504,6 +1495,11 @@ mod tests {
     use crate::witness::WitnessView;
     use starkom_bluesky::from_const;
     use starkom_pcs::hash::{Poseidon1Hash, Poseidon2Hash, Sha2Hash};
+
+    #[inline]
+    fn cell(row: usize, column: usize) -> Cell {
+        Cell::new(row, column)
+    }
 
     // This function tests the circuit from Vitalik's PLONK tutorial,
     // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
