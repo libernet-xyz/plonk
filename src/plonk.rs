@@ -976,6 +976,37 @@ impl Circuit {
         Ok(())
     }
 
+    fn get_variable_substitution(
+        &self,
+        omega: Scalar,
+        omega_inv: Scalar,
+        columns: &[Polynomial],
+    ) -> BTreeMap<Variable, Polynomial> {
+        let mut substitution: BTreeMap<Variable, Polynomial> = BTreeMap::default();
+        for (constraint, instances) in &self.gates {
+            for instance in instances {
+                let constraint = if instance.column_index != 0 {
+                    constraint
+                        .clone()
+                        .remap_variables(instance.column_index as isize)
+                } else {
+                    constraint.clone()
+                };
+                for variable in constraint.get_free_variables() {
+                    if !substitution.contains_key(&variable) {
+                        let column = variable.rotate_column(
+                            columns[variable.column_index()].clone(),
+                            omega,
+                            omega_inv,
+                        );
+                        substitution.insert(variable, column);
+                    }
+                }
+            }
+        }
+        substitution
+    }
+
     /// Builds the three polynomials used in the permutation argument. The components of the
     /// returned tuple are, respectively: the coordinate pair accumulator, the fixpoint constraint,
     /// and the recurrence constraint.
@@ -1097,19 +1128,24 @@ impl Circuit {
         committer.add_batch(columns.clone());
 
         let omega = Polynomial::domain_element2(1, self.degree_bound);
+        let omega_inv = omega.invert_vartime().unwrap();
 
         let gate_constraint = {
+            let substitution = self.get_variable_substitution(omega, omega_inv, columns.as_slice());
             let delta = H::challenge(*DST_DELTA, [committer.transcript_hash()]);
             let mut gate_constraint = Polynomial::default();
             let mut power = Scalar::ONE;
             for (constraint, instances) in &self.gates {
                 for instance in instances {
-                    let constraint = constraint
-                        .clone()
-                        .remap_variables(instance.column_index as isize);
-                    let selector = self.selectors[instance.selector_index].clone();
-                    gate_constraint +=
-                        selector * constraint.compose(omega, columns.as_slice()) * power;
+                    let constraint = if instance.column_index != 0 {
+                        constraint
+                            .clone()
+                            .remap_variables(instance.column_index as isize)
+                    } else {
+                        constraint.clone()
+                    };
+                    let selector = &self.selectors[instance.selector_index];
+                    gate_constraint += constraint.compose2(&substitution, selector) * power;
                     power *= delta;
                 }
             }
@@ -1137,7 +1173,6 @@ impl Circuit {
 
         let xi = H::challenge(*DST_XI, [committer.transcript_hash()]);
 
-        let omega_inv = omega.invert_unwrap();
         let (commitment, prover) = committer.commit(BTreeSet::from_iter(
             get_rotation_set(self.gates.iter().map(|(constraint, _)| constraint))
                 .into_iter()
