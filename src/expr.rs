@@ -94,15 +94,20 @@ impl Variable {
     }
 
     /// Used by [`Constraint::compose`] when replacing variables with column polynomials.
-    fn rotate_column(&self, omega: Scalar, column: Polynomial) -> Polynomial {
+    pub(crate) fn rotate_column(
+        &self,
+        column: Polynomial,
+        omega: Scalar,
+        omega_inv: Scalar,
+    ) -> Polynomial {
+        // NOTE: `pow_small_vartime` is okay here because these calls depend on the circuit
+        // structure, not on the witness.
         match self.rotation.cmp(&0) {
-            Ordering::Less => column.shift_domain_by(
-                omega
-                    .invert_unwrap()
-                    .pow_small(self.rotation.unsigned_abs()),
-            ),
+            Ordering::Less => {
+                column.shift_domain_by(omega_inv.pow_small_vartime(self.rotation.unsigned_abs()))
+            }
             Ordering::Greater => {
-                column.shift_domain_by(omega.pow_small(self.rotation.unsigned_abs()))
+                column.shift_domain_by(omega.pow_small_vartime(self.rotation.unsigned_abs()))
             }
             Ordering::Equal => column,
         }
@@ -521,6 +526,7 @@ impl Constraint {
     pub fn compose(&self, omega: Scalar, substitution: &[Polynomial]) -> Polynomial {
         let columns_by_variable = {
             let mut columns_by_variable = BTreeMap::default();
+            let omega_inv = omega.invert_vartime().unwrap();
             for (variables, &coefficient) in &self.monomials {
                 if coefficient != Scalar::ZERO {
                     for (&variable, _) in variables {
@@ -528,8 +534,9 @@ impl Constraint {
                             columns_by_variable.insert(
                                 variable,
                                 variable.rotate_column(
-                                    omega,
                                     substitution[variable.column_index()].clone(),
+                                    omega,
+                                    omega_inv,
                                 ),
                             );
                         }
@@ -538,6 +545,10 @@ impl Constraint {
             }
             columns_by_variable
         };
+        self.compose2(&columns_by_variable)
+    }
+
+    pub(crate) fn compose2(&self, substitution: &BTreeMap<Variable, Polynomial>) -> Polynomial {
         self.monomials
             .iter()
             .map(|(variables, &coefficient)| match variables.len() {
@@ -550,10 +561,10 @@ impl Constraint {
                     );
                     let exponent = exponent as usize;
                     match exponent {
-                        1 => columns_by_variable[variable].clone() * coefficient,
+                        1 => substitution[variable].clone() * coefficient,
                         _ => {
                             Polynomial::multiply_batch(std::iter::repeat_n(
-                                &columns_by_variable[variable],
+                                &substitution[variable],
                                 exponent,
                             )) * coefficient
                         }
@@ -566,7 +577,7 @@ impl Constraint {
                                 exponent >= 0,
                                 "the constraint must be canonicalized before composition"
                             );
-                            std::iter::repeat_n(&columns_by_variable[variable], exponent as usize)
+                            std::iter::repeat_n(&substitution[variable], exponent as usize)
                         },
                     )) * coefficient
                 }
