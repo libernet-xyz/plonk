@@ -545,14 +545,10 @@ impl Constraint {
             }
             columns_by_variable
         };
-        self.compose2(&columns_by_variable, &Polynomial::constant(Scalar::ONE))
+        self.compose2(&columns_by_variable)
     }
 
-    pub(crate) fn compose2(
-        &self,
-        substitution: &BTreeMap<Variable, Polynomial>,
-        selector: &Polynomial,
-    ) -> Polynomial {
+    pub(crate) fn compose2(&self, substitution: &BTreeMap<Variable, Polynomial>) -> Polynomial {
         self.monomials
             .iter()
             .map(|(variables, &coefficient)| match variables.len() {
@@ -567,26 +563,23 @@ impl Constraint {
                     match exponent {
                         1 => substitution[variable].clone() * coefficient,
                         _ => {
-                            Polynomial::multiply_batch(
-                                std::iter::repeat_n(&substitution[variable], exponent)
-                                    .chain(std::iter::once(selector)),
-                            ) * coefficient
+                            Polynomial::multiply_batch(std::iter::repeat_n(
+                                &substitution[variable],
+                                exponent,
+                            )) * coefficient
                         }
                     }
                 }
                 _ => {
-                    Polynomial::multiply_batch(
-                        variables
-                            .iter()
-                            .flat_map(|(variable, &exponent)| {
-                                assert!(
-                                    exponent >= 0,
-                                    "the constraint must be canonicalized before composition"
-                                );
-                                std::iter::repeat_n(&substitution[variable], exponent as usize)
-                            })
-                            .chain(std::iter::once(selector)),
-                    ) * coefficient
+                    Polynomial::multiply_batch(variables.iter().flat_map(
+                        |(variable, &exponent)| {
+                            assert!(
+                                exponent >= 0,
+                                "the constraint must be canonicalized before composition"
+                            );
+                            std::iter::repeat_n(&substitution[variable], exponent as usize)
+                        },
+                    )) * coefficient
                 }
             })
             .fold(Polynomial::default(), Polynomial::add)

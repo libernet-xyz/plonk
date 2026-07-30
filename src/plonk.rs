@@ -1144,8 +1144,8 @@ impl Circuit {
                     } else {
                         constraint.clone()
                     };
-                    let selector = &self.selectors[instance.selector_index];
-                    gate_constraint += constraint.compose2(&substitution, selector) * power;
+                    let selector = self.selectors[instance.selector_index].clone();
+                    gate_constraint += selector * constraint.compose2(&substitution) * power;
                     power *= delta;
                 }
             }
