@@ -985,14 +985,11 @@ impl Circuit {
         let mut substitution: BTreeMap<Variable, Polynomial> = BTreeMap::default();
         for (constraint, instances) in &self.gates {
             for instance in instances {
-                let constraint = if instance.column_index != 0 {
-                    constraint
-                        .clone()
-                        .remap_variables(instance.column_index as isize)
-                } else {
-                    constraint.clone()
-                };
-                for variable in constraint.get_free_variables() {
+                for variable in constraint
+                    .get_free_variables()
+                    .into_iter()
+                    .map(|variable| variable.remap(instance.column_index as isize))
+                {
                     if !substitution.contains_key(&variable) {
                         let column = variable.rotate_column(
                             columns[variable.column_index()].clone(),
