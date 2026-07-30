@@ -163,11 +163,15 @@ impl<'a> Parser<'a> {
         loop {
             match self.peek_token()? {
                 Token::Power => {
-                    if !base.can_raise() {
-                        return Err(anyhow!("expression `{}` cannot be raised", base));
-                    }
                     self.next_token();
-                    base ^= self.parse_exponent()?;
+                    let exponent = self.parse_exponent()?;
+                    if !base.can_raise_to(exponent) {
+                        return Err(anyhow!(
+                            "expression `{}` cannot be raised to a negative power",
+                            base
+                        ));
+                    }
+                    base ^= exponent;
                 }
                 _ => {
                     return Ok(base);
@@ -349,6 +353,18 @@ mod tests {
         assert_eq!(parse("var(0) ^ -0 == 0"), make_const(1));
         assert_eq!(parse("var(0) ^ -1 == 0"), var(0) ^ -1);
         assert_eq!(parse("var(0) ^ -2 == 0"), var(0) ^ -2);
+    }
+
+    #[test]
+    fn test_power_sum_positive_exponent() {
+        assert_eq!(parse("(var(0) + var(1)) ^ 2 == 0"), (var(0) + var(1)) ^ 2);
+        assert_eq!(parse("(var(0) + var(1)) ^ 3 == 0"), (var(0) + var(1)) ^ 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot be raised to a negative power")]
+    fn test_power_sum_negative_exponent_panics() {
+        let _ = parse("(var(0) + var(1)) ^ -2 == 0");
     }
 
     #[test]

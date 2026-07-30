@@ -313,12 +313,12 @@ impl Constraint {
             .join(" + ")
     }
 
-    /// Indicates whether this constraint expression can be raised to a power.
+    /// Indicates whether this constraint expression can be raised to the given power.
     ///
-    /// Raising can only be done when the expression is not a sum, otherwise our exponentiation
-    /// algorithm panics.
-    pub fn can_raise(&self) -> bool {
-        self.monomials.len() < 2
+    /// Any expression can be raised to a non-negative power (sums use a square-and-multiply
+    /// algorithm), but negative powers are only supported when the expression is not a sum.
+    pub fn can_raise_to(&self, exponent: isize) -> bool {
+        exponent >= 0 || self.monomials.len() < 2
     }
 
     /// Returns the list of variables referenced by this constraint expression, represented as a set
@@ -789,7 +789,7 @@ impl BitXorAssign<isize> for Constraint {
     /// That's counterintuitive but unfortunately Rust doesn't provide a proper power operation, and
     /// exponentiation is often necessary when defining PLONK constraints. Make sure to always
     /// parenthesize accordingly, eg. `x + (y ^ 2)`.
-    fn bitxor_assign(&mut self, rhs: isize) {
+    fn bitxor_assign(&mut self, mut rhs: isize) {
         match rhs {
             0 => {
                 self.monomials = BTreeMap::from([(BTreeMap::default(), Scalar::ONE)]);
@@ -819,7 +819,16 @@ impl BitXorAssign<isize> for Constraint {
                         .collect();
                 }
                 _ => {
-                    panic!("raising a sum to a power is forbidden, try to simplify your constraint")
+                    assert!(rhs >= 0, "cannot raise a sum to a negative power");
+                    let mut result = Self::make_const(Scalar::ONE);
+                    while rhs != 0 {
+                        if (rhs & 1) != 0 {
+                            result.mul_assign(self.clone());
+                        }
+                        rhs >>= 1;
+                        self.mul_assign(self.clone());
+                    }
+                    *self = result;
                 }
             },
         }
@@ -1680,9 +1689,35 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "raising a sum to a power is forbidden")]
-    fn test_pow_sum_panics() {
-        let _ = (var(0) + var(1)) ^ 2;
+    fn test_squared_sum() {
+        let constraint = (var(0) + var(1)) ^ 2;
+        assert_eq!(
+            constraint,
+            (var(0) ^ 2) + (var(1) ^ 2) + var(0) * var(1) * 2
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            (from_const(12) + from_const(34)).square()
+        );
+        assert_eq!(
+            constraint.to_string(),
+            "2 * var(0) * var(1) + var(0) ^ 2 + var(1) ^ 2"
+        );
+    }
+
+    #[test]
+    fn test_cubed_sum() {
+        let constraint = (var(0) + var(1)) ^ 3;
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            (from_const(12) + from_const(34)).pow_small_vartime(3)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot raise a sum to a negative power")]
+    fn test_pow_sum_negative_exponent_panics() {
+        let _ = (var(0) + var(1)) ^ -2;
     }
 
     #[test]
