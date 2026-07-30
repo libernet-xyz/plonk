@@ -83,9 +83,12 @@ impl Variable {
     }
 
     /// Remaps the variable to a different column index, as per [`Constraint::remap_variables`].
-    pub const fn remap(self, column_offset: usize) -> Self {
+    pub const fn remap(self, column_offset: isize) -> Self {
+        assert!(self.column_index <= isize::MAX as usize);
+        let column_index = column_offset + (self.column_index as isize);
+        assert!(column_index >= 0);
         Self {
-            column_index: column_offset + self.column_index,
+            column_index: column_index as usize,
             rotation: self.rotation,
         }
     }
@@ -192,7 +195,19 @@ impl Constraint {
         Self::default()
     }
 
-    pub fn remap_variables(self, column_offset: usize) -> Self {
+    pub(crate) fn get_min_column_index(&self) -> usize {
+        self.monomials
+            .iter()
+            .flat_map(|(variables, _)| {
+                variables
+                    .iter()
+                    .map(|(variable, _)| variable.column_index())
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
+    pub fn remap_variables(self, column_offset: isize) -> Self {
         Self {
             monomials: self
                 .monomials
@@ -298,12 +313,12 @@ impl Constraint {
             .join(" + ")
     }
 
-    /// Indicates whether this constraint expression can be raised to a power.
+    /// Indicates whether this constraint expression can be raised to the given power.
     ///
-    /// Raising can only be done when the expression is not a sum, otherwise our exponentiation
-    /// algorithm panics.
-    pub fn can_raise(&self) -> bool {
-        self.monomials.len() < 2
+    /// Any expression can be raised to a non-negative power (sums use a square-and-multiply
+    /// algorithm), but negative powers are only supported when the expression is not a sum.
+    pub fn can_raise_to(&self, exponent: isize) -> bool {
+        exponent >= 0 || self.monomials.len() < 2
     }
 
     /// Returns the list of variables referenced by this constraint expression, represented as a set
@@ -523,33 +538,18 @@ impl Constraint {
             }
             columns_by_variable
         };
-        let mut result = Polynomial::default();
-        for (variables, &coefficient) in &self.monomials {
-            if coefficient == Scalar::ZERO {
-                continue;
-            }
-            let mut monomial = Polynomial::constant(coefficient);
-            for (variable, &exponent) in variables {
-                let column = &columns_by_variable[variable];
-                match exponent {
-                    0 => {}
-                    1 => {
-                        monomial *= column.clone();
-                    }
-                    exponent => {
-                        assert!(
-                            exponent > 0,
-                            "the constraint must be canonicalized before composition"
-                        );
-                        for _ in 0..exponent {
-                            monomial *= column.clone();
-                        }
-                    }
-                }
-            }
-            result += monomial;
-        }
-        result
+        self.monomials
+            .iter()
+            .map(|(variables, &coefficient)| {
+                Polynomial::multiply_batch(variables.iter().flat_map(|(variable, &exponent)| {
+                    assert!(
+                        exponent >= 0,
+                        "the constraint must be canonicalized before composition"
+                    );
+                    std::iter::repeat_n(&columns_by_variable[variable], exponent as usize)
+                })) * coefficient
+            })
+            .fold(Polynomial::default(), Polynomial::add)
     }
 }
 
@@ -774,7 +774,7 @@ impl BitXorAssign<isize> for Constraint {
     /// That's counterintuitive but unfortunately Rust doesn't provide a proper power operation, and
     /// exponentiation is often necessary when defining PLONK constraints. Make sure to always
     /// parenthesize accordingly, eg. `x + (y ^ 2)`.
-    fn bitxor_assign(&mut self, rhs: isize) {
+    fn bitxor_assign(&mut self, mut rhs: isize) {
         match rhs {
             0 => {
                 self.monomials = BTreeMap::from([(BTreeMap::default(), Scalar::ONE)]);
@@ -804,7 +804,16 @@ impl BitXorAssign<isize> for Constraint {
                         .collect();
                 }
                 _ => {
-                    panic!("raising a sum to a power is forbidden, try to simplify your constraint")
+                    assert!(rhs >= 0, "cannot raise a sum to a negative power");
+                    let mut result = Self::make_const(Scalar::ONE);
+                    while rhs != 0 {
+                        if (rhs & 1) != 0 {
+                            result.mul_assign(self.clone());
+                        }
+                        rhs >>= 1;
+                        self.mul_assign(self.clone());
+                    }
+                    *self = result;
                 }
             },
         }
@@ -931,6 +940,121 @@ mod tests {
     fn test_remap_raw_variable() {
         let variable = Variable::new(12, 34);
         assert_eq!(variable.remap(56), Variable::new(68, 34));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_remap_raw_variable_negative_overflow_panics() {
+        let _ = Variable::new(0, 34).remap(-1);
+    }
+
+    #[test]
+    fn test_remap_variables_single() {
+        let constraint = var(3).remap_variables(5);
+        assert_eq!(constraint, var(8));
+    }
+
+    #[test]
+    fn test_remap_variables_negative_offset() {
+        let constraint = var(5).remap_variables(-5);
+        assert_eq!(constraint, var(0));
+    }
+
+    #[test]
+    fn test_remap_variables_preserves_rotation() {
+        let constraint = rvar(3, -2).remap_variables(4);
+        assert_eq!(constraint, rvar(7, -2));
+    }
+
+    #[test]
+    fn test_remap_variables_sum() {
+        let constraint = (var(0) + var(2)).remap_variables(3);
+        assert_eq!(constraint, var(3) + var(5));
+    }
+
+    #[test]
+    fn test_remap_variables_preserves_exponents() {
+        let constraint = (var(2) ^ 3).remap_variables(1);
+        assert_eq!(constraint, var(3) ^ 3);
+    }
+
+    #[test]
+    fn test_remap_variables_preserves_constant_terms() {
+        let constraint = (var(0) + make_const(7)).remap_variables(2);
+        assert_eq!(constraint, var(2) + make_const(7));
+    }
+
+    #[test]
+    fn test_remap_variables_zero_offset_is_identity() {
+        let constraint = var(0) * var(1) + make_const(9);
+        assert_eq!(constraint.clone().remap_variables(0), constraint);
+    }
+
+    #[test]
+    fn test_remap_variables_round_trip() {
+        let constraint = var(2) + var(4) * var(6);
+        let remapped = constraint.clone().remap_variables(10).remap_variables(-10);
+        assert_eq!(remapped, constraint);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_remap_variables_negative_overflow_panics() {
+        let _ = var(0).remap_variables(-1);
+    }
+
+    #[test]
+    fn test_min_column_index_empty() {
+        let constraint = Constraint::nop();
+        assert_eq!(constraint.get_min_column_index(), 0);
+    }
+
+    #[test]
+    fn test_min_column_index_constant() {
+        let constraint = make_const(5);
+        assert_eq!(constraint.get_min_column_index(), 0);
+    }
+
+    #[test]
+    fn test_min_column_index_single_variable_at_zero() {
+        let constraint = var(0);
+        assert_eq!(constraint.get_min_column_index(), 0);
+    }
+
+    #[test]
+    fn test_min_column_index_single_variable_nonzero() {
+        let constraint = var(3);
+        assert_eq!(constraint.get_min_column_index(), 3);
+    }
+
+    #[test]
+    fn test_min_column_index_ignores_rotation() {
+        let constraint = rvar(4, -3) + rvar(4, 7);
+        assert_eq!(constraint.get_min_column_index(), 4);
+    }
+
+    #[test]
+    fn test_min_column_index_multiple_variables_in_one_monomial() {
+        let constraint = var(6) * var(3);
+        assert_eq!(constraint.get_min_column_index(), 3);
+    }
+
+    #[test]
+    fn test_min_column_index_across_monomials() {
+        let constraint = (var(7) * var(9)) + var(2);
+        assert_eq!(constraint.get_min_column_index(), 2);
+    }
+
+    #[test]
+    fn test_min_column_index_unordered_sum() {
+        let constraint = var(5) + var(2) + var(8);
+        assert_eq!(constraint.get_min_column_index(), 2);
+    }
+
+    #[test]
+    fn test_min_column_index_constant_term_does_not_mask_variable_minimum() {
+        let constraint = var(5) + make_const(3);
+        assert_eq!(constraint.get_min_column_index(), 5);
     }
 
     fn evaluate<const N: usize>(constraint: &Constraint, substitution: [Scalar; N]) -> Scalar {
@@ -1550,9 +1674,35 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "raising a sum to a power is forbidden")]
-    fn test_pow_sum_panics() {
-        let _ = (var(0) + var(1)) ^ 2;
+    fn test_squared_sum() {
+        let constraint = (var(0) + var(1)) ^ 2;
+        assert_eq!(
+            constraint,
+            (var(0) ^ 2) + (var(1) ^ 2) + var(0) * var(1) * 2
+        );
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            (from_const(12) + from_const(34)).square()
+        );
+        assert_eq!(
+            constraint.to_string(),
+            "2 * var(0) * var(1) + var(0) ^ 2 + var(1) ^ 2"
+        );
+    }
+
+    #[test]
+    fn test_cubed_sum() {
+        let constraint = (var(0) + var(1)) ^ 3;
+        assert_eq!(
+            evaluate(&constraint, [from_const(12), from_const(34)]),
+            (from_const(12) + from_const(34)).pow_small_vartime(3)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot raise a sum to a negative power")]
+    fn test_pow_sum_negative_exponent_panics() {
+        let _ = (var(0) + var(1)) ^ -2;
     }
 
     #[test]

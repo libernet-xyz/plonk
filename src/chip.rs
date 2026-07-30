@@ -9,6 +9,9 @@ pub trait Chip<const I: usize, const O: usize> {
     /// Returns the number of columns required by the chip.
     fn width(&self) -> usize;
 
+    /// Returns the number of rows used by the chip.
+    fn height(&self) -> usize;
+
     /// Builds the chip on the provided [`CircuitView`].
     fn build(
         &self,
@@ -31,6 +34,9 @@ pub trait Chip<const I: usize, const O: usize> {
 pub trait DynamicChip {
     /// Returns the number of columns required by the chip.
     fn width(&self) -> usize;
+
+    /// Returns the number of rows used by the chip.
+    fn height(&self) -> usize;
 
     /// Builds the chip on the provided [`CircuitView`].
     fn build(

@@ -443,7 +443,12 @@ pub struct CircuitBuilder {
 }
 
 impl CircuitBuilder {
-    fn add_gate_internal(&mut self, root_cell: Cell, constraint: Constraint) {
+    fn add_gate_internal(&mut self, mut root_cell: Cell, mut constraint: Constraint) {
+        {
+            let min_column_index = constraint.get_min_column_index();
+            root_cell = root_cell.remap(Cell::new(0, min_column_index));
+            constraint = constraint.remap_variables(-(min_column_index as isize));
+        }
         let row = root_cell.row();
         let column = root_cell.column();
         {
@@ -1025,8 +1030,8 @@ impl Circuit {
             lhs - rhs
         };
 
-        let fixpoint_constraint =
-            (accumulator.clone() - Scalar::ONE) * Polynomial::lagrange0(self.degree_bound).clone();
+        let fixpoint_constraint = (accumulator.clone() - Scalar::ONE)
+            * Polynomial::lagrange0_2(self.degree_bound).clone();
 
         Ok((accumulator, fixpoint_constraint, recurrence_constraint))
     }
@@ -1099,7 +1104,9 @@ impl Circuit {
             let mut power = Scalar::ONE;
             for (constraint, instances) in &self.gates {
                 for instance in instances {
-                    let constraint = constraint.clone().remap_variables(instance.column_index);
+                    let constraint = constraint
+                        .clone()
+                        .remap_variables(instance.column_index as isize);
                     let selector = self.selectors[instance.selector_index].clone();
                     gate_constraint +=
                         selector * constraint.compose(omega, columns.as_slice()) * power;
@@ -1406,7 +1413,9 @@ impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
             let mut power = Scalar::ONE;
             for (constraint, gate_instances) in &self.gates {
                 for instance in gate_instances {
-                    let constraint = constraint.clone().remap_variables(instance.column_index);
+                    let constraint = constraint
+                        .clone()
+                        .remap_variables(instance.column_index as isize);
                     let substitution: BTreeMap<Variable, Scalar> = constraint
                         .get_free_variables()
                         .into_iter()
