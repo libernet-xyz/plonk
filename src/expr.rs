@@ -538,33 +538,18 @@ impl Constraint {
             }
             columns_by_variable
         };
-        let mut result = Polynomial::default();
-        for (variables, &coefficient) in &self.monomials {
-            if coefficient == Scalar::ZERO {
-                continue;
-            }
-            let mut monomial = Polynomial::constant(coefficient);
-            for (variable, &exponent) in variables {
-                let column = &columns_by_variable[variable];
-                match exponent {
-                    0 => {}
-                    1 => {
-                        monomial *= column.clone();
-                    }
-                    exponent => {
-                        assert!(
-                            exponent > 0,
-                            "the constraint must be canonicalized before composition"
-                        );
-                        for _ in 0..exponent {
-                            monomial *= column.clone();
-                        }
-                    }
-                }
-            }
-            result += monomial;
-        }
-        result
+        self.monomials
+            .iter()
+            .map(|(variables, &coefficient)| {
+                Polynomial::multiply_batch(variables.iter().flat_map(|(variable, &exponent)| {
+                    assert!(
+                        exponent >= 0,
+                        "the constraint must be canonicalized before composition"
+                    );
+                    std::iter::repeat_n(&columns_by_variable[variable], exponent as usize)
+                })) * coefficient
+            })
+            .fold(Polynomial::default(), Polynomial::add)
     }
 }
 
