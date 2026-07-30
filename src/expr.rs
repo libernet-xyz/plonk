@@ -540,14 +540,36 @@ impl Constraint {
         };
         self.monomials
             .iter()
-            .map(|(variables, &coefficient)| {
-                Polynomial::multiply_batch(variables.iter().flat_map(|(variable, &exponent)| {
+            .map(|(variables, &coefficient)| match variables.len() {
+                0 => Polynomial::constant(coefficient),
+                1 => {
+                    let (variable, &exponent) = variables.iter().next().unwrap();
                     assert!(
                         exponent >= 0,
                         "the constraint must be canonicalized before composition"
                     );
-                    std::iter::repeat_n(&columns_by_variable[variable], exponent as usize)
-                })) * coefficient
+                    let exponent = exponent as usize;
+                    match exponent {
+                        1 => columns_by_variable[variable].clone() * coefficient,
+                        _ => {
+                            Polynomial::multiply_batch(std::iter::repeat_n(
+                                &columns_by_variable[variable],
+                                exponent,
+                            )) * coefficient
+                        }
+                    }
+                }
+                _ => {
+                    Polynomial::multiply_batch(variables.iter().flat_map(
+                        |(variable, &exponent)| {
+                            assert!(
+                                exponent >= 0,
+                                "the constraint must be canonicalized before composition"
+                            );
+                            std::iter::repeat_n(&columns_by_variable[variable], exponent as usize)
+                        },
+                    )) * coefficient
+                }
             })
             .fold(Polynomial::default(), Polynomial::add)
     }
