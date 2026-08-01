@@ -31,7 +31,15 @@ impl Cell {
         self.column
     }
 
-    pub(crate) const fn remap(self, root_cell: Cell) -> Self {
+    /// Shift this cell by row and column offsets equal to the row and column of `root_cell`.
+    ///
+    /// This function can be used with the [root cell](`internal::WitnessViewState::root_cell`) of a
+    /// view to convert a cell relative to the view to an absolute one.
+    ///
+    /// Note that our views never generate relative cells. Both [`crate::plonk::CircuitView::cell`]
+    /// and [`crate::witness::WitnessView::cell`] return absolute cells, so the only way to work
+    /// with relative cells is to construct them directly with [`Cell::new`].
+    pub const fn remap(self, root_cell: Cell) -> Self {
         Self {
             row: root_cell.row + self.row,
             column: root_cell.column + self.column,
