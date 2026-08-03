@@ -475,6 +475,10 @@ impl CircuitBuilder {
     fn connect_internal(&mut self, cell1: Option<Cell>, cell2: Option<Cell>) {
         match (cell1, cell2) {
             (Some(cell1), Some(cell2)) => {
+                self.num_rows = std::cmp::max(self.num_rows, cell1.row() + 1);
+                self.num_rows = std::cmp::max(self.num_rows, cell2.row() + 1);
+                self.num_columns = std::cmp::max(self.num_columns, cell1.column() + 1);
+                self.num_columns = std::cmp::max(self.num_columns, cell2.column() + 1);
                 self.partitioner.connect(cell1, cell2);
             }
             _ => {}
