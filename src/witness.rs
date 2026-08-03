@@ -31,7 +31,21 @@ impl Cell {
         self.column
     }
 
-    /// Shift this cell by row and column offsets equal to the row and column of `root_cell`.
+    /// Shifts this cell by the specified row and column offsets.
+    ///
+    /// Panics if the resulting cell has a negative row or column.
+    pub const fn shift(self, row_shift: isize, column_shift: isize) -> Self {
+        let row = self.row as isize + row_shift;
+        let column = self.column as isize + column_shift;
+        assert!(row >= 0);
+        assert!(column >= 0);
+        Self {
+            row: row as usize,
+            column: column as usize,
+        }
+    }
+
+    /// Shifts this cell by row and column offsets equal to the row and column of `root_cell`.
     ///
     /// This function can be used with the [root cell](`internal::WitnessViewState::root_cell`) of a
     /// view to convert a cell relative to the view to an absolute one.
@@ -683,6 +697,20 @@ mod tests {
         let cell = cell(56, 78);
         assert_eq!(cell.row(), 56);
         assert_eq!(cell.column(), 78);
+    }
+
+    #[test]
+    fn test_shift_cell_1() {
+        let cell = cell(12, 34).shift(56, 78);
+        assert_eq!(cell.row(), 68);
+        assert_eq!(cell.column(), 112);
+    }
+
+    #[test]
+    fn test_shift_cell_2() {
+        let cell = cell(56, 78).shift(42, 43);
+        assert_eq!(cell.row(), 98);
+        assert_eq!(cell.column(), 121);
     }
 
     #[test]

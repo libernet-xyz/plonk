@@ -475,6 +475,10 @@ impl CircuitBuilder {
     fn connect_internal(&mut self, cell1: Option<Cell>, cell2: Option<Cell>) {
         match (cell1, cell2) {
             (Some(cell1), Some(cell2)) => {
+                self.num_rows = std::cmp::max(self.num_rows, cell1.row() + 1);
+                self.num_rows = std::cmp::max(self.num_rows, cell2.row() + 1);
+                self.num_columns = std::cmp::max(self.num_columns, cell1.column() + 1);
+                self.num_columns = std::cmp::max(self.num_columns, cell2.column() + 1);
                 self.partitioner.connect(cell1, cell2);
             }
             _ => {}
@@ -852,6 +856,13 @@ impl Circuit {
         self.num_columns
     }
 
+    pub fn num_gates(&self) -> usize {
+        self.gates
+            .iter()
+            .map(|(_, instances)| instances.len())
+            .sum()
+    }
+
     pub fn public_rows(&self) -> &BTreeSet<usize> {
         &self.public_rows
     }
@@ -1045,16 +1056,34 @@ impl Circuit {
         let shifted = accumulator.clone().shift_domain_by(omega);
 
         let recurrence_constraint = {
-            let mut lhs = shifted;
-            for (column, sigma) in columns.iter().zip(self.sigma.iter()) {
-                lhs *= column.clone() + sigma.clone() * beta + gamma;
-            }
-            let mut rhs = accumulator.clone();
+            let lhs = Polynomial::multiply_batch(
+                std::iter::once(shifted)
+                    .chain(
+                        columns
+                            .iter()
+                            .zip(self.sigma.iter())
+                            .map(|(column, sigma)| column.clone() + sigma.clone() * beta + gamma),
+                    )
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            );
+
             let mut power = Scalar::ONE;
-            for column in columns {
-                rhs *= column.clone() + Polynomial::with_coefficients(vec![gamma, beta * power]);
-                power *= Scalar::MULTIPLICATIVE_GENERATOR;
-            }
+            let rhs = Polynomial::multiply_batch(
+                std::iter::once(&accumulator).chain(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            let column = column.clone()
+                                + Polynomial::with_coefficients(vec![gamma, beta * power]);
+                            power *= Scalar::MULTIPLICATIVE_GENERATOR;
+                            column
+                        })
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                ),
+            );
+
             lhs - rhs
         };
 
@@ -1289,7 +1318,7 @@ pub struct CompressedCircuit<H: HashBackend<Scalar>> {
     /// List of rows that are revealed in the proofs.
     public_rows: BTreeSet<usize>,
 
-    /// Merkle root of the circuit selectors.
+    /// Merkle root of the circuit selectors and sigma polynomials.
     circuit_commitment: H256,
 
     _data: PhantomData<H>,
@@ -1310,6 +1339,10 @@ impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
 
     pub fn public_rows(&self) -> &BTreeSet<usize> {
         &self.public_rows
+    }
+
+    pub fn commitment(&self) -> H256 {
+        self.circuit_commitment
     }
 
     /// Calculates the number of chunks the quotient was split into.
@@ -1553,6 +1586,10 @@ mod tests {
     use starkom_bluesky::from_const;
     use starkom_pcs::hash::{Poseidon1Hash, Poseidon2Hash, Sha2Hash};
 
+    fn parse_hash(s: &'static str) -> H256 {
+        s.parse().unwrap()
+    }
+
     #[inline]
     fn cell(row: usize, column: usize) -> Cell {
         Cell::new(row, column)
@@ -1563,6 +1600,7 @@ mod tests {
     fn test_vitalik_circuit_impl<H: HashBackend<Scalar>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
+        commitment: H256,
     ) -> Result<()> {
         let mut builder = CircuitBuilder::default();
         builder.add_gate(0, (var(0) ^ 2) - var(1));
@@ -1579,6 +1617,7 @@ mod tests {
         assert_eq!(circuit.num_rows(), 3);
         assert_eq!(circuit.degree_bound(), 8);
         assert_eq!(circuit.num_columns(), 3);
+        assert_eq!(circuit.num_gates(), 3);
         let mut witness = circuit.make_witness();
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
@@ -1597,7 +1636,9 @@ mod tests {
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
         assert_eq!(proof.num_polys(), 13);
-        let public_inputs = circuit.verify(&proof, options)?;
+        let circuit = circuit.to_compressed(options);
+        assert_eq!(circuit.commitment(), commitment);
+        let public_inputs = circuit.verify(&proof)?;
         assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
         assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
         Ok(())
@@ -1605,61 +1646,71 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_2() {
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 1).is_ok());
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 1).is_ok());
+        let c = parse_hash("0x2732a0cce5e03109e372c39515b4e3cc7aae87adfde949418c7f5918e4cea1f9");
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 1, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 1, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon1_blowup_2() {
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 1).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 1).is_ok());
+        let c = parse_hash("0x4c0f5d5f66539f75d5b6aee98ffc568beb42e3e7e0cb4ed90d41e64d4be837e0");
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 1, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 1, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_2() {
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 1).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 1).is_ok());
+        let c = parse_hash("0x5508e170339ecee104b4b4d7ca3a85e793016286d39000c09c24c79580cf75cf");
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 1, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 1, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_4() {
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 2).is_ok());
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 2).is_ok());
+        let c = parse_hash("0xd81086a421590d6b5517c86495fcc3f52c983ff49e9d7e9cbc034fdb7cb77782");
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 2, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 2, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon1_blowup_4() {
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 2).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 2).is_ok());
+        let c = parse_hash("0x4b1ab763f019c48274cf9befb19a851105834ae5f3b1fc85a905025cf4da6211");
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 2, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 2, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_4() {
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 2).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 2).is_ok());
+        let c = parse_hash("0x726e2fb39c3ac77f8abda66ad8f43b26ec1bdc2e996c70b4bbe9871d8a961e56");
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 2, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 2, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_8() {
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 3).is_ok());
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 3).is_ok());
+        let c = parse_hash("0xdb14b315aa52e49402a85544104520629b245a2fcecf33b15eebb39e0c711aa5");
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 3, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 3, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon1_blowup_8() {
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 3).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 3).is_ok());
+        let c = parse_hash("0x104be93670e60515e8a99a4470fa15784544a15aae1b4e314a0cb85cc9c2f6e8");
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 3, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 3, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_poseidon2_blowup_8() {
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 3).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 3).is_ok());
+        let c = parse_hash("0x0f6a49c82bc868f6454d2d520224c591c6155533bd88a906ad8918fdc09461a9");
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 3, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 3, c).is_ok());
     }
 
     fn test_vitalik_circuit_with_auto_gates_impl<H: HashBackend<Scalar>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
+        commitment: H256,
     ) -> Result<()> {
         let mut builder = CircuitBuilder::default();
         let [x, square] = builder.auto_gate((var(0) ^ 2) - var(1), []);
@@ -1675,6 +1726,7 @@ mod tests {
         assert_eq!(circuit.num_rows(), 3);
         assert_eq!(circuit.degree_bound(), 8);
         assert_eq!(circuit.num_columns(), 3);
+        assert_eq!(circuit.num_gates(), 3);
         let mut witness = circuit.make_witness();
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
@@ -1693,7 +1745,9 @@ mod tests {
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
         assert_eq!(proof.num_polys(), 13);
-        let public_inputs = circuit.verify(&proof, options)?;
+        let circuit = circuit.to_compressed(options);
+        assert_eq!(circuit.commitment(), commitment);
+        let public_inputs = circuit.verify(&proof)?;
         assert_eq!(public_inputs[&x], from_const(3));
         assert_eq!(public_inputs[&result], from_const(35));
         Ok(())
@@ -1701,14 +1755,16 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_with_auto_gates_blowup_2() {
-        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(false, 1).is_ok());
-        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(true, 1).is_ok());
+        let c = parse_hash("0x2732a0cce5e03109e372c39515b4e3cc7aae87adfde949418c7f5918e4cea1f9");
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(false, 1, c).is_ok());
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(true, 1, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_with_auto_gates_blowup_4() {
-        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(false, 2).is_ok());
-        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(true, 2).is_ok());
+        let c = parse_hash("0xd81086a421590d6b5517c86495fcc3f52c983ff49e9d7e9cbc034fdb7cb77782");
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(false, 2, c).is_ok());
+        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(true, 2, c).is_ok());
     }
 
     /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
@@ -1716,6 +1772,7 @@ mod tests {
     fn test_vitalik_circuit_variation_impl<H: HashBackend<Scalar>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
+        commitment: H256,
     ) -> Result<()> {
         let mut builder = CircuitBuilder::default();
         let [x, square] = builder.auto_gate((var(0) ^ 2) - var(1), []);
@@ -1732,6 +1789,7 @@ mod tests {
         assert_eq!(circuit.num_rows(), 4);
         assert_eq!(circuit.degree_bound(), 8);
         assert_eq!(circuit.num_columns(), 4);
+        assert_eq!(circuit.num_gates(), 4);
         let mut witness = circuit.make_witness();
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 8);
@@ -1755,7 +1813,9 @@ mod tests {
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
         assert_eq!(proof.num_polys(), 17);
-        let public_inputs = circuit.verify(&proof, options)?;
+        let circuit = circuit.to_compressed(options);
+        assert_eq!(circuit.commitment(), commitment);
+        let public_inputs = circuit.verify(&proof)?;
         assert_eq!(public_inputs[&x], from_const(3));
         assert_eq!(public_inputs[&y], from_const(4));
         assert_eq!(public_inputs[&result], from_const(44));
@@ -1764,15 +1824,16 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_variation_blowup_2() {
-        test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 1).unwrap();
-        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 1).is_ok());
-        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 1).is_ok());
+        let c = parse_hash("0x3fd5a29b97c62d5899b807aef6eed75d108e51774f22a4b354f6aa84c46b938a");
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 1, c).is_ok());
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 1, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_variation_blowup_4() {
-        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 2).is_ok());
-        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 2).is_ok());
+        let c = parse_hash("0xf966855fcd2cfce8b257312f1e7964d3824874376522fe497050ce313e078c50");
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 2, c).is_ok());
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 2, c).is_ok());
     }
 
     fn build_vitalik_circuit() -> Circuit {
