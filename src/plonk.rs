@@ -10,7 +10,7 @@ use starkom_pcs::{self as pcs, hash::HashBackend};
 use starkom_poly;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
-use std::sync::{LazyLock, atomic::AtomicUsize};
+use std::sync::LazyLock;
 
 type Polynomial = starkom_poly::Polynomial<Scalar>;
 
@@ -1027,8 +1027,6 @@ impl Circuit {
     ) -> Result<(Polynomial, Polynomial, Polynomial)> {
         let omega = Polynomial::domain_element2(1, self.degree_bound);
 
-        eprintln!("building permutation accumulator...");
-
         let accumulator = {
             let mut accumulator = vec![Scalar::ZERO; self.degree_bound + 1];
 
@@ -1052,16 +1050,10 @@ impl Circuit {
                 return Err(anyhow!("permutation accumulator wraparound check failed"));
             }
 
-            eprintln!("permutation wraparound check succeeded");
-
             Polynomial::encode2(accumulator)
         };
 
         let shifted = accumulator.clone().shift_domain_by(omega);
-
-        eprintln!("permutation accumulator encoded and shifted");
-
-        eprintln!("building recurrence constraint...");
 
         let recurrence_constraint = {
             let lhs = Polynomial::multiply_batch(
@@ -1075,8 +1067,6 @@ impl Circuit {
                     .collect::<Vec<_>>()
                     .as_slice(),
             );
-
-            eprintln!("...LHS done");
 
             let mut power = Scalar::ONE;
             let rhs = Polynomial::multiply_batch(
@@ -1094,12 +1084,8 @@ impl Circuit {
                 ),
             );
 
-            eprintln!("...RHS done");
-
             lhs - rhs
         };
-
-        eprintln!("building fixpoint constraint...");
 
         let fixpoint_constraint = (accumulator.clone() - Scalar::ONE)
             * Polynomial::lagrange0_2(self.degree_bound).clone();
@@ -1177,15 +1163,6 @@ impl Circuit {
             let mut power = Scalar::ONE;
             for (constraint, instances) in &self.gates {
                 for instance in instances {
-                    {
-                        static COUNTER: LazyLock<AtomicUsize> =
-                            LazyLock::new(|| AtomicUsize::default());
-                        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        eprintln!(
-                            "gate {}, {:?} at {}",
-                            count, constraint, instance.column_index
-                        );
-                    }
                     let constraint = if instance.column_index != 0 {
                         constraint
                             .clone()
@@ -1201,8 +1178,6 @@ impl Circuit {
             gate_constraint
         };
 
-        eprintln!("building permutation argument...");
-
         let (
             permutation_accumulator,
             permutation_fixpoint_constraint,
@@ -1213,30 +1188,18 @@ impl Circuit {
             self.build_permutation_argument(&witness, columns.as_slice(), beta, gamma)?
         };
 
-        eprintln!("hashing permutation accumulator...");
-
         committer.add_batch(vec![permutation_accumulator]);
 
         let alpha = H::challenge(*DST_ALPHA, [committer.transcript_hash()]);
-
-        eprintln!("alpha = {}", alpha);
-
-        eprintln!("building final quotient...");
 
         let quotient = (gate_constraint
             + permutation_fixpoint_constraint * alpha
             + permutation_recurrence_constraint * alpha.square())
         .divide_by_zero(self.degree_bound)?;
 
-        eprintln!("splitting and hashing final quotient...");
-
         committer.add_batch(self.split_quotient(quotient));
 
         let xi = H::challenge(*DST_XI, [committer.transcript_hash()]);
-
-        eprintln!("xi = {}", xi);
-
-        eprintln!("committing...");
 
         let (commitment, prover) = committer.commit(BTreeSet::from_iter(
             get_rotation_set(self.gates.iter().map(|(constraint, _)| constraint))
@@ -1248,11 +1211,7 @@ impl Circuit {
                 .chain(self.public_rows.iter().map(|&row| omega.pow_small(row))),
         ));
 
-        eprintln!("proving...");
-
         let inner_proof = prover.prove(&commitment);
-
-        eprintln!("done");
 
         Ok(Proof {
             commitment,
