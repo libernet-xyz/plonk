@@ -227,7 +227,7 @@ pub trait WitnessView {
 
     /// Indicates whether the specified `cell` is contained in this view.
     ///
-    /// Always true for the root [`CircuitBuilder`].
+    /// Always true for the root [`Witness`].
     fn contains_cell(&self, cell: Cell) -> bool {
         let row_offset = self.row_offset();
         let column_offset = self.column_offset();
@@ -932,6 +932,18 @@ mod tests {
     }
 
     #[test]
+    fn test_contains_cell_root_view() {
+        let witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        assert!(witness.contains_cell(cell(0, 0)));
+        assert!(witness.contains_cell(cell(0, 3)));
+        assert!(witness.contains_cell(cell(7, 0)));
+        assert!(witness.contains_cell(cell(7, 3)));
+        assert!(!witness.contains_cell(cell(8, 0)));
+        assert!(!witness.contains_cell(cell(0, 4)));
+        assert!(!witness.contains_cell(cell(8, 4)));
+    }
+
+    #[test]
     fn test_update_witness() {
         let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
         witness.set(cell(0, 1), from_const(42));
@@ -1128,5 +1140,40 @@ mod tests {
         assert_eq!(witness.get_at(cell(3, 1)), from_const(43));
         assert_eq!(witness.get(cell(2, 1).into()), from_const(42));
         assert_eq!(witness.get(cell(3, 1).into()), from_const(43));
+    }
+
+    #[test]
+    fn test_get_unconstrained_value_from_sub_view() {
+        let mut witness = Witness::new(4, 3, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 0), from_const(1));
+        witness.set(cell(0, 1), from_const(2));
+        witness.set(cell(0, 2), from_const(3));
+        witness.set(cell(1, 0), from_const(4));
+        witness.set(cell(1, 1), from_const(5));
+        witness.set(cell(1, 2), from_const(6));
+        witness.set(cell(2, 0), from_const(7));
+        witness.set(cell(2, 1), from_const(8));
+        witness.set(cell(2, 2), from_const(9));
+        witness.set(cell(3, 0), from_const(10));
+        witness.set(cell(3, 1), from_const(11));
+        witness.set(cell(3, 2), from_const(12));
+        let view = witness.sub(2, 1, 1.into(), 4.into());
+        assert_eq!(view.get(cell(2, 1).into()), from_const(8));
+        assert_eq!(view.get(from_const(34).into()), from_const(34));
+        assert_eq!(view.get(from_const(56).into()), from_const(56));
+    }
+
+    #[test]
+    fn test_contains_cell_sub_view() {
+        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let view = witness.sub(1, 2, 2.into(), 3.into());
+        assert!(view.contains_cell(cell(1, 2)));
+        assert!(view.contains_cell(cell(1, 3)));
+        assert!(view.contains_cell(cell(3, 2)));
+        assert!(view.contains_cell(cell(3, 3)));
+        assert!(!view.contains_cell(cell(0, 2)));
+        assert!(!view.contains_cell(cell(1, 1)));
+        assert!(!view.contains_cell(cell(1, 4)));
+        assert!(!view.contains_cell(cell(4, 2)));
     }
 }
