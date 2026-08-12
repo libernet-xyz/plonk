@@ -1606,74 +1606,85 @@ mod tests {
         assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 3, c).is_ok());
     }
 
-    // /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
-    // /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81).
-    // fn test_vitalik_circuit_variation_impl<H: HashBackend<Scalar>>(
-    //     canonicalize_constraints: bool,
-    //     blowup_log2: usize,
-    //     commitment: H256,
-    // ) -> Result<()> {
-    //     let mut builder = CircuitBuilder::default();
-    //     let [x, square] = builder.auto_gate((var(0) ^ 2) - var(1), []);
-    //     let [y, mul] = builder.auto_gate(var(0) * var(1) - var(2), [x.into()]);
-    //     let [result] = builder.auto_gate(
-    //         var(0) * var(1) + var(2) + 5 - var(3),
-    //         [x.into(), square.into(), mul.into()],
-    //     );
-    //     let [_, _, result] = builder.add_nop_gate([x.into(), y.into(), result.into()]);
-    //     builder.declare_public_rows([result.row()]);
-    //     let circuit = builder.build(CompilationOptions {
-    //         canonicalize_constraints,
-    //     })?;
-    //     assert_eq!(circuit.num_rows(), 4);
-    //     assert_eq!(circuit.degree_bound(), 8);
-    //     assert_eq!(circuit.num_columns(), 4);
-    //     assert_eq!(circuit.num_gates(), 4);
-    //     let mut witness = circuit.make_witness();
-    //     assert_eq!(witness.num_rows(), 4);
-    //     assert_eq!(witness.degree_bound(), 8);
-    //     assert_eq!(witness.num_columns(), 4);
-    //     let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
-    //     let mul = witness.auto_set_one(
-    //         var(2),
-    //         var(0) * var(1),
-    //         [from_const(3).into(), from_const(4).into()],
-    //     );
-    //     let result = witness.auto_set_one(
-    //         var(3),
-    //         var(0) * var(1) + var(2) + 5,
-    //         [x.into(), square.into(), mul.into()],
-    //     );
-    //     let [x, y, result] = witness.nop([x.into(), y.into(), result.into()]);
-    //     assert!(circuit.check_witness(&witness).is_ok());
-    //     let options = ProvingOptions { blowup_log2 };
-    //     let proof = circuit.prove::<H>(witness, options.clone())?;
-    //     assert_eq!(proof.degree_bound(), 8);
-    //     assert_eq!(proof.blowup_log2(), blowup_log2);
-    //     assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
-    //     assert_eq!(proof.num_polys(), 17);
-    //     let circuit = circuit.to_compressed(options);
-    //     assert_eq!(circuit.commitment(), commitment);
-    //     let public_inputs = circuit.verify(&proof)?;
-    //     assert_eq!(public_inputs[&x], from_const(3));
-    //     assert_eq!(public_inputs[&y], from_const(4));
-    //     assert_eq!(public_inputs[&result], from_const(44));
-    //     Ok(())
-    // }
+    /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
+    /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81).
+    fn test_vitalik_circuit_variation_impl<H: HashBackend<Scalar>>(
+        canonicalize_constraints: bool,
+        blowup_log2: usize,
+        commitment: H256,
+    ) -> Result<()> {
+        let mut builder = CircuitBuilder::default();
+        builder.add_gate(0, (var(0) ^ 2) - var(1));
+        let x = cell(0, 0);
+        let square = cell(0, 1);
+        builder.add_gate(1, var(0) * var(1) - var(2));
+        builder.connect(x.into(), cell(1, 0).into());
+        let y = cell(1, 1);
+        let mul = cell(1, 2);
+        builder.add_gate(2, var(0) * var(1) + var(2) + 5 - var(3));
+        builder.connect(x.into(), cell(2, 0).into());
+        builder.connect(square.into(), cell(2, 1).into());
+        builder.connect(mul.into(), cell(2, 2).into());
+        let result = cell(2, 3);
+        let x_out = cell(3, 0);
+        builder.connect(x.into(), x_out.into());
+        let y_out = cell(3, 1);
+        builder.connect(y.into(), y_out.into());
+        let result_out = cell(3, 2);
+        builder.connect(result.into(), result_out.into());
+        builder.declare_public_rows([3]);
+        let circuit = builder.build(CompilationOptions {
+            canonicalize_constraints,
+        })?;
+        assert_eq!(circuit.num_rows(), 4);
+        assert_eq!(circuit.degree_bound(), 8);
+        assert_eq!(circuit.num_columns(), 4);
+        assert_eq!(circuit.num_gates(), 3);
+        let mut witness = circuit.make_witness();
+        assert_eq!(witness.num_rows(), 4);
+        assert_eq!(witness.degree_bound(), 8);
+        assert_eq!(witness.num_columns(), 4);
+        witness.set(cell(0, 0), from_const(3));
+        witness.set(cell(0, 1), from_const(9));
+        witness.set(cell(1, 0), from_const(3));
+        witness.set(cell(1, 1), from_const(4));
+        witness.set(cell(1, 2), from_const(12));
+        witness.set(cell(2, 0), from_const(3));
+        witness.set(cell(2, 1), from_const(9));
+        witness.set(cell(2, 2), from_const(12));
+        witness.set(cell(2, 3), from_const(44));
+        witness.set(cell(3, 0), from_const(3));
+        witness.set(cell(3, 1), from_const(4));
+        witness.set(cell(3, 2), from_const(44));
+        assert!(circuit.check_witness(&witness).is_ok());
+        let options = ProvingOptions { blowup_log2 };
+        let proof = circuit.prove::<H>(witness, options.clone())?;
+        assert_eq!(proof.degree_bound(), 8);
+        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
+        assert_eq!(proof.num_polys(), 16);
+        let circuit = circuit.to_compressed(options);
+        assert_eq!(circuit.commitment(), commitment);
+        let public_inputs = circuit.verify(&proof)?;
+        assert_eq!(public_inputs[&x_out], from_const(3));
+        assert_eq!(public_inputs[&y_out], from_const(4));
+        assert_eq!(public_inputs[&result_out], from_const(44));
+        Ok(())
+    }
 
-    // #[test]
-    // fn test_vitalik_circuit_variation_blowup_2() {
-    //     let c = parse_hash("0x3fd5a29b97c62d5899b807aef6eed75d108e51774f22a4b354f6aa84c46b938a");
-    //     assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 1, c).is_ok());
-    //     assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 1, c).is_ok());
-    // }
+    #[test]
+    fn test_vitalik_circuit_variation_blowup_2() {
+        let c = parse_hash("0x6f793d1bfd1349adb0981b299dae730991836d950d53d4f2df08b649db552d29");
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 1, c).is_ok());
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 1, c).is_ok());
+    }
 
-    // #[test]
-    // fn test_vitalik_circuit_variation_blowup_4() {
-    //     let c = parse_hash("0xf966855fcd2cfce8b257312f1e7964d3824874376522fe497050ce313e078c50");
-    //     assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 2, c).is_ok());
-    //     assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 2, c).is_ok());
-    // }
+    #[test]
+    fn test_vitalik_circuit_variation_blowup_4() {
+        let c = parse_hash("0xb50cc61c1a3f557f97d42bb6233ba4d133338bf86577615e4cbae10bbb90ccb6");
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 2, c).is_ok());
+        assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 2, c).is_ok());
+    }
 
     fn build_vitalik_circuit() -> Circuit {
         let mut builder = CircuitBuilder::default();
