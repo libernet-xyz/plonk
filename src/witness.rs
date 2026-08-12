@@ -191,6 +191,11 @@ pub trait WitnessView {
     /// For the root view this is the same as [`Witness::num_columns`].
     fn width(&self) -> usize;
 
+    /// Returns the number of rows included in the view.
+    ///
+    /// For the root view this is the same as [`Witness::num_rows`].
+    fn height(&self) -> usize;
+
     /// Returns the row offset of the view (0 for the [`Witness`] itself).
     ///
     /// This is always an absolute value even for transitive sub-views. It is not relative to
@@ -220,6 +225,20 @@ pub trait WitnessView {
         Cell::new(row as usize, column as usize)
     }
 
+    /// Indicates whether the specified `cell` is contained in this view.
+    ///
+    /// Always true for the root [`CircuitBuilder`].
+    fn contains_cell(&self, cell: Cell) -> bool {
+        let row_offset = self.row_offset();
+        let column_offset = self.column_offset();
+        let cell_row = cell.row();
+        let cell_column = cell.column();
+        cell_row >= row_offset
+            && cell_column >= column_offset
+            && cell_column < column_offset + self.width()
+            && cell_row < row_offset + self.height()
+    }
+
     /// Reads a witness cell.
     fn get(&self, cell: Cell) -> Scalar {
         self.witness().get_internal(cell)
@@ -244,10 +263,28 @@ pub trait WitnessView {
     }
 
     /// Spawns a child `WitnessView` at the given coordinates.
-    fn sub(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView {
+    ///
+    /// If `width` and/or `height` are specified they must not overflow the parent view. If they are
+    /// not specified the child view will automatically extend to the full width and/or height of
+    /// the parent view.
+    ///
+    /// The function will panic if the child view overflows the parent view.
+    fn sub(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        width: Option<usize>,
+        height: Option<usize>,
+    ) -> impl WitnessView {
+        let parent_width = self.width();
+        let parent_height = self.height();
+        let width = width.unwrap_or(parent_width - column_offset);
+        let height = height.unwrap_or(parent_height - row_offset);
+        assert!(column_offset + width <= parent_width);
+        assert!(row_offset + height <= parent_height);
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
-        WitnessSection::new(self.witness_mut(), row_offset, column_offset, width)
+        WitnessSection::new(self.witness_mut(), row_offset, column_offset, width, height)
     }
 
     /// Spawns a child `WitnessView` at the given coordinates and runs the provided `callback` on
@@ -255,13 +292,22 @@ pub trait WitnessView {
     ///
     /// `sub_fn` returns `self`, not the child view. The child view is only valid for the duration
     /// of the callback, while `self` is returned to make `sub_fn` chainable.
+    ///
+    /// See [`Self::sub`] for details about how the `width` and `height` parameters are treated.
     fn sub_fn(
         &mut self,
         row_offset: usize,
         column_offset: usize,
-        width: usize,
+        width: Option<usize>,
+        height: Option<usize>,
         callback: impl FnOnce(&mut WitnessSection),
     ) -> &mut Self {
+        let parent_width = self.width();
+        let parent_height = self.height();
+        let width = width.unwrap_or(parent_width - column_offset);
+        let height = height.unwrap_or(parent_height - row_offset);
+        assert!(column_offset + width <= parent_width);
+        assert!(row_offset + height <= parent_height);
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
         callback(&mut WitnessSection::new(
@@ -269,6 +315,7 @@ pub trait WitnessView {
             row_offset,
             column_offset,
             width,
+            height,
         ));
         self
     }
@@ -281,11 +328,22 @@ pub trait WitnessView {
         chip: &impl Chip<I, O>,
         inputs: [CellOrUnconstrained; I],
     ) -> Result<[CellOrUnconstrained; O]> {
+        let parent_width = self.width();
+        let parent_height = self.height();
+        let chip_width = chip.width();
+        let chip_height = chip.height();
+        assert!(column_offset + chip_width <= parent_width);
+        assert!(row_offset + chip_height <= parent_height);
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
-        let mut child =
-            WitnessSection::new(self.witness_mut(), row_offset, column_offset, chip.width());
-        chip.witness(&mut child, inputs)
+        let mut view = WitnessSection::new(
+            self.witness_mut(),
+            row_offset,
+            column_offset,
+            chip_width,
+            chip_height,
+        );
+        chip.witness(&mut view, inputs)
     }
 }
 
@@ -300,6 +358,9 @@ pub struct WitnessViewGenerator<'a> {
     /// Width of each sub-section.
     width: usize,
 
+    /// Height of each sub-section.
+    height: usize,
+
     /// Number of sub-sections to generate.
     count: usize,
 }
@@ -312,6 +373,7 @@ impl<'a> WitnessViewGenerator<'a> {
             self.row_offset,
             self.width * index,
             self.width,
+            self.height,
         )
     }
 }
@@ -413,32 +475,16 @@ impl WitnessView for Witness {
         self.data.len()
     }
 
+    fn height(&self) -> usize {
+        self.data[0].len()
+    }
+
     fn row_offset(&self) -> usize {
         0
     }
 
     fn column_offset(&self) -> usize {
         0
-    }
-
-    fn sub(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView {
-        WitnessSection::new(self, row_offset, column_offset, width)
-    }
-
-    fn sub_fn(
-        &mut self,
-        row_offset: usize,
-        column_offset: usize,
-        width: usize,
-        callback: impl FnOnce(&mut WitnessSection),
-    ) -> &mut Self {
-        callback(&mut WitnessSection::new(
-            self,
-            row_offset,
-            column_offset,
-            width,
-        ));
-        self
     }
 }
 
@@ -448,6 +494,7 @@ pub struct WitnessSection<'a> {
     row_offset: usize,
     column_offset: usize,
     width: usize,
+    height: usize,
 }
 
 impl<'a> WitnessSection<'a> {
@@ -456,12 +503,14 @@ impl<'a> WitnessSection<'a> {
         row_offset: usize,
         column_offset: usize,
         width: usize,
+        height: usize,
     ) -> Self {
         Self {
             witness,
             row_offset,
             column_offset,
             width,
+            height,
         }
     }
 }
@@ -477,6 +526,10 @@ impl<'a> WitnessView for WitnessSection<'a> {
 
     fn width(&self) -> usize {
         self.width
+    }
+
+    fn height(&self) -> usize {
+        self.height
     }
 
     fn row_offset(&self) -> usize {
@@ -904,7 +957,7 @@ mod tests {
         witness.set(cell(2, 1), from_const(10));
         witness.set(cell(2, 2), from_const(11));
         witness.set(cell(2, 3), from_const(12));
-        let view = witness.sub(1, 2, 2);
+        let view = witness.sub(1, 2, 2.into(), 3.into());
         assert_eq!(view.width(), 2);
         assert_eq!(view.cell(0, 0), cell(1, 2));
         assert_eq!(view.cell(0, 1), cell(1, 3));
@@ -931,7 +984,7 @@ mod tests {
         witness.set(cell(3, 0), from_const(10));
         witness.set(cell(3, 1), from_const(11));
         witness.set(cell(3, 2), from_const(12));
-        let view = witness.sub(2, 1, 1);
+        let view = witness.sub(2, 1, 1.into(), 4.into());
         assert_eq!(view.width(), 1);
         assert_eq!(view.cell(0, 0), cell(2, 1));
         assert_eq!(view.cell(1, 0), cell(3, 1));
@@ -955,7 +1008,7 @@ mod tests {
         witness.set(cell(2, 2), from_const(11));
         witness.set(cell(2, 3), from_const(12));
         {
-            let mut view = witness.sub(1, 2, 2);
+            let mut view = witness.sub(1, 2, 2.into(), 3.into());
             view.set(cell(1, 2), from_const(42));
             view.set(cell(1, 3), from_const(43));
             view.set(cell(2, 2), from_const(44));
@@ -983,7 +1036,7 @@ mod tests {
         witness.set(cell(3, 1), from_const(11));
         witness.set(cell(3, 2), from_const(12));
         {
-            let mut view = witness.sub(2, 1, 1);
+            let mut view = witness.sub(2, 1, 1.into(), 4.into());
             view.set(cell(2, 1), from_const(42));
             view.set(cell(3, 1), from_const(43));
         }

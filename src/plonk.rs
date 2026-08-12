@@ -174,14 +174,38 @@ pub trait CircuitView {
     fn cell(&self, row_offset: impl CellOffset, column_offset: impl CellOffset) -> Cell {
         let row = self.row_offset() as isize + row_offset.into_offset();
         let column = self.column_offset() as isize + column_offset.into_offset();
-        debug_assert!(row >= 0);
-        debug_assert!(column >= 0);
+        assert!(row >= 0);
+        assert!(column >= 0);
         Cell::new(row as usize, column as usize)
     }
 
+    /// Indicates whether the specified `cell` is contained in this view.
+    ///
+    /// Always true for the root [`CircuitBuilder`].
+    fn contains_cell(&self, cell: Cell) -> bool {
+        let row_offset = self.row_offset();
+        let column_offset = self.column_offset();
+        if cell.row() < row_offset || cell.column() < column_offset {
+            return false;
+        }
+        if let Some(width) = self.width() {
+            assert!(cell.column() < column_offset + width);
+        }
+        if let Some(height) = self.height() {
+            assert!(cell.row() < row_offset + height);
+        }
+        true
+    }
+
     /// Adds a gate to the circuit.
+    ///
+    /// NOTE: the function panics if the root cell of the gate lies outside the view. It is however
+    /// not forbidden to refer to external cells from within the gate constraint by using rotations
+    /// or overflowing column numbers. For example, it's okay to place a gate at row 0 and refer to
+    /// `rvar(0, -1)`, or to place it at the rightmost column and refer to `var(1)`.
     fn add_gate(&mut self, row: usize, constraint: Constraint) {
         let root_cell = self.cell(row, 0);
+        assert!(self.contains_cell(root_cell));
         self.builder_mut().add_gate_internal(root_cell, constraint);
     }
 
@@ -191,13 +215,31 @@ pub trait CircuitView {
     }
 
     /// Spawns a child `CircuitView` at the given coordinates.
+    ///
+    /// If `width` and/or `height` are specified they must not overflow the parent view. If they are
+    /// not specified the child view will automatically extend to the full width and/or height of
+    /// the parent view.
+    ///
+    /// The function will panic if the child view overflows the parent view.
+    ///
+    /// NOTE: the width and height of the root view are undefined because the [`CircuitBuilder`] is
+    /// unbounded, so the `width` and `height` parameters MUST be specified when creating direct
+    /// children of the [`CircuitBuilder`].
     fn sub(
         &mut self,
         row_offset: usize,
         column_offset: usize,
-        width: usize,
-        height: usize,
+        width: Option<usize>,
+        height: Option<usize>,
     ) -> impl CircuitView {
+        let width = width.unwrap_or(self.width().unwrap() - column_offset);
+        let height = height.unwrap_or(self.height().unwrap() - row_offset);
+        if let Some(parent_width) = self.width() {
+            assert!(column_offset + width <= parent_width);
+        }
+        if let Some(parent_height) = self.height() {
+            assert!(row_offset + height <= parent_height);
+        }
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
         CircuitSectionBuilder::new(self.builder_mut(), row_offset, column_offset, width, height)
@@ -208,14 +250,24 @@ pub trait CircuitView {
     ///
     /// `sub_fn` returns `self`, not the child view. The child view is only valid for the duration
     /// of the callback, while `self` is returned to make `sub_fn` chainable.
+    ///
+    /// See [`Self::sub`] for details about how the `width` and `height` parameters are treated.
     fn sub_fn(
         &mut self,
         row_offset: usize,
         column_offset: usize,
-        width: usize,
-        height: usize,
+        width: Option<usize>,
+        height: Option<usize>,
         callback: impl FnOnce(&mut CircuitSectionBuilder),
     ) -> &mut Self {
+        let width = width.unwrap_or(self.width().unwrap() - column_offset);
+        let height = height.unwrap_or(self.height().unwrap() - row_offset);
+        if let Some(parent_width) = self.width() {
+            assert!(column_offset + width <= parent_width);
+        }
+        if let Some(parent_height) = self.height() {
+            assert!(row_offset + height <= parent_height);
+        }
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
         callback(&mut CircuitSectionBuilder::new(
@@ -236,14 +288,22 @@ pub trait CircuitView {
         chip: &impl Chip<I, O>,
         inputs: [Option<Cell>; I],
     ) -> Result<[Option<Cell>; O]> {
+        let chip_width = chip.width();
+        let chip_height = chip.height();
+        if let Some(parent_width) = self.width() {
+            assert!(column_offset + chip_width <= parent_width);
+        }
+        if let Some(parent_height) = self.height() {
+            assert!(row_offset + chip_height <= parent_height);
+        }
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
         let mut child = CircuitSectionBuilder::new(
             self.builder_mut(),
             row_offset,
             column_offset,
-            chip.width(),
-            chip.height(),
+            chip_width,
+            chip_height,
         );
         chip.build(&mut child, inputs)
     }
