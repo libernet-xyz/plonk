@@ -144,6 +144,12 @@ pub trait CircuitView {
     /// unbounded and `None` is returned.
     fn width(&self) -> Option<usize>;
 
+    /// Returns the number of rows included in the view.
+    ///
+    /// If this is the root view, that is the raw [`CircuitBuilder`] instance, the height is
+    /// unbounded and `None` is returned.
+    fn height(&self) -> Option<usize>;
+
     /// Returns the row offset of the view (0 for the [`CircuitBuilder`] itself).
     ///
     /// This is always an absolute value even for transitive sub-views. It is not relative to
@@ -185,10 +191,16 @@ pub trait CircuitView {
     }
 
     /// Spawns a child `CircuitView` at the given coordinates.
-    fn sub(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView {
+    fn sub(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        width: usize,
+        height: usize,
+    ) -> impl CircuitView {
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
-        CircuitSectionBuilder::new(self.builder_mut(), row_offset, column_offset, width)
+        CircuitSectionBuilder::new(self.builder_mut(), row_offset, column_offset, width, height)
     }
 
     /// Spawns a child `CircuitView` at the given coordinates and runs the provided `callback` on
@@ -201,6 +213,7 @@ pub trait CircuitView {
         row_offset: usize,
         column_offset: usize,
         width: usize,
+        height: usize,
         callback: impl FnOnce(&mut CircuitSectionBuilder),
     ) -> &mut Self {
         let row_offset = self.row_offset() + row_offset;
@@ -210,6 +223,7 @@ pub trait CircuitView {
             row_offset,
             column_offset,
             width,
+            height,
         ));
         self
     }
@@ -224,8 +238,13 @@ pub trait CircuitView {
     ) -> Result<[Option<Cell>; O]> {
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
-        let mut child =
-            CircuitSectionBuilder::new(self.builder_mut(), row_offset, column_offset, chip.width());
+        let mut child = CircuitSectionBuilder::new(
+            self.builder_mut(),
+            row_offset,
+            column_offset,
+            chip.width(),
+            chip.height(),
+        );
         chip.build(&mut child, inputs)
     }
 }
@@ -241,6 +260,9 @@ pub struct CircuitViewGenerator<'a> {
     /// Width of each sub-section.
     width: usize,
 
+    /// Height of each sub-section.
+    height: usize,
+
     /// Number of sub-sections to generate.
     count: usize,
 }
@@ -253,6 +275,7 @@ impl<'a> CircuitViewGenerator<'a> {
             self.row_offset,
             self.width * index,
             self.width,
+            self.height,
         )
     }
 }
@@ -501,6 +524,10 @@ impl CircuitView for CircuitBuilder {
         None
     }
 
+    fn height(&self) -> Option<usize> {
+        None
+    }
+
     fn row_offset(&self) -> usize {
         0
     }
@@ -524,6 +551,9 @@ pub struct CircuitSectionBuilder<'a> {
 
     /// Width (number of columns) of the sub-section.
     width: usize,
+
+    /// Height (number of rows) of the sub-section.
+    height: usize,
 }
 
 impl<'a> CircuitSectionBuilder<'a> {
@@ -532,12 +562,14 @@ impl<'a> CircuitSectionBuilder<'a> {
         row_offset: usize,
         column_offset: usize,
         width: usize,
+        height: usize,
     ) -> Self {
         Self {
             builder,
             row_offset,
             column_offset,
             width,
+            height,
         }
     }
 }
@@ -553,6 +585,10 @@ impl<'a> CircuitView for CircuitSectionBuilder<'a> {
 
     fn width(&self) -> Option<usize> {
         Some(self.width)
+    }
+
+    fn height(&self) -> Option<usize> {
+        Some(self.height)
     }
 
     fn row_offset(&self) -> usize {
