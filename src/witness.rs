@@ -244,6 +244,14 @@ pub trait WitnessView {
         self.witness().get_internal(cell)
     }
 
+    /// Reads a witness cell or unconstrained value.
+    fn get(&self, cell_or_unconstrained: CellOrUnconstrained) -> Scalar {
+        match cell_or_unconstrained {
+            CellOrUnconstrained::Cell(cell) => self.get_at(cell),
+            CellOrUnconstrained::Unconstrained(value) => value,
+        }
+    }
+
     /// Updates a witness cell.
     fn set(&mut self, cell: Cell, value: Scalar) {
         self.witness_mut().set_internal(cell, value);
@@ -764,46 +772,64 @@ mod tests {
     #[test]
     fn test_empty_witness_1x1() {
         let witness = Witness::new(1, 1, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 1);
+        assert_eq!(witness.height(), 4);
         assert_eq!(witness.num_rows(), 1);
         assert_eq!(witness.degree_bound(), 4);
         assert_eq!(witness.num_columns(), 1);
         assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_1x2() {
         let witness = Witness::new(1, 2, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 2);
+        assert_eq!(witness.height(), 4);
         assert_eq!(witness.num_rows(), 1);
         assert_eq!(witness.degree_bound(), 4);
         assert_eq!(witness.num_columns(), 2);
         assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
         assert_eq!(witness.get_at(cell(0, 1)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_1x3() {
         let witness = Witness::new(1, 3, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 4);
         assert_eq!(witness.num_rows(), 1);
         assert_eq!(witness.degree_bound(), 4);
         assert_eq!(witness.num_columns(), 3);
         assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
         assert_eq!(witness.get_at(cell(0, 1)), from_const(0));
         assert_eq!(witness.get_at(cell(0, 2)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 2).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_2x1() {
         let witness = Witness::new(2, 1, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 1);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 2);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 1);
         assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
         assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_2x2() {
         let witness = Witness::new(2, 2, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 2);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 2);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 2);
@@ -811,22 +837,33 @@ mod tests {
         assert_eq!(witness.get_at(cell(0, 1)), from_const(0));
         assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
         assert_eq!(witness.get_at(cell(1, 1)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 1).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_3x1() {
         let witness = Witness::new(3, 1, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 1);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 1);
         assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
         assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
         assert_eq!(witness.get_at(cell(2, 0)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(2, 0).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_3x2() {
         let witness = Witness::new(3, 2, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 2);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 2);
@@ -836,11 +873,19 @@ mod tests {
         assert_eq!(witness.get_at(cell(1, 1)), from_const(0));
         assert_eq!(witness.get_at(cell(2, 0)), from_const(0));
         assert_eq!(witness.get_at(cell(2, 1)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(2, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(2, 1).into()), from_const(0));
     }
 
     #[test]
     fn test_witness_four_rows_three_rotations_1() {
         let witness = Witness::new(4, 3, [-1, 0, 1]);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 3);
@@ -849,6 +894,8 @@ mod tests {
     #[test]
     fn test_witness_four_rows_three_rotations_2() {
         let witness = Witness::new(4, 3, [0, 1, 2]);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 3);
@@ -857,6 +904,8 @@ mod tests {
     #[test]
     fn test_witness_four_rows_four_rotations_1() {
         let witness = Witness::new(4, 3, [-1, 0, 1, 2]);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 16);
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 16);
         assert_eq!(witness.num_columns(), 3);
@@ -865,6 +914,8 @@ mod tests {
     #[test]
     fn test_witness_four_rows_four_rotations_2() {
         let witness = Witness::new(4, 3, [-2, -1, 0, 1]);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 16);
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 16);
         assert_eq!(witness.num_columns(), 3);
@@ -873,6 +924,8 @@ mod tests {
     #[test]
     fn test_witness_four_rows_five_rotations() {
         let witness = Witness::new(4, 3, [-2, -1, 0, 1, 2]);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 16);
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 16);
         assert_eq!(witness.num_columns(), 3);
@@ -889,6 +942,12 @@ mod tests {
         assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
         assert_eq!(witness.get_at(cell(1, 1)), from_const(0));
         assert_eq!(witness.get_at(cell(1, 2)), from_const(43));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(42));
+        assert_eq!(witness.get(cell(0, 2).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 2).into()), from_const(43));
     }
 
     #[test]
@@ -902,6 +961,21 @@ mod tests {
         assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
         assert_eq!(witness.get_at(cell(1, 1)), from_const(0));
         assert_eq!(witness.get_at(cell(1, 2)), from_const(44));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(44));
+        assert_eq!(witness.get(cell(0, 2).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 2).into()), from_const(44));
+    }
+
+    #[test]
+    fn test_get_unconstrained_value() {
+        let mut witness = Witness::new(1, 1, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 0), from_const(12));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(12));
+        assert_eq!(witness.get(from_const(34).into()), from_const(34));
+        assert_eq!(witness.get(from_const(56).into()), from_const(56));
     }
 
     #[test]
@@ -967,6 +1041,10 @@ mod tests {
         assert_eq!(view.get_at(cell(1, 3)), from_const(8));
         assert_eq!(view.get_at(cell(2, 2)), from_const(11));
         assert_eq!(view.get_at(cell(2, 3)), from_const(12));
+        assert_eq!(view.get(cell(1, 2).into()), from_const(7));
+        assert_eq!(view.get(cell(1, 3).into()), from_const(8));
+        assert_eq!(view.get(cell(2, 2).into()), from_const(11));
+        assert_eq!(view.get(cell(2, 3).into()), from_const(12));
     }
 
     #[test]
@@ -990,6 +1068,8 @@ mod tests {
         assert_eq!(view.cell(1, 0), cell(3, 1));
         assert_eq!(view.get_at(cell(2, 1)), from_const(8));
         assert_eq!(view.get_at(cell(3, 1)), from_const(11));
+        assert_eq!(view.get(cell(2, 1).into()), from_const(8));
+        assert_eq!(view.get(cell(3, 1).into()), from_const(11));
     }
 
     #[test]
@@ -1018,6 +1098,10 @@ mod tests {
         assert_eq!(witness.get_at(cell(1, 3)), from_const(43));
         assert_eq!(witness.get_at(cell(2, 2)), from_const(44));
         assert_eq!(witness.get_at(cell(2, 3)), from_const(45));
+        assert_eq!(witness.get(cell(1, 2).into()), from_const(42));
+        assert_eq!(witness.get(cell(1, 3).into()), from_const(43));
+        assert_eq!(witness.get(cell(2, 2).into()), from_const(44));
+        assert_eq!(witness.get(cell(2, 3).into()), from_const(45));
     }
 
     #[test]
@@ -1042,5 +1126,7 @@ mod tests {
         }
         assert_eq!(witness.get_at(cell(2, 1)), from_const(42));
         assert_eq!(witness.get_at(cell(3, 1)), from_const(43));
+        assert_eq!(witness.get(cell(2, 1).into()), from_const(42));
+        assert_eq!(witness.get(cell(3, 1).into()), from_const(43));
     }
 }
