@@ -1,5 +1,4 @@
 use crate::chip::Chip;
-use crate::expr::{Constraint, Variable};
 use crate::utils::padded_circuit_size;
 use anyhow::Result;
 use starkom_bluesky::Scalar;
@@ -180,50 +179,34 @@ impl Partitioner {
     }
 }
 
-mod internal {
-    use super::*;
+pub trait WitnessView {
+    /// Returns a reference to the [`Witness`].
+    fn witness(&self) -> &Witness;
 
-    /// Provides access to the internal state of a circuit view.
-    ///
-    /// This is used to implement the provided methods of the [`WitnessView`] trait.
-    pub trait WitnessViewState {
-        /// Returns a reference to the [`Witness`].
-        fn witness(&self) -> &Witness;
+    /// Returns a mutable reference to the [`Witness`].
+    fn witness_mut(&mut self) -> &mut Witness;
 
-        /// Returns a mutable reference to the [`Witness`].
-        fn witness_mut(&mut self) -> &mut Witness;
-
-        /// Returns the row offset of the view (0 for the [`Witness`] itself).
-        ///
-        /// This is always an absolute value even for transitive sub-views. It is not relative to
-        /// the parent view.
-        fn row_offset(&self) -> usize;
-
-        /// Returns the column offset of the view (0 for the [`Witness`] itself).
-        ///
-        /// This is always an absolute value even for transitive sub-views. It is not relative to
-        /// the parent view.
-        fn column_offset(&self) -> usize;
-
-        /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
-        fn root_cell(&self) -> Cell {
-            Cell::new(self.row_offset(), self.column_offset())
-        }
-
-        /// Returns the next root cell for [setting auto gates](`Witness::auto_set`), advancing the
-        /// internal state to the next row.
-        fn step_row(&mut self) -> Cell;
-
-        /// Advances the internal row counter by `n`.
-        fn skip_rows(&mut self, n: usize);
-    }
-}
-
-pub trait WitnessView: internal::WitnessViewState {
     /// Returns the number of columns included in the view.
     ///
     /// For the root view this is the same as [`Witness::num_columns`].
     fn width(&self) -> usize;
+
+    /// Returns the row offset of the view (0 for the [`Witness`] itself).
+    ///
+    /// This is always an absolute value even for transitive sub-views. It is not relative to
+    /// the parent view.
+    fn row_offset(&self) -> usize;
+
+    /// Returns the column offset of the view (0 for the [`Witness`] itself).
+    ///
+    /// This is always an absolute value even for transitive sub-views. It is not relative to
+    /// the parent view.
+    fn column_offset(&self) -> usize;
+
+    /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
+    fn root_cell(&self) -> Cell {
+        Cell::new(self.row_offset(), self.column_offset())
+    }
 
     /// Creates a [`Cell`] relative to this view.
     ///
@@ -258,93 +241,6 @@ pub trait WitnessView: internal::WitnessViewState {
                 value
             }
         }
-    }
-
-    /// Skips `n` rows, advancing the internal row counter by `n`.
-    ///
-    /// This is the witness counterpart of [`crate::plonk::CircuitView::skip_rows`].
-    fn skip_rows(&mut self, n: usize) {
-        internal::WitnessViewState::skip_rows(self, n);
-    }
-
-    /// Sets witness values for an auto-gate.
-    ///
-    /// This is the witness counterpart of [`crate::plonk::CircuitView::auto_gate`].
-    fn auto_set<const N: usize, const M: usize>(
-        &mut self,
-        expressions: BTreeMap<Constraint, Constraint>,
-        inputs: [CellOrUnconstrained; N],
-    ) -> [Cell; M] {
-        assert_eq!(expressions.len(), M);
-
-        let expressions: BTreeMap<Variable, Constraint> = expressions
-            .into_iter()
-            .map(|(variable, constraint)| match variable.get_variable() {
-                Some(variable) => (variable, constraint),
-                None => panic!("the keys of the expression set must be single variables"),
-            })
-            .collect();
-
-        let root_cell = self.step_row();
-
-        let variables: BTreeSet<Variable> = expressions
-            .iter()
-            .map(|(_, constraint)| constraint.get_free_variables())
-            .fold(BTreeSet::default(), |mut accumulator, mut variables| {
-                accumulator.append(&mut variables);
-                accumulator
-            });
-        assert_eq!(variables.len(), N);
-
-        let substitution: BTreeMap<Variable, Scalar> = variables
-            .into_iter()
-            .zip(inputs.into_iter())
-            .map(|(variable, input)| {
-                let dst_cell = variable.map_to_cell(root_cell);
-                let value = self.copy(input, dst_cell);
-                (variable, value)
-            })
-            .collect();
-
-        expressions
-            .iter()
-            .map(|(variable, expression)| {
-                let cell = variable.map_to_cell(root_cell);
-                self.set(cell, expression.evaluate(&substitution));
-                cell
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap()
-    }
-
-    fn auto_set_one<const N: usize>(
-        &mut self,
-        output: Constraint,
-        expression: Constraint,
-        inputs: [CellOrUnconstrained; N],
-    ) -> Cell {
-        let [result] = self.auto_set(BTreeMap::from([(output, expression)]), inputs);
-        result
-    }
-
-    /// Sets witness values for a NOP gate.
-    ///
-    /// This is the witness counterpart of [`crate::plonk::CircuitView::add_nop_gate`].
-    fn nop<const N: usize>(&mut self, inputs: [CellOrUnconstrained; N]) -> [Cell; N] {
-        let root_cell = self.step_row();
-        std::array::from_fn(|i| {
-            let cell = Cell::new(0, i).remap(root_cell);
-            match inputs[i].into() {
-                CellOrUnconstrained::Cell(input) => {
-                    self.witness_mut().copy_internal(input, cell);
-                }
-                CellOrUnconstrained::Unconstrained(value) => {
-                    self.witness_mut().set_internal(cell, value);
-                }
-            }
-            cell
-        })
     }
 
     /// Spawns a child `WitnessView` at the given coordinates.
@@ -391,8 +287,6 @@ pub trait WitnessView: internal::WitnessViewState {
             WitnessSection::new(self.witness_mut(), row_offset, column_offset, chip.width());
         chip.witness(&mut child, inputs)
     }
-
-    fn auto_sub<'a>(&'a mut self, width: usize, count: usize) -> WitnessViewGenerator<'a>;
 }
 
 #[derive(Debug)]
@@ -436,9 +330,6 @@ pub struct Witness {
     /// Padded circuit size, including the blinding rows and rounded up to the next power of 2.
     degree_bound: usize,
 
-    /// Used by [`Self::auto_set`] to identify the row to update.
-    row_counter: usize,
-
     /// Witness table cells, indexed column-first.
     ///
     /// The column-first indexing allows quickly interpolating polynomials for the columns.
@@ -456,7 +347,6 @@ impl Witness {
             num_rows,
             num_blinding_rows,
             degree_bound,
-            row_counter: 0,
             data: vec![vec![Scalar::ZERO; degree_bound]; num_columns],
         }
     }
@@ -510,7 +400,7 @@ impl Witness {
     }
 }
 
-impl internal::WitnessViewState for Witness {
+impl WitnessView for Witness {
     fn witness(&self) -> &Witness {
         self
     }
@@ -519,28 +409,16 @@ impl internal::WitnessViewState for Witness {
         self
     }
 
+    fn width(&self) -> usize {
+        self.data.len()
+    }
+
     fn row_offset(&self) -> usize {
         0
     }
 
     fn column_offset(&self) -> usize {
         0
-    }
-
-    fn step_row(&mut self) -> Cell {
-        let root_cell = Cell::new(self.row_counter, 0);
-        self.row_counter += 1;
-        root_cell
-    }
-
-    fn skip_rows(&mut self, n: usize) {
-        self.row_counter += n;
-    }
-}
-
-impl WitnessView for Witness {
-    fn width(&self) -> usize {
-        self.data.len()
     }
 
     fn sub(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView {
@@ -562,16 +440,6 @@ impl WitnessView for Witness {
         ));
         self
     }
-
-    fn auto_sub<'a>(&'a mut self, width: usize, count: usize) -> WitnessViewGenerator<'a> {
-        let row_offset = self.row_counter;
-        WitnessViewGenerator {
-            witness: self,
-            row_offset,
-            width,
-            count,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -580,7 +448,6 @@ pub struct WitnessSection<'a> {
     row_offset: usize,
     column_offset: usize,
     width: usize,
-    row_counter: usize,
 }
 
 impl<'a> WitnessSection<'a> {
@@ -595,18 +462,21 @@ impl<'a> WitnessSection<'a> {
             row_offset,
             column_offset,
             width,
-            row_counter: 0,
         }
     }
 }
 
-impl<'a> internal::WitnessViewState for WitnessSection<'a> {
+impl<'a> WitnessView for WitnessSection<'a> {
     fn witness(&self) -> &Witness {
         self.witness
     }
 
     fn witness_mut(&mut self) -> &mut Witness {
         self.witness
+    }
+
+    fn width(&self) -> usize {
+        self.width
     }
 
     fn row_offset(&self) -> usize {
@@ -616,45 +486,11 @@ impl<'a> internal::WitnessViewState for WitnessSection<'a> {
     fn column_offset(&self) -> usize {
         self.column_offset
     }
-
-    fn step_row(&mut self) -> Cell {
-        let root_cell = Cell::new(self.row_counter, 0);
-        self.row_counter += 1;
-        root_cell
-    }
-
-    fn skip_rows(&mut self, n: usize) {
-        self.row_counter += n;
-    }
-}
-
-impl<'a> WitnessView for WitnessSection<'a> {
-    fn width(&self) -> usize {
-        self.width
-    }
-
-    fn auto_sub<'b>(&'b mut self, width: usize, count: usize) -> WitnessViewGenerator<'b> {
-        let row_offset = self.row_offset + self.row_counter;
-        WitnessViewGenerator {
-            witness: self.witness,
-            row_offset,
-            width,
-            count,
-        }
-    }
-}
-
-impl<'a> Drop for WitnessSection<'a> {
-    fn drop(&mut self) {
-        self.witness.row_counter =
-            std::cmp::max(self.witness.row_counter, self.row_offset + self.row_counter);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expr::var;
     use starkom_bluesky::from_const;
 
     #[inline]
@@ -1051,41 +887,6 @@ mod tests {
         assert_eq!(witness.cell(2, 0), cell(2, 0));
         assert_eq!(witness.cell(2, 1), cell(2, 1));
         assert_eq!(witness.cell(2, 2), cell(2, 2));
-    }
-
-    #[test]
-    fn test_auto_gates() {
-        let mut witness = Witness::new(3, 3, DEFAULT_ROTATIONS);
-        let x = cell(0, 0);
-        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
-        let [result] = witness.auto_set(
-            BTreeMap::from([(var(2), var(0) * var(1) + var(0) + 5)]),
-            [x.into(), square.into()],
-        );
-        let [public_result] = witness.nop([result.into()]);
-        witness.blind();
-        assert_eq!(square, cell(0, 1));
-        assert_eq!(result, cell(1, 2));
-        assert_eq!(public_result, cell(2, 0));
-        assert_eq!(witness.get(cell(0, 0)), from_const(3));
-        assert_eq!(witness.get(cell(0, 1)), from_const(9));
-        assert_eq!(witness.get(cell(0, 2)), from_const(0));
-        assert_eq!(witness.get(cell(1, 0)), from_const(3));
-        assert_eq!(witness.get(cell(1, 1)), from_const(9));
-        assert_eq!(witness.get(cell(1, 2)), from_const(35));
-        assert_eq!(witness.get(cell(2, 0)), from_const(35));
-        assert_eq!(witness.get(cell(2, 1)), from_const(0));
-        assert_eq!(witness.get(cell(2, 2)), from_const(0));
-        let max = from_const(u64::MAX);
-        assert!(witness.get(cell(3, 0)) > max);
-        assert!(witness.get(cell(3, 1)) > max);
-        assert!(witness.get(cell(3, 2)) > max);
-        assert!(witness.get(cell(4, 0)) > max);
-        assert!(witness.get(cell(4, 1)) > max);
-        assert!(witness.get(cell(4, 2)) > max);
-        assert!(witness.get(cell(5, 0)) > max);
-        assert!(witness.get(cell(5, 1)) > max);
-        assert!(witness.get(cell(5, 2)) > max);
     }
 
     #[test]
