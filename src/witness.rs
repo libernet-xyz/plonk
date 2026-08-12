@@ -1,5 +1,4 @@
 use crate::chip::Chip;
-use crate::expr::{Constraint, Variable};
 use crate::utils::padded_circuit_size;
 use anyhow::Result;
 use starkom_bluesky::Scalar;
@@ -180,50 +179,39 @@ impl Partitioner {
     }
 }
 
-mod internal {
-    use super::*;
+pub trait WitnessView {
+    /// Returns a reference to the [`Witness`].
+    fn witness(&self) -> &Witness;
 
-    /// Provides access to the internal state of a circuit view.
-    ///
-    /// This is used to implement the provided methods of the [`WitnessView`] trait.
-    pub trait WitnessViewState {
-        /// Returns a reference to the [`Witness`].
-        fn witness(&self) -> &Witness;
+    /// Returns a mutable reference to the [`Witness`].
+    fn witness_mut(&mut self) -> &mut Witness;
 
-        /// Returns a mutable reference to the [`Witness`].
-        fn witness_mut(&mut self) -> &mut Witness;
-
-        /// Returns the row offset of the view (0 for the [`Witness`] itself).
-        ///
-        /// This is always an absolute value even for transitive sub-views. It is not relative to
-        /// the parent view.
-        fn row_offset(&self) -> usize;
-
-        /// Returns the column offset of the view (0 for the [`Witness`] itself).
-        ///
-        /// This is always an absolute value even for transitive sub-views. It is not relative to
-        /// the parent view.
-        fn column_offset(&self) -> usize;
-
-        /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
-        fn root_cell(&self) -> Cell {
-            Cell::new(self.row_offset(), self.column_offset())
-        }
-
-        /// Returns the next root cell for [setting auto gates](`Witness::auto_set`), advancing the
-        /// internal state to the next row.
-        fn step_row(&mut self) -> Cell;
-
-        /// Advances the internal row counter by `n`.
-        fn skip_rows(&mut self, n: usize);
-    }
-}
-
-pub trait WitnessView: internal::WitnessViewState {
     /// Returns the number of columns included in the view.
     ///
     /// For the root view this is the same as [`Witness::num_columns`].
     fn width(&self) -> usize;
+
+    /// Returns the number of rows included in the view.
+    ///
+    /// For the root view this is the same as [`Witness::num_rows`].
+    fn height(&self) -> usize;
+
+    /// Returns the row offset of the view (0 for the [`Witness`] itself).
+    ///
+    /// This is always an absolute value even for transitive sub-views. It is not relative to
+    /// the parent view.
+    fn row_offset(&self) -> usize;
+
+    /// Returns the column offset of the view (0 for the [`Witness`] itself).
+    ///
+    /// This is always an absolute value even for transitive sub-views. It is not relative to
+    /// the parent view.
+    fn column_offset(&self) -> usize;
+
+    /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
+    fn root_cell(&self) -> Cell {
+        Cell::new(self.row_offset(), self.column_offset())
+    }
 
     /// Creates a [`Cell`] relative to this view.
     ///
@@ -237,9 +225,31 @@ pub trait WitnessView: internal::WitnessViewState {
         Cell::new(row as usize, column as usize)
     }
 
+    /// Indicates whether the specified `cell` is contained in this view.
+    ///
+    /// Always true for the root [`Witness`].
+    fn contains_cell(&self, cell: Cell) -> bool {
+        let row_offset = self.row_offset();
+        let column_offset = self.column_offset();
+        let cell_row = cell.row();
+        let cell_column = cell.column();
+        cell_row >= row_offset
+            && cell_column >= column_offset
+            && cell_column < column_offset + self.width()
+            && cell_row < row_offset + self.height()
+    }
+
     /// Reads a witness cell.
-    fn get(&self, cell: Cell) -> Scalar {
+    fn get_at(&self, cell: Cell) -> Scalar {
         self.witness().get_internal(cell)
+    }
+
+    /// Reads a witness cell or unconstrained value.
+    fn get(&self, cell_or_unconstrained: CellOrUnconstrained) -> Scalar {
+        match cell_or_unconstrained {
+            CellOrUnconstrained::Cell(cell) => self.get_at(cell),
+            CellOrUnconstrained::Unconstrained(value) => value,
+        }
     }
 
     /// Updates a witness cell.
@@ -260,98 +270,29 @@ pub trait WitnessView: internal::WitnessViewState {
         }
     }
 
-    /// Skips `n` rows, advancing the internal row counter by `n`.
-    ///
-    /// This is the witness counterpart of [`crate::plonk::CircuitView::skip_rows`].
-    fn skip_rows(&mut self, n: usize) {
-        internal::WitnessViewState::skip_rows(self, n);
-    }
-
-    /// Sets witness values for an auto-gate.
-    ///
-    /// This is the witness counterpart of [`crate::plonk::CircuitView::auto_gate`].
-    fn auto_set<const N: usize, const M: usize>(
-        &mut self,
-        expressions: BTreeMap<Constraint, Constraint>,
-        inputs: [CellOrUnconstrained; N],
-    ) -> [Cell; M] {
-        assert_eq!(expressions.len(), M);
-
-        let expressions: BTreeMap<Variable, Constraint> = expressions
-            .into_iter()
-            .map(|(variable, constraint)| match variable.get_variable() {
-                Some(variable) => (variable, constraint),
-                None => panic!("the keys of the expression set must be single variables"),
-            })
-            .collect();
-
-        let root_cell = self.step_row();
-
-        let variables: BTreeSet<Variable> = expressions
-            .iter()
-            .map(|(_, constraint)| constraint.get_free_variables())
-            .fold(BTreeSet::default(), |mut accumulator, mut variables| {
-                accumulator.append(&mut variables);
-                accumulator
-            });
-        assert_eq!(variables.len(), N);
-
-        let substitution: BTreeMap<Variable, Scalar> = variables
-            .into_iter()
-            .zip(inputs.into_iter())
-            .map(|(variable, input)| {
-                let dst_cell = variable.map_to_cell(root_cell);
-                let value = self.copy(input, dst_cell);
-                (variable, value)
-            })
-            .collect();
-
-        expressions
-            .iter()
-            .map(|(variable, expression)| {
-                let cell = variable.map_to_cell(root_cell);
-                self.set(cell, expression.evaluate(&substitution));
-                cell
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap()
-    }
-
-    fn auto_set_one<const N: usize>(
-        &mut self,
-        output: Constraint,
-        expression: Constraint,
-        inputs: [CellOrUnconstrained; N],
-    ) -> Cell {
-        let [result] = self.auto_set(BTreeMap::from([(output, expression)]), inputs);
-        result
-    }
-
-    /// Sets witness values for a NOP gate.
-    ///
-    /// This is the witness counterpart of [`crate::plonk::CircuitView::add_nop_gate`].
-    fn nop<const N: usize>(&mut self, inputs: [CellOrUnconstrained; N]) -> [Cell; N] {
-        let root_cell = self.step_row();
-        std::array::from_fn(|i| {
-            let cell = Cell::new(0, i).remap(root_cell);
-            match inputs[i].into() {
-                CellOrUnconstrained::Cell(input) => {
-                    self.witness_mut().copy_internal(input, cell);
-                }
-                CellOrUnconstrained::Unconstrained(value) => {
-                    self.witness_mut().set_internal(cell, value);
-                }
-            }
-            cell
-        })
-    }
-
     /// Spawns a child `WitnessView` at the given coordinates.
-    fn sub(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView {
+    ///
+    /// If `width` and/or `height` are specified they must not overflow the parent view. If they are
+    /// not specified the child view will automatically extend to the full width and/or height of
+    /// the parent view.
+    ///
+    /// The function will panic if the child view overflows the parent view.
+    fn sub(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        width: Option<usize>,
+        height: Option<usize>,
+    ) -> impl WitnessView {
+        let parent_width = self.width();
+        let parent_height = self.height();
+        let width = width.unwrap_or(parent_width - column_offset);
+        let height = height.unwrap_or(parent_height - row_offset);
+        assert!(column_offset + width <= parent_width);
+        assert!(row_offset + height <= parent_height);
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
-        WitnessSection::new(self.witness_mut(), row_offset, column_offset, width)
+        WitnessSection::new(self.witness_mut(), row_offset, column_offset, width, height)
     }
 
     /// Spawns a child `WitnessView` at the given coordinates and runs the provided `callback` on
@@ -359,13 +300,22 @@ pub trait WitnessView: internal::WitnessViewState {
     ///
     /// `sub_fn` returns `self`, not the child view. The child view is only valid for the duration
     /// of the callback, while `self` is returned to make `sub_fn` chainable.
+    ///
+    /// See [`Self::sub`] for details about how the `width` and `height` parameters are treated.
     fn sub_fn(
         &mut self,
         row_offset: usize,
         column_offset: usize,
-        width: usize,
+        width: Option<usize>,
+        height: Option<usize>,
         callback: impl FnOnce(&mut WitnessSection),
     ) -> &mut Self {
+        let parent_width = self.width();
+        let parent_height = self.height();
+        let width = width.unwrap_or(parent_width - column_offset);
+        let height = height.unwrap_or(parent_height - row_offset);
+        assert!(column_offset + width <= parent_width);
+        assert!(row_offset + height <= parent_height);
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
         callback(&mut WitnessSection::new(
@@ -373,6 +323,7 @@ pub trait WitnessView: internal::WitnessViewState {
             row_offset,
             column_offset,
             width,
+            height,
         ));
         self
     }
@@ -385,14 +336,23 @@ pub trait WitnessView: internal::WitnessViewState {
         chip: &impl Chip<I, O>,
         inputs: [CellOrUnconstrained; I],
     ) -> Result<[CellOrUnconstrained; O]> {
+        let parent_width = self.width();
+        let parent_height = self.height();
+        let chip_width = chip.width();
+        let chip_height = chip.height();
+        assert!(column_offset + chip_width <= parent_width);
+        assert!(row_offset + chip_height <= parent_height);
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
-        let mut child =
-            WitnessSection::new(self.witness_mut(), row_offset, column_offset, chip.width());
-        chip.witness(&mut child, inputs)
+        let mut view = WitnessSection::new(
+            self.witness_mut(),
+            row_offset,
+            column_offset,
+            chip_width,
+            chip_height,
+        );
+        chip.witness(&mut view, inputs)
     }
-
-    fn auto_sub<'a>(&'a mut self, width: usize, count: usize) -> WitnessViewGenerator<'a>;
 }
 
 #[derive(Debug)]
@@ -406,6 +366,9 @@ pub struct WitnessViewGenerator<'a> {
     /// Width of each sub-section.
     width: usize,
 
+    /// Height of each sub-section.
+    height: usize,
+
     /// Number of sub-sections to generate.
     count: usize,
 }
@@ -418,6 +381,7 @@ impl<'a> WitnessViewGenerator<'a> {
             self.row_offset,
             self.width * index,
             self.width,
+            self.height,
         )
     }
 }
@@ -436,9 +400,6 @@ pub struct Witness {
     /// Padded circuit size, including the blinding rows and rounded up to the next power of 2.
     degree_bound: usize,
 
-    /// Used by [`Self::auto_set`] to identify the row to update.
-    row_counter: usize,
-
     /// Witness table cells, indexed column-first.
     ///
     /// The column-first indexing allows quickly interpolating polynomials for the columns.
@@ -456,7 +417,6 @@ impl Witness {
             num_rows,
             num_blinding_rows,
             degree_bound,
-            row_counter: 0,
             data: vec![vec![Scalar::ZERO; degree_bound]; num_columns],
         }
     }
@@ -510,7 +470,7 @@ impl Witness {
     }
 }
 
-impl internal::WitnessViewState for Witness {
+impl WitnessView for Witness {
     fn witness(&self) -> &Witness {
         self
     }
@@ -519,58 +479,20 @@ impl internal::WitnessViewState for Witness {
         self
     }
 
+    fn width(&self) -> usize {
+        self.data.len()
+    }
+
+    fn height(&self) -> usize {
+        self.data[0].len()
+    }
+
     fn row_offset(&self) -> usize {
         0
     }
 
     fn column_offset(&self) -> usize {
         0
-    }
-
-    fn step_row(&mut self) -> Cell {
-        let root_cell = Cell::new(self.row_counter, 0);
-        self.row_counter += 1;
-        root_cell
-    }
-
-    fn skip_rows(&mut self, n: usize) {
-        self.row_counter += n;
-    }
-}
-
-impl WitnessView for Witness {
-    fn width(&self) -> usize {
-        self.data.len()
-    }
-
-    fn sub(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl WitnessView {
-        WitnessSection::new(self, row_offset, column_offset, width)
-    }
-
-    fn sub_fn(
-        &mut self,
-        row_offset: usize,
-        column_offset: usize,
-        width: usize,
-        callback: impl FnOnce(&mut WitnessSection),
-    ) -> &mut Self {
-        callback(&mut WitnessSection::new(
-            self,
-            row_offset,
-            column_offset,
-            width,
-        ));
-        self
-    }
-
-    fn auto_sub<'a>(&'a mut self, width: usize, count: usize) -> WitnessViewGenerator<'a> {
-        let row_offset = self.row_counter;
-        WitnessViewGenerator {
-            witness: self,
-            row_offset,
-            width,
-            count,
-        }
     }
 }
 
@@ -580,7 +502,7 @@ pub struct WitnessSection<'a> {
     row_offset: usize,
     column_offset: usize,
     width: usize,
-    row_counter: usize,
+    height: usize,
 }
 
 impl<'a> WitnessSection<'a> {
@@ -589,24 +511,33 @@ impl<'a> WitnessSection<'a> {
         row_offset: usize,
         column_offset: usize,
         width: usize,
+        height: usize,
     ) -> Self {
         Self {
             witness,
             row_offset,
             column_offset,
             width,
-            row_counter: 0,
+            height,
         }
     }
 }
 
-impl<'a> internal::WitnessViewState for WitnessSection<'a> {
+impl<'a> WitnessView for WitnessSection<'a> {
     fn witness(&self) -> &Witness {
         self.witness
     }
 
     fn witness_mut(&mut self) -> &mut Witness {
         self.witness
+    }
+
+    fn width(&self) -> usize {
+        self.width
+    }
+
+    fn height(&self) -> usize {
+        self.height
     }
 
     fn row_offset(&self) -> usize {
@@ -616,45 +547,11 @@ impl<'a> internal::WitnessViewState for WitnessSection<'a> {
     fn column_offset(&self) -> usize {
         self.column_offset
     }
-
-    fn step_row(&mut self) -> Cell {
-        let root_cell = Cell::new(self.row_counter, 0);
-        self.row_counter += 1;
-        root_cell
-    }
-
-    fn skip_rows(&mut self, n: usize) {
-        self.row_counter += n;
-    }
-}
-
-impl<'a> WitnessView for WitnessSection<'a> {
-    fn width(&self) -> usize {
-        self.width
-    }
-
-    fn auto_sub<'b>(&'b mut self, width: usize, count: usize) -> WitnessViewGenerator<'b> {
-        let row_offset = self.row_offset + self.row_counter;
-        WitnessViewGenerator {
-            witness: self.witness,
-            row_offset,
-            width,
-            count,
-        }
-    }
-}
-
-impl<'a> Drop for WitnessSection<'a> {
-    fn drop(&mut self) {
-        self.witness.row_counter =
-            std::cmp::max(self.witness.row_counter, self.row_offset + self.row_counter);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expr::var;
     use starkom_bluesky::from_const;
 
     #[inline]
@@ -875,83 +772,120 @@ mod tests {
     #[test]
     fn test_empty_witness_1x1() {
         let witness = Witness::new(1, 1, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 1);
+        assert_eq!(witness.height(), 4);
         assert_eq!(witness.num_rows(), 1);
         assert_eq!(witness.degree_bound(), 4);
         assert_eq!(witness.num_columns(), 1);
-        assert_eq!(witness.get(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_1x2() {
         let witness = Witness::new(1, 2, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 2);
+        assert_eq!(witness.height(), 4);
         assert_eq!(witness.num_rows(), 1);
         assert_eq!(witness.degree_bound(), 4);
         assert_eq!(witness.num_columns(), 2);
-        assert_eq!(witness.get(cell(0, 0)), from_const(0));
-        assert_eq!(witness.get(cell(0, 1)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 1)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_1x3() {
         let witness = Witness::new(1, 3, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 4);
         assert_eq!(witness.num_rows(), 1);
         assert_eq!(witness.degree_bound(), 4);
         assert_eq!(witness.num_columns(), 3);
-        assert_eq!(witness.get(cell(0, 0)), from_const(0));
-        assert_eq!(witness.get(cell(0, 1)), from_const(0));
-        assert_eq!(witness.get(cell(0, 2)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 1)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 2)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 2).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_2x1() {
         let witness = Witness::new(2, 1, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 1);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 2);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 1);
-        assert_eq!(witness.get(cell(0, 0)), from_const(0));
-        assert_eq!(witness.get(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_2x2() {
         let witness = Witness::new(2, 2, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 2);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 2);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 2);
-        assert_eq!(witness.get(cell(0, 0)), from_const(0));
-        assert_eq!(witness.get(cell(0, 1)), from_const(0));
-        assert_eq!(witness.get(cell(1, 0)), from_const(0));
-        assert_eq!(witness.get(cell(1, 1)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 1)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 1)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 1).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_3x1() {
         let witness = Witness::new(3, 1, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 1);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 1);
-        assert_eq!(witness.get(cell(0, 0)), from_const(0));
-        assert_eq!(witness.get(cell(1, 0)), from_const(0));
-        assert_eq!(witness.get(cell(2, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(2, 0)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(2, 0).into()), from_const(0));
     }
 
     #[test]
     fn test_empty_witness_3x2() {
         let witness = Witness::new(3, 2, DEFAULT_ROTATIONS);
+        assert_eq!(witness.width(), 2);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 2);
-        assert_eq!(witness.get(cell(0, 0)), from_const(0));
-        assert_eq!(witness.get(cell(0, 1)), from_const(0));
-        assert_eq!(witness.get(cell(1, 0)), from_const(0));
-        assert_eq!(witness.get(cell(1, 1)), from_const(0));
-        assert_eq!(witness.get(cell(2, 0)), from_const(0));
-        assert_eq!(witness.get(cell(2, 1)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 1)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 1)), from_const(0));
+        assert_eq!(witness.get_at(cell(2, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(2, 1)), from_const(0));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(2, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(2, 1).into()), from_const(0));
     }
 
     #[test]
     fn test_witness_four_rows_three_rotations_1() {
         let witness = Witness::new(4, 3, [-1, 0, 1]);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 3);
@@ -960,6 +894,8 @@ mod tests {
     #[test]
     fn test_witness_four_rows_three_rotations_2() {
         let witness = Witness::new(4, 3, [0, 1, 2]);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 3);
@@ -968,6 +904,8 @@ mod tests {
     #[test]
     fn test_witness_four_rows_four_rotations_1() {
         let witness = Witness::new(4, 3, [-1, 0, 1, 2]);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 16);
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 16);
         assert_eq!(witness.num_columns(), 3);
@@ -976,6 +914,8 @@ mod tests {
     #[test]
     fn test_witness_four_rows_four_rotations_2() {
         let witness = Witness::new(4, 3, [-2, -1, 0, 1]);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 16);
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 16);
         assert_eq!(witness.num_columns(), 3);
@@ -984,9 +924,23 @@ mod tests {
     #[test]
     fn test_witness_four_rows_five_rotations() {
         let witness = Witness::new(4, 3, [-2, -1, 0, 1, 2]);
+        assert_eq!(witness.width(), 3);
+        assert_eq!(witness.height(), 16);
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 16);
         assert_eq!(witness.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_contains_cell_root_view() {
+        let witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        assert!(witness.contains_cell(cell(0, 0)));
+        assert!(witness.contains_cell(cell(0, 3)));
+        assert!(witness.contains_cell(cell(7, 0)));
+        assert!(witness.contains_cell(cell(7, 3)));
+        assert!(!witness.contains_cell(cell(8, 0)));
+        assert!(!witness.contains_cell(cell(0, 4)));
+        assert!(!witness.contains_cell(cell(8, 4)));
     }
 
     #[test]
@@ -994,12 +948,18 @@ mod tests {
         let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
         witness.set(cell(0, 1), from_const(42));
         witness.set(cell(1, 2), from_const(43));
-        assert_eq!(witness.get(cell(0, 0)), from_const(0));
-        assert_eq!(witness.get(cell(0, 1)), from_const(42));
-        assert_eq!(witness.get(cell(0, 2)), from_const(0));
-        assert_eq!(witness.get(cell(1, 0)), from_const(0));
-        assert_eq!(witness.get(cell(1, 1)), from_const(0));
-        assert_eq!(witness.get(cell(1, 2)), from_const(43));
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 1)), from_const(42));
+        assert_eq!(witness.get_at(cell(0, 2)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 1)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 2)), from_const(43));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(42));
+        assert_eq!(witness.get(cell(0, 2).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 2).into()), from_const(43));
     }
 
     #[test]
@@ -1007,12 +967,27 @@ mod tests {
         let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
         witness.set(cell(0, 1), from_const(44));
         assert_eq!(witness.copy(cell(0, 1).into(), cell(1, 2)), from_const(44));
-        assert_eq!(witness.get(cell(0, 0)), from_const(0));
-        assert_eq!(witness.get(cell(0, 1)), from_const(44));
-        assert_eq!(witness.get(cell(0, 2)), from_const(0));
-        assert_eq!(witness.get(cell(1, 0)), from_const(0));
-        assert_eq!(witness.get(cell(1, 1)), from_const(0));
-        assert_eq!(witness.get(cell(1, 2)), from_const(44));
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 1)), from_const(44));
+        assert_eq!(witness.get_at(cell(0, 2)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 1)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 2)), from_const(44));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(0, 1).into()), from_const(44));
+        assert_eq!(witness.get(cell(0, 2).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 0).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 1).into()), from_const(0));
+        assert_eq!(witness.get(cell(1, 2).into()), from_const(44));
+    }
+
+    #[test]
+    fn test_get_unconstrained_value() {
+        let mut witness = Witness::new(1, 1, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 0), from_const(12));
+        assert_eq!(witness.get(cell(0, 0).into()), from_const(12));
+        assert_eq!(witness.get(from_const(34).into()), from_const(34));
+        assert_eq!(witness.get(from_const(56).into()), from_const(56));
     }
 
     #[test]
@@ -1021,22 +996,22 @@ mod tests {
         witness.set(cell(0, 1), from_const(44));
         assert_eq!(witness.copy(cell(0, 1).into(), cell(1, 2)), from_const(44));
         witness.blind();
-        assert_eq!(witness.get(cell(0, 0)), from_const(0));
-        assert_eq!(witness.get(cell(0, 1)), from_const(44));
-        assert_eq!(witness.get(cell(0, 2)), from_const(0));
-        assert_eq!(witness.get(cell(1, 0)), from_const(0));
-        assert_eq!(witness.get(cell(1, 1)), from_const(0));
-        assert_eq!(witness.get(cell(1, 2)), from_const(44));
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(0, 1)), from_const(44));
+        assert_eq!(witness.get_at(cell(0, 2)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 0)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 1)), from_const(0));
+        assert_eq!(witness.get_at(cell(1, 2)), from_const(44));
         let max = from_const(u64::MAX);
-        assert!(witness.get(cell(2, 0)) > max);
-        assert!(witness.get(cell(2, 1)) > max);
-        assert!(witness.get(cell(2, 2)) > max);
-        assert!(witness.get(cell(3, 0)) > max);
-        assert!(witness.get(cell(3, 1)) > max);
-        assert!(witness.get(cell(3, 2)) > max);
-        assert!(witness.get(cell(4, 0)) > max);
-        assert!(witness.get(cell(4, 1)) > max);
-        assert!(witness.get(cell(4, 2)) > max);
+        assert!(witness.get_at(cell(2, 0)) > max);
+        assert!(witness.get_at(cell(2, 1)) > max);
+        assert!(witness.get_at(cell(2, 2)) > max);
+        assert!(witness.get_at(cell(3, 0)) > max);
+        assert!(witness.get_at(cell(3, 1)) > max);
+        assert!(witness.get_at(cell(3, 2)) > max);
+        assert!(witness.get_at(cell(4, 0)) > max);
+        assert!(witness.get_at(cell(4, 1)) > max);
+        assert!(witness.get_at(cell(4, 2)) > max);
     }
 
     #[test]
@@ -1054,41 +1029,6 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_gates() {
-        let mut witness = Witness::new(3, 3, DEFAULT_ROTATIONS);
-        let x = cell(0, 0);
-        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
-        let [result] = witness.auto_set(
-            BTreeMap::from([(var(2), var(0) * var(1) + var(0) + 5)]),
-            [x.into(), square.into()],
-        );
-        let [public_result] = witness.nop([result.into()]);
-        witness.blind();
-        assert_eq!(square, cell(0, 1));
-        assert_eq!(result, cell(1, 2));
-        assert_eq!(public_result, cell(2, 0));
-        assert_eq!(witness.get(cell(0, 0)), from_const(3));
-        assert_eq!(witness.get(cell(0, 1)), from_const(9));
-        assert_eq!(witness.get(cell(0, 2)), from_const(0));
-        assert_eq!(witness.get(cell(1, 0)), from_const(3));
-        assert_eq!(witness.get(cell(1, 1)), from_const(9));
-        assert_eq!(witness.get(cell(1, 2)), from_const(35));
-        assert_eq!(witness.get(cell(2, 0)), from_const(35));
-        assert_eq!(witness.get(cell(2, 1)), from_const(0));
-        assert_eq!(witness.get(cell(2, 2)), from_const(0));
-        let max = from_const(u64::MAX);
-        assert!(witness.get(cell(3, 0)) > max);
-        assert!(witness.get(cell(3, 1)) > max);
-        assert!(witness.get(cell(3, 2)) > max);
-        assert!(witness.get(cell(4, 0)) > max);
-        assert!(witness.get(cell(4, 1)) > max);
-        assert!(witness.get(cell(4, 2)) > max);
-        assert!(witness.get(cell(5, 0)) > max);
-        assert!(witness.get(cell(5, 1)) > max);
-        assert!(witness.get(cell(5, 2)) > max);
-    }
-
-    #[test]
     fn test_sub_view_1() {
         let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
         witness.set(cell(0, 0), from_const(1));
@@ -1103,16 +1043,20 @@ mod tests {
         witness.set(cell(2, 1), from_const(10));
         witness.set(cell(2, 2), from_const(11));
         witness.set(cell(2, 3), from_const(12));
-        let view = witness.sub(1, 2, 2);
+        let view = witness.sub(1, 2, 2.into(), 3.into());
         assert_eq!(view.width(), 2);
         assert_eq!(view.cell(0, 0), cell(1, 2));
         assert_eq!(view.cell(0, 1), cell(1, 3));
         assert_eq!(view.cell(1, 0), cell(2, 2));
         assert_eq!(view.cell(1, 1), cell(2, 3));
-        assert_eq!(view.get(cell(1, 2)), from_const(7));
-        assert_eq!(view.get(cell(1, 3)), from_const(8));
-        assert_eq!(view.get(cell(2, 2)), from_const(11));
-        assert_eq!(view.get(cell(2, 3)), from_const(12));
+        assert_eq!(view.get_at(cell(1, 2)), from_const(7));
+        assert_eq!(view.get_at(cell(1, 3)), from_const(8));
+        assert_eq!(view.get_at(cell(2, 2)), from_const(11));
+        assert_eq!(view.get_at(cell(2, 3)), from_const(12));
+        assert_eq!(view.get(cell(1, 2).into()), from_const(7));
+        assert_eq!(view.get(cell(1, 3).into()), from_const(8));
+        assert_eq!(view.get(cell(2, 2).into()), from_const(11));
+        assert_eq!(view.get(cell(2, 3).into()), from_const(12));
     }
 
     #[test]
@@ -1130,12 +1074,14 @@ mod tests {
         witness.set(cell(3, 0), from_const(10));
         witness.set(cell(3, 1), from_const(11));
         witness.set(cell(3, 2), from_const(12));
-        let view = witness.sub(2, 1, 1);
+        let view = witness.sub(2, 1, 1.into(), 4.into());
         assert_eq!(view.width(), 1);
         assert_eq!(view.cell(0, 0), cell(2, 1));
         assert_eq!(view.cell(1, 0), cell(3, 1));
-        assert_eq!(view.get(cell(2, 1)), from_const(8));
-        assert_eq!(view.get(cell(3, 1)), from_const(11));
+        assert_eq!(view.get_at(cell(2, 1)), from_const(8));
+        assert_eq!(view.get_at(cell(3, 1)), from_const(11));
+        assert_eq!(view.get(cell(2, 1).into()), from_const(8));
+        assert_eq!(view.get(cell(3, 1).into()), from_const(11));
     }
 
     #[test]
@@ -1154,16 +1100,20 @@ mod tests {
         witness.set(cell(2, 2), from_const(11));
         witness.set(cell(2, 3), from_const(12));
         {
-            let mut view = witness.sub(1, 2, 2);
+            let mut view = witness.sub(1, 2, 2.into(), 3.into());
             view.set(cell(1, 2), from_const(42));
             view.set(cell(1, 3), from_const(43));
             view.set(cell(2, 2), from_const(44));
             view.set(cell(2, 3), from_const(45));
         }
-        assert_eq!(witness.get(cell(1, 2)), from_const(42));
-        assert_eq!(witness.get(cell(1, 3)), from_const(43));
-        assert_eq!(witness.get(cell(2, 2)), from_const(44));
-        assert_eq!(witness.get(cell(2, 3)), from_const(45));
+        assert_eq!(witness.get_at(cell(1, 2)), from_const(42));
+        assert_eq!(witness.get_at(cell(1, 3)), from_const(43));
+        assert_eq!(witness.get_at(cell(2, 2)), from_const(44));
+        assert_eq!(witness.get_at(cell(2, 3)), from_const(45));
+        assert_eq!(witness.get(cell(1, 2).into()), from_const(42));
+        assert_eq!(witness.get(cell(1, 3).into()), from_const(43));
+        assert_eq!(witness.get(cell(2, 2).into()), from_const(44));
+        assert_eq!(witness.get(cell(2, 3).into()), from_const(45));
     }
 
     #[test]
@@ -1182,11 +1132,48 @@ mod tests {
         witness.set(cell(3, 1), from_const(11));
         witness.set(cell(3, 2), from_const(12));
         {
-            let mut view = witness.sub(2, 1, 1);
+            let mut view = witness.sub(2, 1, 1.into(), 4.into());
             view.set(cell(2, 1), from_const(42));
             view.set(cell(3, 1), from_const(43));
         }
-        assert_eq!(witness.get(cell(2, 1)), from_const(42));
-        assert_eq!(witness.get(cell(3, 1)), from_const(43));
+        assert_eq!(witness.get_at(cell(2, 1)), from_const(42));
+        assert_eq!(witness.get_at(cell(3, 1)), from_const(43));
+        assert_eq!(witness.get(cell(2, 1).into()), from_const(42));
+        assert_eq!(witness.get(cell(3, 1).into()), from_const(43));
+    }
+
+    #[test]
+    fn test_get_unconstrained_value_from_sub_view() {
+        let mut witness = Witness::new(4, 3, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 0), from_const(1));
+        witness.set(cell(0, 1), from_const(2));
+        witness.set(cell(0, 2), from_const(3));
+        witness.set(cell(1, 0), from_const(4));
+        witness.set(cell(1, 1), from_const(5));
+        witness.set(cell(1, 2), from_const(6));
+        witness.set(cell(2, 0), from_const(7));
+        witness.set(cell(2, 1), from_const(8));
+        witness.set(cell(2, 2), from_const(9));
+        witness.set(cell(3, 0), from_const(10));
+        witness.set(cell(3, 1), from_const(11));
+        witness.set(cell(3, 2), from_const(12));
+        let view = witness.sub(2, 1, 1.into(), 4.into());
+        assert_eq!(view.get(cell(2, 1).into()), from_const(8));
+        assert_eq!(view.get(from_const(34).into()), from_const(34));
+        assert_eq!(view.get(from_const(56).into()), from_const(56));
+    }
+
+    #[test]
+    fn test_contains_cell_sub_view() {
+        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let view = witness.sub(1, 2, 2.into(), 3.into());
+        assert!(view.contains_cell(cell(1, 2)));
+        assert!(view.contains_cell(cell(1, 3)));
+        assert!(view.contains_cell(cell(3, 2)));
+        assert!(view.contains_cell(cell(3, 3)));
+        assert!(!view.contains_cell(cell(0, 2)));
+        assert!(!view.contains_cell(cell(1, 1)));
+        assert!(!view.contains_cell(cell(1, 4)));
+        assert!(!view.contains_cell(cell(4, 2)));
     }
 }

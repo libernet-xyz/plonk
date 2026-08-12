@@ -582,7 +582,7 @@ impl Constraint {
                     )) * coefficient
                 }
             })
-            .fold(Polynomial::default(), Polynomial::add)
+            .sum()
     }
 }
 

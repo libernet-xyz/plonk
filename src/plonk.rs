@@ -131,51 +131,41 @@ impl Default for ProvingOptions {
     }
 }
 
-mod internal {
-    use super::*;
+pub trait CircuitView {
+    /// Returns a reference to the [`CircuitBuilder`].
+    fn builder(&self) -> &CircuitBuilder;
 
-    /// Provides access to the internal state of a circuit view.
-    ///
-    /// This is used to implement the provided methods of the [`CircuitView`] trait.
-    pub trait CircuitViewState {
-        /// Returns a reference to the [`CircuitBuilder`].
-        fn builder(&self) -> &CircuitBuilder;
+    /// Returns a mutable reference to the [`CircuitBuilder`].
+    fn builder_mut(&mut self) -> &mut CircuitBuilder;
 
-        /// Returns a mutable reference to the [`CircuitBuilder`].
-        fn builder_mut(&mut self) -> &mut CircuitBuilder;
-
-        /// Returns the row offset of the view (0 for the [`CircuitBuilder`] itself).
-        ///
-        /// This is always an absolute value even for transitive sub-views. It is not relative to
-        /// the parent view.
-        fn row_offset(&self) -> usize;
-
-        /// Returns the column offset of the view (0 for the [`CircuitBuilder`] itself).
-        ///
-        /// This is always an absolute value even for transitive sub-views. It is not relative to
-        /// the parent view.
-        fn column_offset(&self) -> usize;
-
-        /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
-        fn root_cell(&self) -> Cell {
-            Cell::new(self.row_offset(), self.column_offset())
-        }
-
-        /// Returns the next root cell where an [auto gate](`CircuitView::auto_gate`) can be placed,
-        /// advancing the internal state to the next row.
-        fn step_row(&mut self) -> Cell;
-
-        /// Advances the internal row counter by `n`.
-        fn skip_rows(&mut self, n: usize);
-    }
-}
-
-pub trait CircuitView: internal::CircuitViewState {
     /// Returns the number of columns included in the view.
     ///
     /// If this is the root view, that is the raw [`CircuitBuilder`] instance, the width is
     /// unbounded and `None` is returned.
     fn width(&self) -> Option<usize>;
+
+    /// Returns the number of rows included in the view.
+    ///
+    /// If this is the root view, that is the raw [`CircuitBuilder`] instance, the height is
+    /// unbounded and `None` is returned.
+    fn height(&self) -> Option<usize>;
+
+    /// Returns the row offset of the view (0 for the [`CircuitBuilder`] itself).
+    ///
+    /// This is always an absolute value even for transitive sub-views. It is not relative to
+    /// the parent view.
+    fn row_offset(&self) -> usize;
+
+    /// Returns the column offset of the view (0 for the [`CircuitBuilder`] itself).
+    ///
+    /// This is always an absolute value even for transitive sub-views. It is not relative to
+    /// the parent view.
+    fn column_offset(&self) -> usize;
+
+    /// Returns [`Self::row_offset()`] and [`Self::column_offset()`] as a [`Cell`].
+    fn root_cell(&self) -> Cell {
+        Cell::new(self.row_offset(), self.column_offset())
+    }
 
     /// Creates a [`Cell`] relative to this view.
     ///
@@ -184,14 +174,38 @@ pub trait CircuitView: internal::CircuitViewState {
     fn cell(&self, row_offset: impl CellOffset, column_offset: impl CellOffset) -> Cell {
         let row = self.row_offset() as isize + row_offset.into_offset();
         let column = self.column_offset() as isize + column_offset.into_offset();
-        debug_assert!(row >= 0);
-        debug_assert!(column >= 0);
+        assert!(row >= 0);
+        assert!(column >= 0);
         Cell::new(row as usize, column as usize)
     }
 
+    /// Indicates whether the specified `cell` is contained in this view.
+    ///
+    /// Always true for the root [`CircuitBuilder`].
+    fn contains_cell(&self, cell: Cell) -> bool {
+        let row_offset = self.row_offset();
+        let column_offset = self.column_offset();
+        if cell.row() < row_offset || cell.column() < column_offset {
+            return false;
+        }
+        if let Some(width) = self.width() {
+            assert!(cell.column() < column_offset + width);
+        }
+        if let Some(height) = self.height() {
+            assert!(cell.row() < row_offset + height);
+        }
+        true
+    }
+
     /// Adds a gate to the circuit.
+    ///
+    /// NOTE: the function panics if the root cell of the gate lies outside the view. It is however
+    /// not forbidden to refer to external cells from within the gate constraint by using rotations
+    /// or overflowing column numbers. For example, it's okay to place a gate at row 0 and refer to
+    /// `rvar(0, -1)`, or to place it at the rightmost column and refer to `var(1)`.
     fn add_gate(&mut self, row: usize, constraint: Constraint) {
         let root_cell = self.cell(row, 0);
+        assert!(self.contains_cell(root_cell));
         self.builder_mut().add_gate_internal(root_cell, constraint);
     }
 
@@ -200,132 +214,35 @@ pub trait CircuitView: internal::CircuitViewState {
         self.builder_mut().connect_internal(cell1, cell2);
     }
 
-    /// Skips `n` rows, advancing the internal row counter by `n`.
-    ///
-    /// This is useful between [`Self::auto_gate`] / [`Self::auto_constraint`] calls because it
-    /// allows the caller to place auto-gates at the correct position and satisfy assumptions about
-    /// rotated variables accessed by the gate. For example:
-    ///
-    /// ```ignore
-    /// let [sum] = view.auto_gate(rvar(0, 0) + rvar(0, 1) - rvar(0, 2), [x, y]);
-    /// view.skip_rows(2);
-    /// let [result] = view.auto_constraint(var(0) - 42, [sum.into()]);
-    /// ```
-    ///
-    /// The above circuit proves knowledge of two numbers whose sum is 42, and the `skip_rows` call
-    /// is required because the second gate must be placed three rows after the first.
-    fn skip_rows(&mut self, n: usize) {
-        internal::CircuitViewState::skip_rows(self, n);
-    }
-
-    /// Adds a gate with `N` inputs and `M` outputs.
-    ///
-    /// The provided `constraint` must use exactly `N+M` variables, or the function will panic. The
-    /// provided input cells are wrapped in `Option`s because `None` means the corresponding input
-    /// is unconstrained.
-    ///
-    /// The first `N` variables used in the constraint (those with the lowest column numbers) will
-    /// be automatically connected to the specified `inputs` unless they're unconstrained / None,
-    /// while the last `M` variables (those with the highest column numbers) will be returned as
-    /// outputs.
-    ///
-    /// NOTE: variables with the same column number but different rotations are considered different
-    /// variables for the purpose of counting against `N` and `M`. For example, the constraint
-    /// `var(0,+1) == var(0,-1) + var(0)` uses three variables, not one. Variables with the same
-    /// column number are ordered by rotation, so for example if you set `N=2` and `M=1` the above
-    /// constraint would associate the 2 inputs to `var(0,-1)` and `var(0)`, and the output to
-    /// `var(0,+1)`.
-    fn auto_gate<const N: usize, const M: usize>(
-        &mut self,
-        constraint: Constraint,
-        inputs: [Option<Cell>; N],
-    ) -> [Cell; M] {
-        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
-        assert_eq!(variables.len(), N + M);
-
-        let root_cell = self.step_row();
-
-        for i in 0..N {
-            if let Some(input) = inputs[i] {
-                self.builder_mut()
-                    .connect_internal(Some(input), Some(variables[i].map_to_cell(root_cell)));
-            }
-        }
-
-        self.builder_mut().add_gate_internal(root_cell, constraint);
-
-        std::array::from_fn(|i| variables[N + i].map_to_cell(root_cell))
-    }
-
-    /// Adds a gate with `N` terminations.
-    ///
-    /// Unlike [`Self::auto_gate`] this method doesn't make a distinction between input and output
-    /// terminations; it simply enforces a polynomial relation among `N` terminations.
-    ///
-    /// The provided `constraint` must use exactly `N` variables, or the function will panic. The
-    /// provided input cells are wrapped in `Option`s because `None` means the corresponding input
-    /// is unconstrained.
-    ///
-    /// The `N` variables used in the constraint will be automatically connected to the specified
-    /// `inputs` unless they're unconstrained / None.
-    ///
-    /// NOTE: variables with the same column number but different rotations are considered different
-    /// variables for the purpose of counting against `N`. For example, the constraint
-    /// `var(0,+1) == var(0,-1) + var(0)` uses three variables, not one. Variables with the same
-    /// column number are ordered by rotation, so for example the above constraint would associate
-    /// the 3 inputs to `var(0,-1)`, `var(0)`, and `var(0,+1)`, respectively.
-    fn auto_constraint<const N: usize>(
-        &mut self,
-        constraint: Constraint,
-        inputs: [Option<Cell>; N],
-    ) -> [Cell; N] {
-        let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
-        assert_eq!(variables.len(), N);
-
-        let root_cell = self.step_row();
-
-        for i in 0..N {
-            if let Some(input) = inputs[i] {
-                self.connect(Some(input), Some(variables[i].map_to_cell(root_cell)));
-            }
-        }
-
-        self.builder_mut().add_gate_internal(root_cell, constraint);
-
-        std::array::from_fn(|i| variables[i].map_to_cell(root_cell))
-    }
-
-    /// Adds a NOP gate with `N` terminations; the constraint of the gate is `0 == 0`.
-    ///
-    /// This is conceptually equivalent to calling:
-    ///
-    /// ```ignore
-    /// witness.auto_constraint::<N>(Constraint::nop(), inputs);
-    /// ```
-    ///
-    /// except that the above call wouldn't work because the nop constraint uses 0 variables, so it
-    /// would panic because `0 != N`.
-    fn add_nop_gate<const N: usize>(&mut self, inputs: [Option<Cell>; N]) -> [Cell; N] {
-        let root_cell = self.step_row();
-        let outputs = std::array::from_fn(|i| Cell::new(0, i).remap(root_cell));
-
-        for i in 0..N {
-            if let Some(input) = inputs[i] {
-                self.connect(Some(input), Some(outputs[i]));
-            }
-        }
-
-        self.builder_mut()
-            .add_gate_internal(root_cell, Constraint::nop());
-
-        outputs
-    }
-
     /// Spawns a child `CircuitView` at the given coordinates.
-    fn sub(&mut self, row_offset: usize, column_offset: usize, width: usize) -> impl CircuitView {
+    ///
+    /// If `width` and/or `height` are specified they must not overflow the parent view. If they are
+    /// not specified the child view will automatically extend to the full width and/or height of
+    /// the parent view.
+    ///
+    /// The function will panic if the child view overflows the parent view.
+    ///
+    /// NOTE: the width and height of the root view are undefined because the [`CircuitBuilder`] is
+    /// unbounded, so the `width` and `height` parameters MUST be specified when creating direct
+    /// children of the [`CircuitBuilder`].
+    fn sub(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        width: Option<usize>,
+        height: Option<usize>,
+    ) -> impl CircuitView {
+        let width = width.unwrap_or(self.width().unwrap() - column_offset);
+        let height = height.unwrap_or(self.height().unwrap() - row_offset);
+        if let Some(parent_width) = self.width() {
+            assert!(column_offset + width <= parent_width);
+        }
+        if let Some(parent_height) = self.height() {
+            assert!(row_offset + height <= parent_height);
+        }
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
-        CircuitSectionBuilder::new(self.builder_mut(), row_offset, column_offset, width)
+        CircuitSectionBuilder::new(self.builder_mut(), row_offset, column_offset, width, height)
     }
 
     /// Spawns a child `CircuitView` at the given coordinates and runs the provided `callback` on
@@ -333,13 +250,24 @@ pub trait CircuitView: internal::CircuitViewState {
     ///
     /// `sub_fn` returns `self`, not the child view. The child view is only valid for the duration
     /// of the callback, while `self` is returned to make `sub_fn` chainable.
+    ///
+    /// See [`Self::sub`] for details about how the `width` and `height` parameters are treated.
     fn sub_fn(
         &mut self,
         row_offset: usize,
         column_offset: usize,
-        width: usize,
+        width: Option<usize>,
+        height: Option<usize>,
         callback: impl FnOnce(&mut CircuitSectionBuilder),
     ) -> &mut Self {
+        let width = width.unwrap_or(self.width().unwrap() - column_offset);
+        let height = height.unwrap_or(self.height().unwrap() - row_offset);
+        if let Some(parent_width) = self.width() {
+            assert!(column_offset + width <= parent_width);
+        }
+        if let Some(parent_height) = self.height() {
+            assert!(row_offset + height <= parent_height);
+        }
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
         callback(&mut CircuitSectionBuilder::new(
@@ -347,6 +275,7 @@ pub trait CircuitView: internal::CircuitViewState {
             row_offset,
             column_offset,
             width,
+            height,
         ));
         self
     }
@@ -359,14 +288,25 @@ pub trait CircuitView: internal::CircuitViewState {
         chip: &impl Chip<I, O>,
         inputs: [Option<Cell>; I],
     ) -> Result<[Option<Cell>; O]> {
+        let chip_width = chip.width();
+        let chip_height = chip.height();
+        if let Some(parent_width) = self.width() {
+            assert!(column_offset + chip_width <= parent_width);
+        }
+        if let Some(parent_height) = self.height() {
+            assert!(row_offset + chip_height <= parent_height);
+        }
         let row_offset = self.row_offset() + row_offset;
         let column_offset = self.column_offset() + column_offset;
-        let mut child =
-            CircuitSectionBuilder::new(self.builder_mut(), row_offset, column_offset, chip.width());
+        let mut child = CircuitSectionBuilder::new(
+            self.builder_mut(),
+            row_offset,
+            column_offset,
+            chip_width,
+            chip_height,
+        );
         chip.build(&mut child, inputs)
     }
-
-    fn auto_sub<'a>(&'a mut self, width: usize, count: usize) -> CircuitViewGenerator<'a>;
 }
 
 #[derive(Debug)]
@@ -380,6 +320,9 @@ pub struct CircuitViewGenerator<'a> {
     /// Width of each sub-section.
     width: usize,
 
+    /// Height of each sub-section.
+    height: usize,
+
     /// Number of sub-sections to generate.
     count: usize,
 }
@@ -392,6 +335,7 @@ impl<'a> CircuitViewGenerator<'a> {
             self.row_offset,
             self.width * index,
             self.width,
+            self.height,
         )
     }
 }
@@ -418,9 +362,6 @@ pub struct CircuitBuilder {
 
     /// Current number of columns in the circuit.
     num_columns: usize,
-
-    /// Used by [`Self::auto_gate`] to keep track of the current row;
-    row_counter: usize,
 
     /// The gates of the circuit, indexed by constraint.
     ///
@@ -630,7 +571,7 @@ impl CircuitBuilder {
     }
 }
 
-impl internal::CircuitViewState for CircuitBuilder {
+impl CircuitView for CircuitBuilder {
     fn builder(&self) -> &CircuitBuilder {
         self
     }
@@ -639,38 +580,20 @@ impl internal::CircuitViewState for CircuitBuilder {
         self
     }
 
+    fn width(&self) -> Option<usize> {
+        None
+    }
+
+    fn height(&self) -> Option<usize> {
+        None
+    }
+
     fn row_offset(&self) -> usize {
         0
     }
 
     fn column_offset(&self) -> usize {
         0
-    }
-
-    fn step_row(&mut self) -> Cell {
-        let root_cell = self.cell(self.row_counter, 0);
-        self.row_counter += 1;
-        root_cell
-    }
-
-    fn skip_rows(&mut self, n: usize) {
-        self.row_counter += n;
-    }
-}
-
-impl CircuitView for CircuitBuilder {
-    fn width(&self) -> Option<usize> {
-        None
-    }
-
-    fn auto_sub<'a>(&'a mut self, width: usize, count: usize) -> CircuitViewGenerator<'a> {
-        let row_offset = self.row_counter;
-        CircuitViewGenerator {
-            builder: self,
-            row_offset,
-            width,
-            count,
-        }
     }
 }
 
@@ -689,8 +612,8 @@ pub struct CircuitSectionBuilder<'a> {
     /// Width (number of columns) of the sub-section.
     width: usize,
 
-    /// Row counter for [`Self::auto_gate`].
-    row_counter: usize,
+    /// Height (number of rows) of the sub-section.
+    height: usize,
 }
 
 impl<'a> CircuitSectionBuilder<'a> {
@@ -699,18 +622,19 @@ impl<'a> CircuitSectionBuilder<'a> {
         row_offset: usize,
         column_offset: usize,
         width: usize,
+        height: usize,
     ) -> Self {
         Self {
             builder,
             row_offset,
             column_offset,
             width,
-            row_counter: 0,
+            height,
         }
     }
 }
 
-impl<'a> internal::CircuitViewState for CircuitSectionBuilder<'a> {
+impl<'a> CircuitView for CircuitSectionBuilder<'a> {
     fn builder(&self) -> &CircuitBuilder {
         self.builder
     }
@@ -719,45 +643,20 @@ impl<'a> internal::CircuitViewState for CircuitSectionBuilder<'a> {
         self.builder
     }
 
+    fn width(&self) -> Option<usize> {
+        Some(self.width)
+    }
+
+    fn height(&self) -> Option<usize> {
+        Some(self.height)
+    }
+
     fn row_offset(&self) -> usize {
         self.row_offset
     }
 
     fn column_offset(&self) -> usize {
         self.column_offset
-    }
-
-    fn step_row(&mut self) -> Cell {
-        let root_cell = self.cell(self.row_counter, 0);
-        self.row_counter += 1;
-        root_cell
-    }
-
-    fn skip_rows(&mut self, n: usize) {
-        self.row_counter += n;
-    }
-}
-
-impl<'a> CircuitView for CircuitSectionBuilder<'a> {
-    fn width(&self) -> Option<usize> {
-        Some(self.width)
-    }
-
-    fn auto_sub<'b>(&'b mut self, width: usize, count: usize) -> CircuitViewGenerator<'b> {
-        let row_offset = self.row_offset + self.row_counter;
-        CircuitViewGenerator {
-            builder: self.builder,
-            row_offset,
-            width,
-            count,
-        }
-    }
-}
-
-impl<'a> Drop for CircuitSectionBuilder<'a> {
-    fn drop(&mut self) {
-        self.builder.row_counter =
-            std::cmp::max(self.builder.row_counter, self.row_offset + self.row_counter);
     }
 }
 
@@ -931,7 +830,7 @@ impl Circuit {
                         .map(|variable| {
                             (
                                 variable.clone(),
-                                witness.get(variable.map_to_cell(root_cell)),
+                                witness.get_at(variable.map_to_cell(root_cell)),
                             )
                         })
                         .collect();
@@ -968,8 +867,8 @@ impl Circuit {
                 let target_cell = *cell_by_identity_value
                     .get(&self.sigma_values[column][row])
                     .unwrap();
-                let source_value = witness.get(source_cell);
-                let target_value = witness.get(target_cell);
+                let source_value = witness.get_at(source_cell);
+                let target_value = witness.get_at(target_cell);
                 if source_value != target_value {
                     return Err(anyhow!(
                         "wire constraint violated: cell({}, {}) = {}, cell({}, {}) = {}",
@@ -1036,7 +935,7 @@ impl Circuit {
                 let mut generator_power = Scalar::ONE;
                 accumulator[i + 1] = accumulator[i];
                 for j in 0..self.num_columns {
-                    let witness_value = witness.get(Cell::new(i, j));
+                    let witness_value = witness.get_at(Cell::new(i, j));
                     accumulator[i + 1] *=
                         witness_value + beta * generator_power * omega_power + gamma;
                     accumulator[i + 1] *=
@@ -1707,66 +1606,6 @@ mod tests {
         assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 3, c).is_ok());
     }
 
-    fn test_vitalik_circuit_with_auto_gates_impl<H: HashBackend<Scalar>>(
-        canonicalize_constraints: bool,
-        blowup_log2: usize,
-        commitment: H256,
-    ) -> Result<()> {
-        let mut builder = CircuitBuilder::default();
-        let [x, square] = builder.auto_gate((var(0) ^ 2) - var(1), []);
-        let [result] = builder.auto_gate(
-            var(0) * var(1) + var(0) + 5 - var(2),
-            [x.into(), square.into()],
-        );
-        let [_, result] = builder.add_nop_gate([x.into(), result.into()]);
-        builder.declare_public_rows([result.row()]);
-        let circuit = builder.build(CompilationOptions {
-            canonicalize_constraints,
-        })?;
-        assert_eq!(circuit.num_rows(), 3);
-        assert_eq!(circuit.degree_bound(), 8);
-        assert_eq!(circuit.num_columns(), 3);
-        assert_eq!(circuit.num_gates(), 3);
-        let mut witness = circuit.make_witness();
-        assert_eq!(witness.num_rows(), 3);
-        assert_eq!(witness.degree_bound(), 8);
-        assert_eq!(witness.num_columns(), 3);
-        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
-        let result = witness.auto_set_one(
-            var(2),
-            var(0) * var(1) + var(0) + 5,
-            [x.into(), square.into()],
-        );
-        let [x, result] = witness.nop([x.into(), result.into()]);
-        assert!(circuit.check_witness(&witness).is_ok());
-        let options = ProvingOptions { blowup_log2 };
-        let proof = circuit.prove::<H>(witness, options.clone())?;
-        assert_eq!(proof.degree_bound(), 8);
-        assert_eq!(proof.blowup_log2(), blowup_log2);
-        assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
-        assert_eq!(proof.num_polys(), 13);
-        let circuit = circuit.to_compressed(options);
-        assert_eq!(circuit.commitment(), commitment);
-        let public_inputs = circuit.verify(&proof)?;
-        assert_eq!(public_inputs[&x], from_const(3));
-        assert_eq!(public_inputs[&result], from_const(35));
-        Ok(())
-    }
-
-    #[test]
-    fn test_vitalik_circuit_with_auto_gates_blowup_2() {
-        let c = parse_hash("0x2732a0cce5e03109e372c39515b4e3cc7aae87adfde949418c7f5918e4cea1f9");
-        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(false, 1, c).is_ok());
-        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(true, 1, c).is_ok());
-    }
-
-    #[test]
-    fn test_vitalik_circuit_with_auto_gates_blowup_4() {
-        let c = parse_hash("0xd81086a421590d6b5517c86495fcc3f52c983ff49e9d7e9cbc034fdb7cb77782");
-        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(false, 2, c).is_ok());
-        assert!(test_vitalik_circuit_with_auto_gates_impl::<Sha2Hash<Scalar>>(true, 2, c).is_ok());
-    }
-
     /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
     /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81).
     fn test_vitalik_circuit_variation_impl<H: HashBackend<Scalar>>(
@@ -1775,63 +1614,74 @@ mod tests {
         commitment: H256,
     ) -> Result<()> {
         let mut builder = CircuitBuilder::default();
-        let [x, square] = builder.auto_gate((var(0) ^ 2) - var(1), []);
-        let [y, mul] = builder.auto_gate(var(0) * var(1) - var(2), [x.into()]);
-        let [result] = builder.auto_gate(
-            var(0) * var(1) + var(2) + 5 - var(3),
-            [x.into(), square.into(), mul.into()],
-        );
-        let [_, _, result] = builder.add_nop_gate([x.into(), y.into(), result.into()]);
-        builder.declare_public_rows([result.row()]);
+        builder.add_gate(0, (var(0) ^ 2) - var(1));
+        let x = cell(0, 0);
+        let square = cell(0, 1);
+        builder.add_gate(1, var(0) * var(1) - var(2));
+        builder.connect(x.into(), cell(1, 0).into());
+        let y = cell(1, 1);
+        let mul = cell(1, 2);
+        builder.add_gate(2, var(0) * var(1) + var(2) + 5 - var(3));
+        builder.connect(x.into(), cell(2, 0).into());
+        builder.connect(square.into(), cell(2, 1).into());
+        builder.connect(mul.into(), cell(2, 2).into());
+        let result = cell(2, 3);
+        let x_out = cell(3, 0);
+        builder.connect(x.into(), x_out.into());
+        let y_out = cell(3, 1);
+        builder.connect(y.into(), y_out.into());
+        let result_out = cell(3, 2);
+        builder.connect(result.into(), result_out.into());
+        builder.declare_public_rows([3]);
         let circuit = builder.build(CompilationOptions {
             canonicalize_constraints,
         })?;
         assert_eq!(circuit.num_rows(), 4);
         assert_eq!(circuit.degree_bound(), 8);
         assert_eq!(circuit.num_columns(), 4);
-        assert_eq!(circuit.num_gates(), 4);
+        assert_eq!(circuit.num_gates(), 3);
         let mut witness = circuit.make_witness();
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 4);
-        let square = witness.auto_set_one(var(1), var(0) ^ 2, [from_const(3).into()]);
-        let mul = witness.auto_set_one(
-            var(2),
-            var(0) * var(1),
-            [from_const(3).into(), from_const(4).into()],
-        );
-        let result = witness.auto_set_one(
-            var(3),
-            var(0) * var(1) + var(2) + 5,
-            [x.into(), square.into(), mul.into()],
-        );
-        let [x, y, result] = witness.nop([x.into(), y.into(), result.into()]);
+        witness.set(cell(0, 0), from_const(3));
+        witness.set(cell(0, 1), from_const(9));
+        witness.set(cell(1, 0), from_const(3));
+        witness.set(cell(1, 1), from_const(4));
+        witness.set(cell(1, 2), from_const(12));
+        witness.set(cell(2, 0), from_const(3));
+        witness.set(cell(2, 1), from_const(9));
+        witness.set(cell(2, 2), from_const(12));
+        witness.set(cell(2, 3), from_const(44));
+        witness.set(cell(3, 0), from_const(3));
+        witness.set(cell(3, 1), from_const(4));
+        witness.set(cell(3, 2), from_const(44));
         assert!(circuit.check_witness(&witness).is_ok());
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit.prove::<H>(witness, options.clone())?;
         assert_eq!(proof.degree_bound(), 8);
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
-        assert_eq!(proof.num_polys(), 17);
+        assert_eq!(proof.num_polys(), 16);
         let circuit = circuit.to_compressed(options);
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
-        assert_eq!(public_inputs[&x], from_const(3));
-        assert_eq!(public_inputs[&y], from_const(4));
-        assert_eq!(public_inputs[&result], from_const(44));
+        assert_eq!(public_inputs[&x_out], from_const(3));
+        assert_eq!(public_inputs[&y_out], from_const(4));
+        assert_eq!(public_inputs[&result_out], from_const(44));
         Ok(())
     }
 
     #[test]
     fn test_vitalik_circuit_variation_blowup_2() {
-        let c = parse_hash("0x3fd5a29b97c62d5899b807aef6eed75d108e51774f22a4b354f6aa84c46b938a");
+        let c = parse_hash("0x6f793d1bfd1349adb0981b299dae730991836d950d53d4f2df08b649db552d29");
         assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 1, c).is_ok());
         assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 1, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_variation_blowup_4() {
-        let c = parse_hash("0xf966855fcd2cfce8b257312f1e7964d3824874376522fe497050ce313e078c50");
+        let c = parse_hash("0xb50cc61c1a3f557f97d42bb6233ba4d133338bf86577615e4cbae10bbb90ccb6");
         assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(false, 2, c).is_ok());
         assert!(test_vitalik_circuit_variation_impl::<Sha2Hash<Scalar>>(true, 2, c).is_ok());
     }
