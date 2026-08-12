@@ -830,7 +830,7 @@ impl Circuit {
                         .map(|variable| {
                             (
                                 variable.clone(),
-                                witness.get(variable.map_to_cell(root_cell)),
+                                witness.get_at(variable.map_to_cell(root_cell)),
                             )
                         })
                         .collect();
@@ -867,8 +867,8 @@ impl Circuit {
                 let target_cell = *cell_by_identity_value
                     .get(&self.sigma_values[column][row])
                     .unwrap();
-                let source_value = witness.get(source_cell);
-                let target_value = witness.get(target_cell);
+                let source_value = witness.get_at(source_cell);
+                let target_value = witness.get_at(target_cell);
                 if source_value != target_value {
                     return Err(anyhow!(
                         "wire constraint violated: cell({}, {}) = {}, cell({}, {}) = {}",
@@ -935,7 +935,7 @@ impl Circuit {
                 let mut generator_power = Scalar::ONE;
                 accumulator[i + 1] = accumulator[i];
                 for j in 0..self.num_columns {
-                    let witness_value = witness.get(Cell::new(i, j));
+                    let witness_value = witness.get_at(Cell::new(i, j));
                     accumulator[i + 1] *=
                         witness_value + beta * generator_power * omega_power + gamma;
                     accumulator[i + 1] *=
