@@ -260,6 +260,22 @@ pub trait CircuitView {
         height: Option<usize>,
         callback: impl FnOnce(&mut CircuitSectionBuilder),
     ) -> &mut Self {
+        self.sub_fn_or(row_offset, column_offset, width, height, |view| {
+            callback(view);
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    /// Like [`Self::sub_fn`] but the callback may return an error.
+    fn sub_fn_or(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        width: Option<usize>,
+        height: Option<usize>,
+        callback: impl FnOnce(&mut CircuitSectionBuilder) -> Result<()>,
+    ) -> Result<&mut Self> {
         let width = width.unwrap_or(self.width().unwrap() - column_offset);
         let height = height.unwrap_or(self.height().unwrap() - row_offset);
         if let Some(parent_width) = self.width() {
@@ -276,8 +292,8 @@ pub trait CircuitView {
             column_offset,
             width,
             height,
-        ));
-        self
+        ))?;
+        Ok(self)
     }
 
     /// Spawns a child `WitnessView` at the given coordinates and runs the provided `chip` on it.

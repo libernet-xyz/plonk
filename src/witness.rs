@@ -310,6 +310,22 @@ pub trait WitnessView {
         height: Option<usize>,
         callback: impl FnOnce(&mut WitnessSection),
     ) -> &mut Self {
+        self.sub_fn_or(row_offset, column_offset, width, height, |view| {
+            callback(view);
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    /// Like [`Self::sub_fn`] but the callback may return an error.
+    fn sub_fn_or(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        width: Option<usize>,
+        height: Option<usize>,
+        callback: impl FnOnce(&mut WitnessSection) -> Result<()>,
+    ) -> Result<&mut Self> {
         let parent_width = self.width();
         let parent_height = self.height();
         let width = width.unwrap_or(parent_width - column_offset);
@@ -324,8 +340,8 @@ pub trait WitnessView {
             column_offset,
             width,
             height,
-        ));
-        self
+        ))?;
+        Ok(self)
     }
 
     /// Spawns a child `WitnessView` at the given coordinates and runs the provided `chip` on it.
@@ -552,6 +568,7 @@ impl<'a> WitnessView for WitnessSection<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
     use starkom_bluesky::from_const;
 
     #[inline]
@@ -1175,5 +1192,119 @@ mod tests {
         assert!(!view.contains_cell(cell(1, 1)));
         assert!(!view.contains_cell(cell(1, 4)));
         assert!(!view.contains_cell(cell(4, 2)));
+    }
+
+    #[test]
+    fn test_sub_fn_reads_and_writes() {
+        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        witness.set(cell(0, 0), from_const(1));
+        witness.set(cell(0, 1), from_const(2));
+        witness.set(cell(0, 2), from_const(3));
+        witness.set(cell(0, 3), from_const(4));
+        witness.set(cell(1, 0), from_const(5));
+        witness.set(cell(1, 1), from_const(6));
+        witness.set(cell(1, 2), from_const(7));
+        witness.set(cell(1, 3), from_const(8));
+        witness.set(cell(2, 0), from_const(9));
+        witness.set(cell(2, 1), from_const(10));
+        witness.set(cell(2, 2), from_const(11));
+        witness.set(cell(2, 3), from_const(12));
+        let mut read_value = from_const(0);
+        witness.sub_fn(1, 2, 2.into(), 3.into(), |view| {
+            read_value = view.get_at(cell(1, 2));
+            view.set(cell(1, 2), from_const(42));
+            view.set(cell(2, 3), from_const(43));
+        });
+        assert_eq!(read_value, from_const(7));
+        assert_eq!(witness.get_at(cell(1, 2)), from_const(42));
+        assert_eq!(witness.get_at(cell(1, 3)), from_const(8));
+        assert_eq!(witness.get_at(cell(2, 2)), from_const(11));
+        assert_eq!(witness.get_at(cell(2, 3)), from_const(43));
+    }
+
+    #[test]
+    fn test_sub_fn_default_dimensions() {
+        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut width = 0;
+        let mut height = 0;
+        witness.sub_fn(1, 1, None, None, |view| {
+            width = view.width();
+            height = view.height();
+        });
+        assert_eq!(width, 3);
+        assert_eq!(height, 7);
+    }
+
+    #[test]
+    fn test_sub_fn_chainability() {
+        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        witness
+            .sub_fn(0, 0, 2.into(), 2.into(), |view| {
+                view.set(cell(0, 0), from_const(1));
+            })
+            .sub_fn(1, 2, 2.into(), 2.into(), |view| {
+                view.set(cell(1, 2), from_const(2));
+            });
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(1));
+        assert_eq!(witness.get_at(cell(1, 2)), from_const(2));
+    }
+
+    #[test]
+    fn test_sub_fn_or_ok_reads_and_writes() {
+        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        witness.set(cell(1, 2), from_const(7));
+        let mut read_value = from_const(0);
+        let result = witness.sub_fn_or(1, 2, 2.into(), 3.into(), |view| {
+            read_value = view.get_at(cell(1, 2));
+            view.set(cell(1, 2), from_const(42));
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(read_value, from_const(7));
+        assert_eq!(witness.get_at(cell(1, 2)), from_const(42));
+    }
+
+    #[test]
+    fn test_sub_fn_or_default_dimensions() {
+        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut width = 0;
+        let mut height = 0;
+        let result = witness.sub_fn_or(1, 1, None, None, |view| {
+            width = view.width();
+            height = view.height();
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(width, 3);
+        assert_eq!(height, 7);
+    }
+
+    #[test]
+    fn test_sub_fn_or_propagates_error() {
+        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let result = witness.sub_fn_or(1, 2, 2.into(), 3.into(), |view| {
+            view.set(cell(1, 2), from_const(42));
+            Err(anyhow!("callback failed"))
+        });
+        assert_eq!(result.unwrap_err().to_string(), "callback failed");
+        assert_eq!(witness.get_at(cell(1, 2)), from_const(42));
+    }
+
+    #[test]
+    fn test_sub_fn_or_chainability() {
+        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        witness
+            .sub_fn_or(0, 0, 2.into(), 2.into(), |view| {
+                view.set(cell(0, 0), from_const(1));
+                Ok(())
+            })
+            .unwrap()
+            .sub_fn_or(1, 2, 2.into(), 2.into(), |view| {
+                view.set(cell(1, 2), from_const(2));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(witness.get_at(cell(0, 0)), from_const(1));
+        assert_eq!(witness.get_at(cell(1, 2)), from_const(2));
     }
 }
