@@ -310,6 +310,22 @@ pub trait WitnessView {
         height: Option<usize>,
         callback: impl FnOnce(&mut WitnessSection),
     ) -> &mut Self {
+        self.sub_fn_or(row_offset, column_offset, width, height, |view| {
+            callback(view);
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    /// Like [`Self::sub_fn`] but the callback may return an error.
+    fn sub_fn_or(
+        &mut self,
+        row_offset: usize,
+        column_offset: usize,
+        width: Option<usize>,
+        height: Option<usize>,
+        callback: impl FnOnce(&mut WitnessSection) -> Result<()>,
+    ) -> Result<&mut Self> {
         let parent_width = self.width();
         let parent_height = self.height();
         let width = width.unwrap_or(parent_width - column_offset);
@@ -324,8 +340,8 @@ pub trait WitnessView {
             column_offset,
             width,
             height,
-        ));
-        self
+        ))?;
+        Ok(self)
     }
 
     /// Spawns a child `WitnessView` at the given coordinates and runs the provided `chip` on it.
