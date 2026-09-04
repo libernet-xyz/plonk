@@ -1,12 +1,12 @@
 use crate::chip::Chip;
 use crate::expr::{Constraint, Variable};
-use crate::utils::{hash_to_scalar, padded_circuit_size};
+use crate::utils::{self, padded_circuit_size};
 use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
 use starkom_bluesky::Scalar;
-use starkom_ff::{Field, PrimeField};
-use starkom_pcs::{self as pcs, hash::HashBackend};
+use starkom_ff::Field;
+use starkom_pcs::{self as pcs, hash::Hasher};
 use starkom_poly;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
@@ -26,15 +26,20 @@ const COMMIT_INDEX_QUOTIENT: usize = 3;
 const NUM_COMMIT_INDICES: usize = 4;
 
 // Domain separator tags used for various Fiat-Shamir challenges.
-static DST_ALPHA: LazyLock<Scalar> =
-    LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge/alpha"));
-static DST_BETA: LazyLock<Scalar> =
-    LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge/beta"));
-static DST_GAMMA: LazyLock<Scalar> =
-    LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge/gamma"));
-static DST_DELTA: LazyLock<Scalar> =
-    LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge/delta"));
-static DST_XI: LazyLock<Scalar> = LazyLock::new(|| hash_to_scalar(b"starkom/plonk/challenge/xi"));
+
+static DST_ALPHA: LazyLock<H256> =
+    LazyLock::new(|| utils::make_dst(b"starkom/plonk/challenge/alpha"));
+
+static DST_BETA: LazyLock<H256> =
+    LazyLock::new(|| utils::make_dst(b"starkom/plonk/challenge/beta"));
+
+static DST_GAMMA: LazyLock<H256> =
+    LazyLock::new(|| utils::make_dst(b"starkom/plonk/challenge/gamma"));
+
+static DST_DELTA: LazyLock<H256> =
+    LazyLock::new(|| utils::make_dst(b"starkom/plonk/challenge/delta"));
+
+static DST_XI: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/plonk/challenge/xi"));
 
 /// Builds the set of all rotations used in a circuit.
 ///
@@ -680,12 +685,12 @@ impl<'a> CircuitView for CircuitSectionBuilder<'a> {
 ///
 /// The API in the implementation mostly mirrors that of the underlying PCS proof.
 #[derive(Debug, Clone)]
-pub struct Proof<H: HashBackend<Scalar>> {
-    commitment: pcs::Commitment<H>,
-    inner_proof: pcs::Proof<H>,
+pub struct Proof<H: Hasher<Scalar>> {
+    commitment: pcs::Commitment<Scalar, H>,
+    inner_proof: pcs::Proof<Scalar, H>,
 }
 
-impl<H: HashBackend<Scalar>> Proof<H> {
+impl<H: Hasher<Scalar>> Proof<H> {
     /// Returns the proven degree bound.
     pub fn degree_bound(&self) -> usize {
         self.inner_proof.degree_bound()
@@ -1027,7 +1032,7 @@ impl Circuit {
 
     /// Proves correctness of the given witness, or returns an error in case of a constraint
     /// violation.
-    pub fn prove<H: HashBackend<Scalar>>(
+    pub fn prove<H: Hasher<Scalar>>(
         &self,
         mut witness: Witness,
         options: ProvingOptions,
@@ -1062,8 +1067,11 @@ impl Circuit {
             .chain(self.sigma.iter().cloned())
             .collect();
 
-        let mut committer =
-            pcs::Committer::<H>::new(self.degree_bound, options.blowup_log2, circuit_polynomials);
+        let mut committer = pcs::Committer::<Scalar, H>::new(
+            self.degree_bound,
+            options.blowup_log2,
+            circuit_polynomials,
+        );
 
         let columns = witness.clone().encode();
         committer.add_batch(columns.clone());
@@ -1073,7 +1081,7 @@ impl Circuit {
 
         let gate_constraint = {
             let substitution = self.get_variable_substitution(omega, omega_inv, columns.as_slice());
-            let delta = H::challenge(*DST_DELTA, [committer.transcript_hash()]);
+            let delta = H::challenge(*DST_DELTA, &[committer.transcript_hash()]);
             let mut gate_constraint = Polynomial::default();
             let mut power = Scalar::ONE;
             for (constraint, instances) in &self.gates {
@@ -1098,13 +1106,13 @@ impl Circuit {
             permutation_fixpoint_constraint,
             permutation_recurrence_constraint,
         ) = {
-            let beta = H::challenge(*DST_BETA, [committer.transcript_hash()]);
-            let gamma = H::challenge(*DST_GAMMA, [committer.transcript_hash()]);
+            let beta = H::challenge(*DST_BETA, &[committer.transcript_hash()]);
+            let gamma = H::challenge(*DST_GAMMA, &[committer.transcript_hash()]);
             self.build_permutation_argument(&witness, columns.as_slice(), beta, gamma)?
         };
         committer.add_batch(vec![permutation_accumulator]);
 
-        let alpha = H::challenge(*DST_ALPHA, [committer.transcript_hash()]);
+        let alpha = H::challenge(*DST_ALPHA, &[committer.transcript_hash()]);
 
         let quotient = (gate_constraint
             + permutation_fixpoint_constraint * alpha
@@ -1112,7 +1120,7 @@ impl Circuit {
         .divide_by_zero(self.degree_bound)?;
         committer.add_batch(self.split_quotient(quotient));
 
-        let xi = H::challenge(*DST_XI, [committer.transcript_hash()]);
+        let xi = H::challenge(*DST_XI, &[committer.transcript_hash()]);
 
         let (commitment, prover) = committer.commit(BTreeSet::from_iter(
             get_rotation_set(self.gates.iter().map(|(constraint, _)| constraint))
@@ -1131,11 +1139,8 @@ impl Circuit {
         })
     }
 
-    pub fn to_compressed<H: HashBackend<Scalar>>(
-        self,
-        options: ProvingOptions,
-    ) -> CompressedCircuit<H> {
-        let committer = pcs::Committer::<H>::new(
+    pub fn to_compressed<H: Hasher<Scalar>>(self, options: ProvingOptions) -> CompressedCircuit<H> {
+        let committer = pcs::Committer::<Scalar, H>::new(
             self.degree_bound,
             options.blowup_log2,
             self.selectors
@@ -1160,11 +1165,11 @@ impl Circuit {
         }
     }
 
-    pub fn as_compressed<H: HashBackend<Scalar>>(
+    pub fn as_compressed<H: Hasher<Scalar>>(
         &self,
         options: ProvingOptions,
     ) -> CompressedCircuit<H> {
-        let committer = pcs::Committer::<H>::new(
+        let committer = pcs::Committer::<Scalar, H>::new(
             self.degree_bound,
             options.blowup_log2,
             self.selectors
@@ -1192,7 +1197,7 @@ impl Circuit {
         }
     }
 
-    pub fn verify<H: HashBackend<Scalar>>(
+    pub fn verify<H: Hasher<Scalar>>(
         &self,
         proof: &Proof<H>,
         options: ProvingOptions,
@@ -1206,7 +1211,7 @@ impl Circuit {
 /// This struct is much smaller than the original circuit but still allows full verification of a
 /// proof for the circuit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompressedCircuit<H: HashBackend<Scalar>> {
+pub struct CompressedCircuit<H: Hasher<Scalar>> {
     /// The raw number of rows of the circuit.
     ///
     /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
@@ -1239,7 +1244,7 @@ pub struct CompressedCircuit<H: HashBackend<Scalar>> {
     _data: PhantomData<H>,
 }
 
-impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
+impl<H: Hasher<Scalar>> CompressedCircuit<H> {
     pub fn num_rows(&self) -> usize {
         self.num_rows
     }
@@ -1350,7 +1355,7 @@ impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
 
         let xi = H::challenge(
             *DST_XI,
-            [commitment.transcript_hash(COMMIT_INDEX_QUOTIENT + 1)],
+            &[commitment.transcript_hash(COMMIT_INDEX_QUOTIENT + 1)],
         );
 
         let points = inner_proof.points();
@@ -1387,7 +1392,7 @@ impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
             let selectors: Vec<Scalar> = (0..num_gate_selectors).map(|i| points[&xi][i]).collect();
             let delta = H::challenge(
                 *DST_DELTA,
-                [commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
+                &[commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
             );
             let mut result = Scalar::ZERO;
             let mut power = Scalar::ONE;
@@ -1427,11 +1432,11 @@ impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
 
         let beta = H::challenge(
             *DST_BETA,
-            [commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
+            &[commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
         );
         let gamma = H::challenge(
             *DST_GAMMA,
-            [commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
+            &[commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
         );
 
         let (permutation_numerator, permutation_denominator) = {
@@ -1462,7 +1467,7 @@ impl<H: HashBackend<Scalar>> CompressedCircuit<H> {
 
         let alpha = H::challenge(
             *DST_ALPHA,
-            [commitment.transcript_hash(COMMIT_INDEX_PERMUTATION_ARGUMENT + 1)],
+            &[commitment.transcript_hash(COMMIT_INDEX_PERMUTATION_ARGUMENT + 1)],
         );
 
         let permutation_recurrence_constraint = shifted_permutation_accumulator
@@ -1499,7 +1504,7 @@ mod tests {
     use crate::expr::var;
     use crate::witness::WitnessView;
     use starkom_bluesky::from_const;
-    use starkom_pcs::hash::{Poseidon1Hash, Poseidon2Hash, Sha2Hash};
+    use starkom_pcs::hash::{Keccak256Hash, Sha2Hash};
 
     fn parse_hash(s: &'static str) -> H256 {
         s.parse().unwrap()
@@ -1512,7 +1517,7 @@ mod tests {
 
     // This function tests the circuit from Vitalik's PLONK tutorial,
     // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
-    fn test_vitalik_circuit_impl<H: HashBackend<Scalar>>(
+    fn test_vitalik_circuit_impl<H: Hasher<Scalar>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
         commitment: H256,
@@ -1567,17 +1572,10 @@ mod tests {
     }
 
     #[test]
-    fn test_vitalik_circuit_poseidon1_blowup_2() {
-        let c = parse_hash("0x4c0f5d5f66539f75d5b6aee98ffc568beb42e3e7e0cb4ed90d41e64d4be837e0");
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 1, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 1, c).is_ok());
-    }
-
-    #[test]
-    fn test_vitalik_circuit_poseidon2_blowup_2() {
-        let c = parse_hash("0x5508e170339ecee104b4b4d7ca3a85e793016286d39000c09c24c79580cf75cf");
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 1, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 1, c).is_ok());
+    fn test_vitalik_circuit_keccak256_blowup_2() {
+        let c = parse_hash("0xa4e2f7c1507afba18f2996fd89dd570f1bd466fdf14c8bc0d65a015c88aa8e20");
+        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(false, 1, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(true, 1, c).is_ok());
     }
 
     #[test]
@@ -1588,17 +1586,10 @@ mod tests {
     }
 
     #[test]
-    fn test_vitalik_circuit_poseidon1_blowup_4() {
-        let c = parse_hash("0x4b1ab763f019c48274cf9befb19a851105834ae5f3b1fc85a905025cf4da6211");
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 2, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 2, c).is_ok());
-    }
-
-    #[test]
-    fn test_vitalik_circuit_poseidon2_blowup_4() {
-        let c = parse_hash("0x726e2fb39c3ac77f8abda66ad8f43b26ec1bdc2e996c70b4bbe9871d8a961e56");
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 2, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 2, c).is_ok());
+    fn test_vitalik_circuit_keccak256_blowup_4() {
+        let c = parse_hash("0x44197f3984298e3c6d20bc0a5be4ff0dca39b54f0c601f67367c3f72cfb1bb93");
+        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(false, 2, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(true, 2, c).is_ok());
     }
 
     #[test]
@@ -1609,22 +1600,15 @@ mod tests {
     }
 
     #[test]
-    fn test_vitalik_circuit_poseidon1_blowup_8() {
-        let c = parse_hash("0x104be93670e60515e8a99a4470fa15784544a15aae1b4e314a0cb85cc9c2f6e8");
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(false, 3, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon1Hash<Scalar>>(true, 3, c).is_ok());
-    }
-
-    #[test]
-    fn test_vitalik_circuit_poseidon2_blowup_8() {
-        let c = parse_hash("0x0f6a49c82bc868f6454d2d520224c591c6155533bd88a906ad8918fdc09461a9");
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(false, 3, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Poseidon2Hash<Scalar>>(true, 3, c).is_ok());
+    fn test_vitalik_circuit_keccak256_blowup_8() {
+        let c = parse_hash("0x4fa1ea6a1b435bb0309c7432be6087bd326962a13709669be5695ddf6049fc22");
+        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(false, 3, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(true, 3, c).is_ok());
     }
 
     /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
     /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81).
-    fn test_vitalik_circuit_variation_impl<H: HashBackend<Scalar>>(
+    fn test_vitalik_circuit_variation_impl<H: Hasher<Scalar>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
         commitment: H256,
