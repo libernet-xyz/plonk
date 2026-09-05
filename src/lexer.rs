@@ -28,12 +28,12 @@ static REGEX_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+").
 static REGEX_IDENTIFIER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*\b").unwrap());
 
-static REGEX_NUMBER_2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^0[Bb][01]+\b").unwrap());
+static REGEX_NUMBER_2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^0[Bb]([01]+)\b").unwrap());
 static REGEX_NUMBER_8: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^0[0-7]+\b").unwrap());
 static REGEX_NUMBER_10: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:0|[1-9]\d*)\b").unwrap());
 static REGEX_NUMBER_16: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^0[Xx][0-9a-fA-F]+\b").unwrap());
+    LazyLock::new(|| Regex::new(r"^0[Xx]([0-9a-fA-F]+)\b").unwrap());
 
 static SYMBOLS: LazyLock<BTreeMap<&'static str, Token>> = LazyLock::new(|| {
     BTreeMap::from([
@@ -93,9 +93,9 @@ impl<'a> Lexer<'a> {
             } else if let Some(captures) = self.consume_prefix(&*REGEX_NUMBER_8) {
                 tokens.push(Token::Number8(captures[0].to_string()));
             } else if let Some(captures) = self.consume_prefix(&*REGEX_NUMBER_2) {
-                tokens.push(Token::Number2(captures[0].to_string()));
+                tokens.push(Token::Number2(captures[1].to_string()));
             } else if let Some(captures) = self.consume_prefix(&*REGEX_NUMBER_16) {
-                tokens.push(Token::Number16(captures[0].to_string()));
+                tokens.push(Token::Number16(captures[1].to_string()));
             } else if let Some(captures) = self.consume_prefix(&*REGEX_NUMBER_10) {
                 tokens.push(Token::Number10(captures[0].to_string()));
             } else {
