@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
 use sha3::Digest;
-use starkom_ff::{Field, Field256};
+use starkom_ff::Field;
 use std::collections::BTreeSet;
 
 /// Helper function used to derive domain separator tags used in various contexts.
@@ -26,8 +26,7 @@ pub(crate) fn isize_to_scalar<F: Field>(value: isize) -> F {
 /// In some context (e.g. in constraint expression parsing when interpreting an exponent) we get
 /// scalar values that we need to convert to signed [`isize`] values.
 pub(crate) fn is_pseudo_negative<F: Field>(&value: &F) -> bool {
-    assert!(bool::from(F::MAX.is_even()));
-    value > F::MAX * F::TWO_INV
+    value.to_u256() > (F::MAX.to_u256() >> 1)
 }
 
 pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
