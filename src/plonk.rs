@@ -46,7 +46,9 @@ static DST_XI: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/plonk
 /// NOTE: we're always including 0 and +1 because we need to open xi and xi*omega regardless;
 /// they're needed for the final algebraic check and for the shifted permutation argument,
 /// respectively.
-fn get_rotation_set<'a, I: IntoIterator<Item = &'a Constraint>>(gates: I) -> BTreeSet<isize> {
+fn get_rotation_set<'a, F: Field>(
+    gates: impl IntoIterator<Item = &'a Constraint<F>>,
+) -> BTreeSet<isize> {
     gates
         .into_iter()
         .map(|constraint| {
@@ -84,10 +86,10 @@ fn get_rotation_set<'a, I: IntoIterator<Item = &'a Constraint>>(gates: I) -> BTr
 ///   `(N - 1) * (1 + E) - N`;
 /// * so the degree bound of the quotient is `(N - 1) * (1 + E) - N + 1`
 /// * ... which simplifies to `(N - 1) * E`.
-fn quotient_degree_bound<'a, I: Iterator<Item = &'a Constraint>>(
+fn quotient_degree_bound<'a, F: Field>(
     degree_bound: usize,
     num_columns: usize,
-    gate_constraints: I,
+    gate_constraints: impl Iterator<Item = &'a Constraint<F>>,
 ) -> usize {
     let max_gate_degree = gate_constraints
         .map(|constraint| constraint.get_degree())
@@ -208,7 +210,7 @@ pub trait CircuitView {
     /// not forbidden to refer to external cells from within the gate constraint by using rotations
     /// or overflowing column numbers. For example, it's okay to place a gate at row 0 and refer to
     /// `rvar(0, -1)`, or to place it at the rightmost column and refer to `var(1)`.
-    fn add_gate(&mut self, row: usize, constraint: Constraint) {
+    fn add_gate(&mut self, row: usize, constraint: Constraint<Scalar>) {
         let root_cell = self.cell(row, 0);
         assert!(self.contains_cell(root_cell));
         self.builder_mut().add_gate_internal(root_cell, constraint);
@@ -395,7 +397,7 @@ pub struct CircuitBuilder {
     /// NOTE: in order to minimize the number of different gate types stored in a circuit, the
     /// constraints stored in this map are _not_ [remapped](`Constraint::remap_variables`). This map
     /// basically keeps "raw gate types".
-    gates: BTreeMap<Constraint, Vec<Cell>>,
+    gates: BTreeMap<Constraint<Scalar>, Vec<Cell>>,
 
     /// Cell partitioning inferred from the connections made with [`Self::connect`].
     partitioner: Partitioner,
@@ -405,7 +407,7 @@ pub struct CircuitBuilder {
 }
 
 impl CircuitBuilder {
-    fn add_gate_internal(&mut self, mut root_cell: Cell, mut constraint: Constraint) {
+    fn add_gate_internal(&mut self, mut root_cell: Cell, mut constraint: Constraint<Scalar>) {
         {
             let min_column_index = constraint.get_min_column_index();
             root_cell = root_cell.remap(Cell::new(0, min_column_index));
@@ -470,11 +472,12 @@ impl CircuitBuilder {
         &self,
         degree_bound: usize,
     ) -> (
-        BTreeMap<Constraint, BTreeSet<GateInstance>>,
+        BTreeMap<Constraint<Scalar>, BTreeSet<GateInstance>>,
         Vec<Polynomial>,
     ) {
         // Keys are (constraint, column_index) pairs; values are activation row sets.
-        let mut row_set_map: BTreeMap<(Constraint, usize), BTreeSet<usize>> = BTreeMap::default();
+        let mut row_set_map: BTreeMap<(Constraint<Scalar>, usize), BTreeSet<usize>> =
+            BTreeMap::default();
         for (constraint, root_cells) in &self.gates {
             for root_cell in root_cells.as_slice() {
                 let key = (constraint.clone(), root_cell.column());
@@ -485,7 +488,7 @@ impl CircuitBuilder {
 
         // Roughly the inverse of `row_set_map`: keys are activation row sets, values are the list
         // of (constraint, column_index) instances that activate at those rows.
-        let mut gates_by_row_set: BTreeMap<BTreeSet<usize>, Vec<(Constraint, usize)>> =
+        let mut gates_by_row_set: BTreeMap<BTreeSet<usize>, Vec<(Constraint<Scalar>, usize)>> =
             BTreeMap::default();
         for ((constraint, column_index), row_set) in row_set_map {
             gates_by_row_set
@@ -494,7 +497,7 @@ impl CircuitBuilder {
                 .push((constraint, column_index));
         }
 
-        let mut gates: BTreeMap<Constraint, BTreeSet<GateInstance>> = BTreeMap::default();
+        let mut gates: BTreeMap<Constraint<Scalar>, BTreeSet<GateInstance>> = BTreeMap::default();
         let mut selectors: Vec<Polynomial> = vec![];
 
         for (selector_index, (activation_row_set, gate_instances)) in
@@ -515,7 +518,7 @@ impl CircuitBuilder {
     /// Compiles the circuit built so far into a [`Circuit`] object.
     pub fn build(mut self, options: CompilationOptions) -> Result<Circuit> {
         if options.canonicalize_constraints {
-            let mut old_gates: BTreeMap<Constraint, Vec<Cell>> = BTreeMap::default();
+            let mut old_gates: BTreeMap<Constraint<Scalar>, Vec<Cell>> = BTreeMap::default();
             std::mem::swap(&mut self.gates, &mut old_gates);
             for (constraint, mut root_cells) in old_gates {
                 self.gates
@@ -749,7 +752,7 @@ pub struct Circuit {
 
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
     /// second component is the set of instances of that gate across the circuit.
-    gates: BTreeMap<Constraint, BTreeSet<GateInstance>>,
+    gates: BTreeMap<Constraint<Scalar>, BTreeSet<GateInstance>>,
 
     /// Sigma polynomials of the permutation argument, one for every witness column.
     sigma: Vec<Polynomial>,
@@ -1233,7 +1236,7 @@ pub struct CompressedCircuit<H: Hasher<Scalar>> {
 
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
     /// second component is the set of instances of that gate across the circuit.
-    gates: Vec<(Constraint, Vec<GateInstance>)>,
+    gates: Vec<(Constraint<Scalar>, Vec<GateInstance>)>,
 
     /// List of rows that are revealed in the proofs.
     public_rows: BTreeSet<usize>,

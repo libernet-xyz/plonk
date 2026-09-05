@@ -2,9 +2,10 @@ use crate::lexer;
 use crate::parser;
 use crate::utils::{is_pseudo_negative, isize_to_scalar};
 use crate::witness::Cell;
-use starkom_bluesky::Scalar;
+use starkom_bluesky::Scalar as BS;
 use starkom_ff::Field;
-use starkom_poly;
+use starkom_goldilocks::GL;
+use starkom_poly::Polynomial;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display};
@@ -15,23 +16,21 @@ use std::ops::{
 };
 use std::str::FromStr;
 
-type Polynomial = starkom_poly::Polynomial<Scalar>;
-
 /// Short-hand for [`Constraint::make_var`].
 #[inline]
-pub fn var(column_index: usize) -> Constraint {
+pub fn var<F: Field>(column_index: usize) -> Constraint<F> {
     Constraint::make_var(column_index, 0)
 }
 
 /// Short-hand for [`Constraint::make_var`] with a rotation.
 #[inline]
-pub fn rvar(column_index: usize, rotation: isize) -> Constraint {
+pub fn rvar<F: Field>(column_index: usize, rotation: isize) -> Constraint<F> {
     Constraint::make_var(column_index, rotation)
 }
 
 /// Short-hand for [`Constraint::make_const`].
 #[inline]
-pub fn make_const(value: isize) -> Constraint {
+pub fn make_const<F: Field>(value: isize) -> Constraint<F> {
     Constraint::make_const(isize_to_scalar(value))
 }
 
@@ -94,12 +93,12 @@ impl Variable {
     }
 
     /// Used by [`Constraint::compose`] when replacing variables with column polynomials.
-    pub(crate) fn rotate_column(
+    pub(crate) fn rotate_column<F: Field>(
         &self,
-        column: Polynomial,
-        omega: Scalar,
-        omega_inv: Scalar,
-    ) -> Polynomial {
+        column: Polynomial<F>,
+        omega: F,
+        omega_inv: F,
+    ) -> Polynomial<F> {
         // NOTE: `pow_small_vartime` is okay here because these calls depend on the circuit
         // structure, not on the witness.
         match self.rotation.cmp(&0) {
@@ -147,7 +146,7 @@ impl Debug for Variable {
 /// Each monomial is in the form `coeff * var0^exp0 * var1^exp1 * ...`, where `coeff` is a constant
 /// scalar, the `var` variables are witness columns, and the `exp` variables are constant exponents.
 #[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Constraint {
+pub struct Constraint<F: Field> {
     /// The outer map represents the monomials in this constraint, while the inner maps represent
     /// the variables in each monomial.
     ///
@@ -155,14 +154,14 @@ pub struct Constraint {
     /// variable is raised.
     ///
     /// The values of the outer map are the constant coefficients of each monomial.
-    monomials: BTreeMap<BTreeMap<Variable, isize>, Scalar>,
+    monomials: BTreeMap<BTreeMap<Variable, isize>, F>,
 }
 
-impl Constraint {
+impl<F: Field> Constraint<F> {
     /// Makes a [`Constraint`] whose expression is a constant value.
-    pub fn make_const(value: Scalar) -> Self {
+    pub fn make_const(value: F) -> Self {
         Self {
-            monomials: if value != Scalar::ZERO {
+            monomials: if value != F::ZERO {
                 BTreeMap::from([(BTreeMap::default(), value)])
             } else {
                 BTreeMap::default()
@@ -185,7 +184,7 @@ impl Constraint {
                     },
                     1,
                 )]),
-                Scalar::ONE,
+                F::ONE,
             )]),
         }
     }
@@ -252,7 +251,7 @@ impl Constraint {
                     coefficient,
                 )
             })
-            .filter(|(_, coefficient)| *coefficient != Scalar::ZERO)
+            .filter(|(_, coefficient)| *coefficient != F::ZERO)
             .for_each(|(variables, coefficient)| {
                 *monomials.entry(variables).or_default() += coefficient;
             });
@@ -274,11 +273,11 @@ impl Constraint {
         result
     }
 
-    fn print_coefficient(coefficient: &Scalar) -> String {
+    fn print_coefficient(coefficient: &F) -> String {
         if is_pseudo_negative(coefficient) {
             format!(
                 "-{}",
-                (Scalar::MAX - coefficient + Scalar::ONE).to_str_radix(10, 0, false)
+                (F::MAX - coefficient + F::ONE).to_str_radix(10, 0, false)
             )
         } else {
             coefficient.to_str_radix(10, 0, false)
@@ -298,7 +297,7 @@ impl Constraint {
                 if variables.is_empty() {
                     return Self::print_coefficient(coefficient);
                 }
-                (*coefficient != Scalar::ONE)
+                (*coefficient != F::ONE)
                     .then(|| Self::print_coefficient(coefficient))
                     .into_iter()
                     .chain(
@@ -360,8 +359,8 @@ impl Constraint {
     /// circuits, regardless of the witness values. For example, `42 == 0` will always block
     /// proving. Because of that, constant-testing is not very useful as a public API. It's mostly
     /// used internally by the expression parser and doesn't have many other use cases.
-    pub fn get_value_if_constant(&self) -> Option<Scalar> {
-        let mut value = Scalar::ZERO;
+    pub fn get_constant_value(&self) -> Option<F> {
+        let mut value = F::ZERO;
         for (variables, coefficient) in &self.monomials {
             if !variables.is_empty() {
                 return None;
@@ -377,7 +376,7 @@ impl Constraint {
     pub fn get_variable(&self) -> Option<Variable> {
         let mut maybe_variable = None;
         for (variables, &coefficient) in &self.monomials {
-            if coefficient != Scalar::ONE {
+            if coefficient != F::ONE {
                 return None;
             }
             for (variable, &exponent) in variables {
@@ -448,11 +447,7 @@ impl Constraint {
     pub fn get_degree(&self) -> usize {
         let mut degree = 0;
         for (variables, &coefficient) in &self.monomials {
-            assert_ne!(
-                coefficient,
-                Scalar::ZERO,
-                "the constraint is not in normal form"
-            );
+            assert_ne!(coefficient, F::ZERO, "the constraint is not in normal form");
             degree = std::cmp::max(
                 degree,
                 variables
@@ -480,14 +475,11 @@ impl Constraint {
     /// publicly known, so our timing doesn't reveal anything sensitive. Besides, this function is
     /// used by the verifier code, where we don't have anything to leak and we want to maximize
     /// performance.
-    pub fn evaluate<'a, S: Index<&'a Variable, Output = Scalar>>(
-        &'a self,
-        substitution: &S,
-    ) -> Scalar {
-        let mut result = Scalar::ZERO;
+    pub fn evaluate<'a, S: Index<&'a Variable, Output = F>>(&'a self, substitution: &S) -> F {
+        let mut result = F::ZERO;
         for (variables, &coefficient) in &self.monomials {
             let mut monomial_value = coefficient;
-            if monomial_value == Scalar::ZERO {
+            if monomial_value == F::ZERO {
                 continue;
             }
             for (variable, &exponent) in variables {
@@ -523,12 +515,12 @@ impl Constraint {
     /// forward or backward in case one or more variables in the constraint have a non-zero
     /// rotation. Given a rotation offset `r`, shifting works by multiplying all coefficients of a
     /// column by powers of `omega^r`, with negative values of `r` performing modular inversion.
-    pub fn compose(&self, omega: Scalar, substitution: &[Polynomial]) -> Polynomial {
+    pub fn compose(&self, omega: F, substitution: &[Polynomial<F>]) -> Polynomial<F> {
         let columns_by_variable = {
             let mut columns_by_variable = BTreeMap::default();
             let omega_inv = omega.invert_vartime().unwrap();
             for (variables, &coefficient) in &self.monomials {
-                if coefficient != Scalar::ZERO {
+                if coefficient != F::ZERO {
                     for (&variable, _) in variables {
                         if !columns_by_variable.contains_key(&variable) {
                             columns_by_variable.insert(
@@ -548,7 +540,10 @@ impl Constraint {
         self.compose2(&columns_by_variable)
     }
 
-    pub(crate) fn compose2(&self, substitution: &BTreeMap<Variable, Polynomial>) -> Polynomial {
+    pub(crate) fn compose2(
+        &self,
+        substitution: &BTreeMap<Variable, Polynomial<F>>,
+    ) -> Polynomial<F> {
         self.monomials
             .iter()
             .map(|(variables, &coefficient)| match variables.len() {
@@ -586,31 +581,43 @@ impl Constraint {
     }
 }
 
-impl Debug for Constraint {
+impl<F: Field> Debug for Constraint<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Constraint({})", self.format_expression())
     }
 }
 
-impl Display for Constraint {
+impl<F: Field> Display for Constraint<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.format_expression())
     }
 }
 
-impl From<Variable> for Constraint {
+impl<F: Field> From<Variable> for Constraint<F> {
     fn from(value: Variable) -> Self {
         Constraint::make_var(value.column_index(), value.rotation())
     }
 }
 
-impl From<Scalar> for Constraint {
-    fn from(value: Scalar) -> Self {
+impl From<BS> for Constraint<BS> {
+    fn from(value: BS) -> Self {
         Constraint::make_const(value)
     }
 }
 
-impl FromStr for Constraint {
+impl From<GL> for Constraint<GL> {
+    fn from(value: GL) -> Self {
+        Constraint::make_const(value)
+    }
+}
+
+impl<F: Field> From<isize> for Constraint<F> {
+    fn from(value: isize) -> Self {
+        Constraint::make_const(isize_to_scalar(value))
+    }
+}
+
+impl<F: Field> FromStr for Constraint<F> {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -619,8 +626,9 @@ impl FromStr for Constraint {
     }
 }
 
-impl AddAssign for Constraint {
-    fn add_assign(&mut self, rhs: Self) {
+impl<F: Field, V: Into<Self>> AddAssign<V> for Constraint<F> {
+    fn add_assign(&mut self, rhs: V) {
+        let rhs = rhs.into();
         for (variables, coefficient) in rhs.monomials {
             *self.monomials.entry(variables).or_default() += coefficient;
         }
@@ -628,47 +636,17 @@ impl AddAssign for Constraint {
     }
 }
 
-impl AddAssign<Scalar> for Constraint {
-    fn add_assign(&mut self, rhs: Scalar) {
-        *self.monomials.entry(BTreeMap::default()).or_default() += rhs;
-        self.normalize();
-    }
-}
+impl<F: Field, V: Into<Self>> Add<V> for Constraint<F> {
+    type Output = Self;
 
-impl AddAssign<isize> for Constraint {
-    fn add_assign(&mut self, rhs: isize) {
-        *self += isize_to_scalar(rhs);
-    }
-}
-
-impl Add for Constraint {
-    type Output = Constraint;
-
-    fn add(mut self, rhs: Self) -> Self::Output {
+    fn add(mut self, rhs: V) -> Self::Output {
         self += rhs;
         self
     }
 }
 
-impl Add<Scalar> for Constraint {
-    type Output = Constraint;
-
-    fn add(mut self, rhs: Scalar) -> Self::Output {
-        self += rhs;
-        self
-    }
-}
-
-impl Add<isize> for Constraint {
-    type Output = Constraint;
-
-    fn add(self, rhs: isize) -> Self::Output {
-        self.add(isize_to_scalar(rhs))
-    }
-}
-
-impl Neg for Constraint {
-    type Output = Constraint;
+impl<F: Field> Neg for Constraint<F> {
+    type Output = Self;
 
     fn neg(mut self) -> Self::Output {
         for (_, coefficient) in &mut self.monomials {
@@ -678,8 +656,9 @@ impl Neg for Constraint {
     }
 }
 
-impl SubAssign for Constraint {
-    fn sub_assign(&mut self, rhs: Self) {
+impl<F: Field, V: Into<Self>> SubAssign<V> for Constraint<F> {
+    fn sub_assign(&mut self, rhs: V) {
+        let rhs = rhs.into();
         for (variables, coefficient) in rhs.monomials {
             *self.monomials.entry(variables).or_default() -= coefficient;
         }
@@ -687,53 +666,23 @@ impl SubAssign for Constraint {
     }
 }
 
-impl SubAssign<Scalar> for Constraint {
-    fn sub_assign(&mut self, rhs: Scalar) {
-        *self.monomials.entry(BTreeMap::default()).or_default() -= rhs;
-        self.normalize();
-    }
-}
+impl<F: Field, V: Into<Self>> Sub<V> for Constraint<F> {
+    type Output = Self;
 
-impl SubAssign<isize> for Constraint {
-    fn sub_assign(&mut self, rhs: isize) {
-        *self -= isize_to_scalar(rhs);
-    }
-}
-
-impl Sub for Constraint {
-    type Output = Constraint;
-
-    fn sub(mut self, rhs: Self) -> Self::Output {
+    fn sub(mut self, rhs: V) -> Self::Output {
         self -= rhs;
         self
     }
 }
 
-impl Sub<Scalar> for Constraint {
-    type Output = Constraint;
-
-    fn sub(mut self, rhs: Scalar) -> Self::Output {
-        self -= rhs;
-        self
-    }
-}
-
-impl Sub<isize> for Constraint {
-    type Output = Constraint;
-
-    fn sub(mut self, rhs: isize) -> Self::Output {
-        self -= rhs;
-        self
-    }
-}
-
-impl MulAssign for Constraint {
-    fn mul_assign(&mut self, rhs: Self) {
+impl<F: Field, V: Into<Self>> MulAssign<V> for Constraint<F> {
+    fn mul_assign(&mut self, rhs: V) {
+        let rhs = rhs.into();
         let mut monomials = BTreeMap::default();
         for (lhs_variables, lhs_coefficient) in std::mem::take(&mut self.monomials) {
-            if lhs_coefficient != Scalar::ZERO {
+            if lhs_coefficient != F::ZERO {
                 for (rhs_variables, &rhs_coefficient) in &rhs.monomials {
-                    if rhs_coefficient != Scalar::ZERO {
+                    if rhs_coefficient != F::ZERO {
                         let variables = Self::multiply_variables(
                             lhs_variables.clone(),
                             rhs_variables
@@ -751,52 +700,16 @@ impl MulAssign for Constraint {
     }
 }
 
-impl MulAssign<Scalar> for Constraint {
-    fn mul_assign(&mut self, rhs: Scalar) {
-        if rhs != Scalar::ZERO {
-            for (_, coefficient) in &mut self.monomials {
-                *coefficient *= rhs;
-            }
-        } else {
-            self.monomials = BTreeMap::default();
-        }
-    }
-}
+impl<F: Field, V: Into<Self>> Mul<V> for Constraint<F> {
+    type Output = Self;
 
-impl MulAssign<isize> for Constraint {
-    fn mul_assign(&mut self, rhs: isize) {
-        *self *= isize_to_scalar(rhs);
-    }
-}
-
-impl Mul for Constraint {
-    type Output = Constraint;
-
-    fn mul(mut self, rhs: Self) -> Self::Output {
+    fn mul(mut self, rhs: V) -> Self::Output {
         self *= rhs;
         self
     }
 }
 
-impl Mul<Scalar> for Constraint {
-    type Output = Constraint;
-
-    fn mul(mut self, rhs: Scalar) -> Self::Output {
-        self *= rhs;
-        self
-    }
-}
-
-impl Mul<isize> for Constraint {
-    type Output = Constraint;
-
-    fn mul(mut self, rhs: isize) -> Self::Output {
-        self *= rhs;
-        self
-    }
-}
-
-impl BitXorAssign<isize> for Constraint {
+impl<F: Field> BitXorAssign<isize> for Constraint<F> {
     /// We use the XOR operator to actually implement exponentiation. For example, if `x` is a
     /// `Constraint` instance (representing a single variable) then `x ^ 5` means x raised to 5.
     ///
@@ -810,7 +723,7 @@ impl BitXorAssign<isize> for Constraint {
     fn bitxor_assign(&mut self, mut rhs: isize) {
         match rhs {
             0 => {
-                self.monomials = BTreeMap::from([(BTreeMap::default(), Scalar::ONE)]);
+                self.monomials = BTreeMap::from([(BTreeMap::default(), F::ONE)]);
             }
             1 => {}
             _ => match self.monomials.len() {
@@ -838,7 +751,7 @@ impl BitXorAssign<isize> for Constraint {
                 }
                 _ => {
                     assert!(rhs >= 0, "cannot raise a sum to a negative power");
-                    let mut result = Self::make_const(Scalar::ONE);
+                    let mut result = Self::make_const(F::ONE);
                     while rhs != 0 {
                         if (rhs & 1) != 0 {
                             result.mul_assign(self.clone());
@@ -853,8 +766,8 @@ impl BitXorAssign<isize> for Constraint {
     }
 }
 
-impl BitXor<isize> for Constraint {
-    type Output = Constraint;
+impl<F: Field> BitXor<isize> for Constraint<F> {
+    type Output = Self;
 
     fn bitxor(mut self, rhs: isize) -> Self::Output {
         self ^= rhs;
@@ -862,10 +775,11 @@ impl BitXor<isize> for Constraint {
     }
 }
 
-impl DivAssign for Constraint {
+impl<F: Field, V: Into<Self>> DivAssign<V> for Constraint<F> {
     /// Multiplies the LHS by the inverse of the RHS, which must have exactly one monomial and must
     /// not be zero.
-    fn div_assign(&mut self, rhs: Self) {
+    fn div_assign(&mut self, rhs: V) {
+        let rhs = rhs.into();
         match rhs.monomials.len() {
             0 => panic!("division by zero"),
             1 => *self *= rhs.bitxor(-1),
@@ -874,61 +788,31 @@ impl DivAssign for Constraint {
     }
 }
 
-impl DivAssign<Scalar> for Constraint {
-    fn div_assign(&mut self, rhs: Scalar) {
-        *self *= rhs.invert_vartime().unwrap();
-    }
-}
+impl<F: Field, V: Into<Self>> Div<V> for Constraint<F> {
+    type Output = Self;
 
-impl DivAssign<isize> for Constraint {
-    fn div_assign(&mut self, rhs: isize) {
-        *self *= isize_to_scalar(rhs).invert_vartime().unwrap();
-    }
-}
-
-impl Div for Constraint {
-    type Output = Constraint;
-
-    fn div(mut self, rhs: Self) -> Self::Output {
+    fn div(mut self, rhs: V) -> Self::Output {
         self /= rhs;
         self
     }
 }
 
-impl Div<Scalar> for Constraint {
-    type Output = Constraint;
-
-    fn div(mut self, rhs: Scalar) -> Self::Output {
-        self /= rhs;
-        self
-    }
-}
-
-impl Div<isize> for Constraint {
-    type Output = Constraint;
-
-    fn div(mut self, rhs: isize) -> Self::Output {
-        self /= rhs;
-        self
-    }
-}
-
-impl Sum for Constraint {
+impl<F: Field> Sum for Constraint<F> {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
         iter.fold(Constraint::default(), |a, b| a + b)
     }
 }
 
-impl Product for Constraint {
+impl<F: Field> Product for Constraint<F> {
     fn product<I: Iterator<Item = Self>>(iter: I) -> Self {
-        iter.fold(Constraint::make_const(Scalar::ONE), |a, b| a * b)
+        iter.fold(Constraint::make_const(F::ONE), |a, b| a * b)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use starkom_bluesky::from_const;
+    use starkom_bluesky::{Scalar, from_const};
 
     #[inline]
     fn cell(row: usize, column: usize) -> Cell {
@@ -983,49 +867,49 @@ mod tests {
 
     #[test]
     fn test_remap_variables_single() {
-        let constraint = var(3).remap_variables(5);
+        let constraint: Constraint<Scalar> = var(3).remap_variables(5);
         assert_eq!(constraint, var(8));
     }
 
     #[test]
     fn test_remap_variables_negative_offset() {
-        let constraint = var(5).remap_variables(-5);
+        let constraint: Constraint<Scalar> = var(5).remap_variables(-5);
         assert_eq!(constraint, var(0));
     }
 
     #[test]
     fn test_remap_variables_preserves_rotation() {
-        let constraint = rvar(3, -2).remap_variables(4);
+        let constraint: Constraint<Scalar> = rvar(3, -2).remap_variables(4);
         assert_eq!(constraint, rvar(7, -2));
     }
 
     #[test]
     fn test_remap_variables_sum() {
-        let constraint = (var(0) + var(2)).remap_variables(3);
+        let constraint: Constraint<Scalar> = (var(0) + var(2)).remap_variables(3);
         assert_eq!(constraint, var(3) + var(5));
     }
 
     #[test]
     fn test_remap_variables_preserves_exponents() {
-        let constraint = (var(2) ^ 3).remap_variables(1);
+        let constraint: Constraint<Scalar> = (var(2) ^ 3).remap_variables(1);
         assert_eq!(constraint, var(3) ^ 3);
     }
 
     #[test]
     fn test_remap_variables_preserves_constant_terms() {
-        let constraint = (var(0) + make_const(7)).remap_variables(2);
+        let constraint: Constraint<Scalar> = (var(0) + make_const(7)).remap_variables(2);
         assert_eq!(constraint, var(2) + make_const(7));
     }
 
     #[test]
     fn test_remap_variables_zero_offset_is_identity() {
-        let constraint = var(0) * var(1) + make_const(9);
+        let constraint: Constraint<Scalar> = var(0) * var(1) + make_const(9);
         assert_eq!(constraint.clone().remap_variables(0), constraint);
     }
 
     #[test]
     fn test_remap_variables_round_trip() {
-        let constraint = var(2) + var(4) * var(6);
+        let constraint: Constraint<Scalar> = var(2) + var(4) * var(6);
         let remapped = constraint.clone().remap_variables(10).remap_variables(-10);
         assert_eq!(remapped, constraint);
     }
@@ -1033,64 +917,67 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_remap_variables_negative_overflow_panics() {
-        let _ = var(0).remap_variables(-1);
+        let _: Constraint<Scalar> = var(0).remap_variables(-1);
     }
 
     #[test]
     fn test_min_column_index_empty() {
-        let constraint = Constraint::nop();
+        let constraint: Constraint<Scalar> = Constraint::nop();
         assert_eq!(constraint.get_min_column_index(), 0);
     }
 
     #[test]
     fn test_min_column_index_constant() {
-        let constraint = make_const(5);
+        let constraint: Constraint<Scalar> = make_const(5);
         assert_eq!(constraint.get_min_column_index(), 0);
     }
 
     #[test]
     fn test_min_column_index_single_variable_at_zero() {
-        let constraint = var(0);
+        let constraint: Constraint<Scalar> = var(0);
         assert_eq!(constraint.get_min_column_index(), 0);
     }
 
     #[test]
     fn test_min_column_index_single_variable_nonzero() {
-        let constraint = var(3);
+        let constraint: Constraint<Scalar> = var(3);
         assert_eq!(constraint.get_min_column_index(), 3);
     }
 
     #[test]
     fn test_min_column_index_ignores_rotation() {
-        let constraint = rvar(4, -3) + rvar(4, 7);
+        let constraint: Constraint<Scalar> = rvar(4, -3) + rvar(4, 7);
         assert_eq!(constraint.get_min_column_index(), 4);
     }
 
     #[test]
     fn test_min_column_index_multiple_variables_in_one_monomial() {
-        let constraint = var(6) * var(3);
+        let constraint: Constraint<Scalar> = var(6) * var(3);
         assert_eq!(constraint.get_min_column_index(), 3);
     }
 
     #[test]
     fn test_min_column_index_across_monomials() {
-        let constraint = (var(7) * var(9)) + var(2);
+        let constraint: Constraint<Scalar> = (var(7) * var(9)) + var(2);
         assert_eq!(constraint.get_min_column_index(), 2);
     }
 
     #[test]
     fn test_min_column_index_unordered_sum() {
-        let constraint = var(5) + var(2) + var(8);
+        let constraint: Constraint<Scalar> = var(5) + var(2) + var(8);
         assert_eq!(constraint.get_min_column_index(), 2);
     }
 
     #[test]
     fn test_min_column_index_constant_term_does_not_mask_variable_minimum() {
-        let constraint = var(5) + make_const(3);
+        let constraint: Constraint<Scalar> = var(5) + make_const(3);
         assert_eq!(constraint.get_min_column_index(), 5);
     }
 
-    fn evaluate<const N: usize>(constraint: &Constraint, substitution: [Scalar; N]) -> Scalar {
+    fn evaluate<const N: usize>(
+        constraint: &Constraint<Scalar>,
+        substitution: [Scalar; N],
+    ) -> Scalar {
         let variables: Vec<Variable> = constraint.get_free_variables().into_iter().collect();
         assert_eq!(variables.len(), N);
         let substitution: BTreeMap<Variable, Scalar> = variables
@@ -1114,7 +1001,7 @@ mod tests {
         };
         assert_eq!(constraint.get_free_variables(), BTreeSet::default());
         assert!(constraint.is_constant());
-        assert_eq!(constraint.get_value_if_constant(), Some(value));
+        assert_eq!(constraint.get_constant_value(), Some(value));
         assert_eq!(evaluate(&constraint, []), value);
         assert_eq!(constraint.to_string(), value.to_str_radix(10, 0, false));
     }
@@ -1134,7 +1021,7 @@ mod tests {
             BTreeSet::from([Variable::new(0, 0)])
         );
         assert!(!constraint.is_constant());
-        assert!(constraint.get_value_if_constant().is_none());
+        assert!(constraint.get_constant_value().is_none());
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
         assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
         assert_eq!(constraint.to_string(), "var(0)");
@@ -1148,7 +1035,7 @@ mod tests {
             BTreeSet::from([Variable::new(1, 0)])
         );
         assert!(!constraint.is_constant());
-        assert!(constraint.get_value_if_constant().is_none());
+        assert!(constraint.get_constant_value().is_none());
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
         assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
         assert_eq!(constraint.to_string(), "var(1)");
@@ -1162,7 +1049,7 @@ mod tests {
             BTreeSet::from([Variable::new(2, 1)])
         );
         assert!(!constraint.is_constant());
-        assert!(constraint.get_value_if_constant().is_none());
+        assert!(constraint.get_constant_value().is_none());
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
         assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
         assert_eq!(constraint.to_string(), "var(2,+1)");
@@ -1176,7 +1063,7 @@ mod tests {
             BTreeSet::from([Variable::new(2, -1)])
         );
         assert!(!constraint.is_constant());
-        assert!(constraint.get_value_if_constant().is_none());
+        assert!(constraint.get_constant_value().is_none());
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
         assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
         assert_eq!(constraint.to_string(), "var(2,-1)");
@@ -1735,47 +1622,47 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot raise a sum to a negative power")]
     fn test_pow_sum_negative_exponent_panics() {
-        let _ = (var(0) + var(1)) ^ -2;
+        let _: Constraint<Scalar> = (var(0) + var(1)) ^ -2;
     }
 
     #[test]
     #[should_panic(expected = "cannot raise 0 to a negative power")]
     fn test_pow_zero_to_negative_exponent_panics_1() {
-        let _ = make_const(0) ^ -1;
+        let _: Constraint<Scalar> = make_const(0) ^ -1;
     }
 
     #[test]
     #[should_panic(expected = "cannot raise 0 to a negative power")]
     fn test_pow_zero_to_negative_exponent_panics_2() {
-        let _ = make_const(0) ^ -2;
+        let _: Constraint<Scalar> = make_const(0) ^ -2;
     }
 
     #[test]
     fn test_parsing() {
-        let c1: Constraint = "var(0) ^ 2 * var(1) + var(0) + 5 == 35".parse().unwrap();
-        let c2 = (var(0) ^ 2) * var(1) + var(0) - 30;
-        let c3: Constraint = format!("{} == 0", c2).parse().unwrap();
+        let c1: Constraint<Scalar> = "var(0) ^ 2 * var(1) + var(0) + 5 == 35".parse().unwrap();
+        let c2: Constraint<Scalar> = (var(0) ^ 2) * var(1) + var(0) - 30;
+        let c3: Constraint<Scalar> = format!("{} == 0", c2).parse().unwrap();
         assert_eq!(c1, c2);
         assert_eq!(c1, c3);
     }
 
     #[test]
     fn test_iter_sum_empty() {
-        let constraint: Constraint = std::iter::empty::<Constraint>().sum();
+        let constraint: Constraint<Scalar> = std::iter::empty::<Constraint<Scalar>>().sum();
         assert_eq!(constraint, Constraint::default());
         assert_eq!(constraint.to_string(), "0");
     }
 
     #[test]
     fn test_iter_sum_single() {
-        let constraint: Constraint = vec![var(0)].into_iter().sum();
+        let constraint: Constraint<Scalar> = vec![var(0)].into_iter().sum();
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
         assert_eq!(constraint.to_string(), "var(0)");
     }
 
     #[test]
     fn test_iter_sum() {
-        let constraint: Constraint = vec![var(0), var(1), var(2)].into_iter().sum();
+        let constraint: Constraint<Scalar> = vec![var(0), var(1), var(2)].into_iter().sum();
         assert_eq!(
             evaluate(
                 &constraint,
@@ -1795,21 +1682,21 @@ mod tests {
 
     #[test]
     fn test_iter_product_empty() {
-        let constraint: Constraint = std::iter::empty::<Constraint>().product();
-        assert_eq!(constraint.get_value_if_constant(), Some(Scalar::ONE));
+        let constraint: Constraint<Scalar> = std::iter::empty::<Constraint<Scalar>>().product();
+        assert_eq!(constraint.get_constant_value(), Some(Scalar::ONE));
         assert_eq!(constraint.to_string(), "1");
     }
 
     #[test]
     fn test_iter_product_single() {
-        let constraint: Constraint = vec![var(0)].into_iter().product();
+        let constraint: Constraint<Scalar> = vec![var(0)].into_iter().product();
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
         assert_eq!(constraint.to_string(), "var(0)");
     }
 
     #[test]
     fn test_iter_product() {
-        let constraint: Constraint = vec![var(0), var(1), var(2)].into_iter().product();
+        let constraint: Constraint<Scalar> = vec![var(0), var(1), var(2)].into_iter().product();
         assert_eq!(
             evaluate(
                 &constraint,

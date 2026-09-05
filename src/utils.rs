@@ -1,10 +1,8 @@
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
 use sha3::Digest;
-use starkom_bluesky::Scalar;
 use starkom_ff::{Field, Field256};
 use std::collections::BTreeSet;
-use std::sync::LazyLock;
 
 /// Helper function used to derive domain separator tags used in various contexts.
 pub(crate) fn make_dst(s: &'static [u8]) -> H256 {
@@ -14,12 +12,12 @@ pub(crate) fn make_dst(s: &'static [u8]) -> H256 {
 }
 
 /// Converts an [`isize`] to a [`Scalar`], wrapping negative values around.
-pub(crate) fn isize_to_scalar(value: isize) -> Scalar {
+pub(crate) fn isize_to_scalar<F: Field>(value: isize) -> F {
     let abs = value.unsigned_abs();
     if value < 0 {
-        -Scalar::try_from(abs).unwrap()
+        -F::try_from(abs).unwrap()
     } else {
-        Scalar::try_from(abs).unwrap()
+        F::try_from(abs).unwrap()
     }
 }
 
@@ -27,22 +25,21 @@ pub(crate) fn isize_to_scalar(value: isize) -> Scalar {
 ///
 /// In some context (e.g. in constraint expression parsing when interpreting an exponent) we get
 /// [`Scalar`] values that we need to convert to signed [`isize`] values.
-pub(crate) fn is_pseudo_negative(&value: &Scalar) -> bool {
-    static HALF_RANGE: LazyLock<Scalar> = LazyLock::new(|| Scalar::MAX * Scalar::TWO_INV);
-    value > *HALF_RANGE
+pub(crate) fn is_pseudo_negative<F: Field>(&value: &F) -> bool {
+    value > F::MAX * F::TWO_INV
 }
 
-pub(crate) fn scalar_to_isize(value: Scalar) -> Result<isize> {
-    const MAX: Scalar = Scalar::from_const(isize::MAX as u64);
+pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
     if is_pseudo_negative(&value) {
-        let abs = (Scalar::MAX - value + Scalar::ONE).try_to_u128().unwrap() as i128;
+        let abs = (F::MAX - value + F::ONE).try_to_u128().unwrap() as i128;
         if abs > -(isize::MIN as i128) {
             Err(anyhow!("out of range: {}", value))
         } else {
             Ok(-abs as isize)
         }
     } else {
-        if value > MAX {
+        let isize_max = F::from(isize::MAX as u64);
+        if value > isize_max {
             Err(anyhow!("out of range: {}", value))
         } else {
             Ok(value.try_to_u64().unwrap() as isize)
@@ -79,16 +76,16 @@ pub(crate) fn padded_circuit_size<R: IntoIterator<Item = isize>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use starkom_bluesky::{from_const, parse_scalar};
+    use starkom_bluesky::{Scalar as BS, from_const};
 
     #[test]
     fn test_isize_to_scalar() {
-        assert_eq!(isize_to_scalar(0), from_const(0));
-        assert_eq!(isize_to_scalar(1), from_const(1));
-        assert_eq!(isize_to_scalar(2), from_const(2));
-        assert_eq!(isize_to_scalar(-1), Scalar::MAX);
-        assert_eq!(isize_to_scalar(-2), Scalar::MAX - from_const(1));
-        assert_eq!(isize_to_scalar(-3), Scalar::MAX - from_const(2));
+        assert_eq!(isize_to_scalar::<BS>(0), from_const(0));
+        assert_eq!(isize_to_scalar::<BS>(1), from_const(1));
+        assert_eq!(isize_to_scalar::<BS>(2), from_const(2));
+        assert_eq!(isize_to_scalar::<BS>(-1), BS::MAX);
+        assert_eq!(isize_to_scalar::<BS>(-2), BS::MAX - from_const(1));
+        assert_eq!(isize_to_scalar::<BS>(-3), BS::MAX - from_const(2));
     }
 
     #[test]
@@ -96,10 +93,10 @@ mod tests {
         assert!(!is_pseudo_negative(&from_const(0)));
         assert!(!is_pseudo_negative(&from_const(1)));
         assert!(!is_pseudo_negative(&from_const(2)));
-        assert!(is_pseudo_negative(&(Scalar::MAX)));
-        assert!(is_pseudo_negative(&(Scalar::MAX - from_const(1))));
-        assert!(is_pseudo_negative(&(Scalar::MAX - from_const(2))));
-        let half_range = Scalar::MAX * Scalar::TWO_INV;
+        assert!(is_pseudo_negative(&(BS::MAX)));
+        assert!(is_pseudo_negative(&(BS::MAX - from_const(1))));
+        assert!(is_pseudo_negative(&(BS::MAX - from_const(2))));
+        let half_range = BS::MAX * BS::TWO_INV;
         assert!(!is_pseudo_negative(&(half_range - from_const(2))));
         assert!(!is_pseudo_negative(&(half_range - from_const(1))));
         assert!(!is_pseudo_negative(&(half_range)));
