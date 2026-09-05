@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use primitive_types::H256;
+use primitive_types::{H256, U256};
 use sha3::Digest;
 use starkom_ff::{Field, Field256};
 use std::collections::BTreeSet;
@@ -24,25 +24,26 @@ pub(crate) fn isize_to_scalar<F: Field>(value: isize) -> F {
 /// Indicates whether a scalar value looks like a "negative" value.
 ///
 /// In some context (e.g. in constraint expression parsing when interpreting an exponent) we get
-/// [`Scalar`] values that we need to convert to signed [`isize`] values.
+/// scalar values that we need to convert to signed [`isize`] values.
 pub(crate) fn is_pseudo_negative<F: Field>(&value: &F) -> bool {
+    assert!(bool::from(F::MAX.is_even()));
     value > F::MAX * F::TWO_INV
 }
 
 pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
     if is_pseudo_negative(&value) {
-        let abs = (F::MAX - value + F::ONE).try_to_u128().unwrap() as i128;
-        if abs > -(isize::MIN as i128) {
-            Err(anyhow!("out of range: {}", value))
+        let abs = (F::MAX - value + F::ONE).to_u256();
+        if abs > U256::from((-(isize::MIN as i128)) as u128) {
+            Err(anyhow!("out of range: {} < {}", value, isize::MIN))
         } else {
-            Ok(-abs as isize)
+            Ok((-(abs.as_u128() as i128)) as isize)
         }
     } else {
-        let isize_max = F::from(isize::MAX as u64);
-        if value > isize_max {
-            Err(anyhow!("out of range: {}", value))
+        let value = value.to_u256();
+        if value > U256::from(isize::MAX as u128) {
+            Err(anyhow!("out of range: {} > {}", value, isize::MAX))
         } else {
-            Ok(value.try_to_u64().unwrap() as isize)
+            Ok(value.as_u128() as isize)
         }
     }
 }
