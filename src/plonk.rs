@@ -1045,26 +1045,27 @@ where
         gamma: G,
     ) -> Result<(Polynomial<G>, Polynomial<G>, Polynomial<G>)> {
         let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
-        let base_generator = G::from(F::MULTIPLICATIVE_GENERATOR);
+        let omega_base = Polynomial::<F>::domain_element2(1, self.degree_bound);
+        assert_eq!(G::from(omega_base), omega);
 
         let accumulator = {
             let mut accumulator = vec![G::ZERO; self.degree_bound + 1];
 
             accumulator[0] = G::ONE;
-            let mut omega_power = G::ONE;
+            let mut omega_power = F::ONE;
             for i in 0..self.degree_bound {
-                let mut generator_power = G::ONE;
+                let mut generator_power = F::ONE;
                 accumulator[i + 1] = accumulator[i];
                 for j in 0..self.num_columns {
                     let witness_value: G = witness.get_at(Cell::new(i, j)).into();
                     accumulator[i + 1] *=
-                        witness_value + beta * generator_power * omega_power + gamma;
+                        witness_value + beta * (generator_power * omega_power) + gamma;
                     accumulator[i + 1] *=
                         (witness_value + beta * G::from(self.sigma_values[j][i]) + gamma)
                             .invert_unwrap();
-                    generator_power *= base_generator;
+                    generator_power *= F::MULTIPLICATIVE_GENERATOR;
                 }
-                omega_power *= omega;
+                omega_power *= omega_base;
             }
 
             if accumulator.pop().unwrap() != G::ONE {
@@ -1093,7 +1094,7 @@ where
                     .as_slice(),
             );
 
-            let mut power = G::ONE;
+            let mut power = F::ONE;
             let rhs = Polynomial::multiply_batch(
                 std::iter::once(&accumulator).chain(
                     columns
@@ -1101,7 +1102,7 @@ where
                         .map(|column| {
                             let column = Self::embed_polynomial(column)
                                 + Polynomial::with_coefficients(vec![gamma, beta * power]);
-                            power *= base_generator;
+                            power *= F::MULTIPLICATIVE_GENERATOR;
                             column
                         })
                         .collect::<Vec<_>>()
@@ -1570,8 +1571,8 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> CompressedCircuit<F, G, H> {
         let (permutation_numerator, permutation_denominator) = {
             let mut numerator = G::ONE;
             let mut denominator = G::ONE;
-            let mut generator_power = G::ONE;
             let base_generator = G::from(F::MULTIPLICATIVE_GENERATOR);
+            let mut generator_power = G::ONE;
             let offset = num_gate_selectors + num_sigma_polynomials;
             for column_index in 0..self.num_columns {
                 let variable = points[&xi][offset + column_index];
@@ -1702,38 +1703,73 @@ mod tests {
     }
 
     #[test]
-    fn test_vitalik_circuit_keccak256_blowup_2() {
+    fn test_vitalik_circuit_bluesky_keccak256_blowup_2() {
         let c = parse_hash("0xa4e2f7c1507afba18f2996fd89dd570f1bd466fdf14c8bc0d65a015c88aa8e20");
         assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 1, c).is_ok());
         assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 1, c).is_ok());
     }
 
     #[test]
-    fn test_vitalik_circuit_sha2_blowup_4() {
+    fn test_vitalik_circuit_goldilocks_keccak256_blowup_2() {
+        let c = parse_hash("0xeac3cd914a28b35b75dee8ecc5296d882b0c7c7e22bc4b1ddc58fd5a04e4c96f");
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, c).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_bluesky_sha2_blowup_4() {
         let c = parse_hash("0xd81086a421590d6b5517c86495fcc3f52c983ff49e9d7e9cbc034fdb7cb77782");
         assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 2, c).is_ok());
         assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 2, c).is_ok());
     }
 
     #[test]
-    fn test_vitalik_circuit_keccak256_blowup_4() {
+    fn test_vitalik_circuit_goldilocks_sha2_blowup_4() {
+        let c = parse_hash("0x40f93e0e525edbbb9785091a4e00df73d2635291b32389ec4445ff4e1906dd19");
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, c).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_bluesky_keccak256_blowup_4() {
         let c = parse_hash("0x44197f3984298e3c6d20bc0a5be4ff0dca39b54f0c601f67367c3f72cfb1bb93");
         assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 2, c).is_ok());
         assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 2, c).is_ok());
     }
 
     #[test]
-    fn test_vitalik_circuit_sha2_blowup_8() {
+    fn test_vitalik_circuit_goldilocks_keccak256_blowup_4() {
+        let c = parse_hash("0x8cd3aa0999f7adb690f056a70fbe4d166e7bbe789f067ed9b1960ffa1c62f29e");
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, c).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_bluesky_sha2_blowup_8() {
         let c = parse_hash("0xdb14b315aa52e49402a85544104520629b245a2fcecf33b15eebb39e0c711aa5");
         assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 3, c).is_ok());
         assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 3, c).is_ok());
     }
 
     #[test]
-    fn test_vitalik_circuit_keccak256_blowup_8() {
+    fn test_vitalik_circuit_goldilocks_sha2_blowup_8() {
+        let c = parse_hash("0x0b868fd1478007ea28b86466888d89d866235edd95a083c145cccf5adaa00f6b");
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, c).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_bluesky_keccak256_blowup_8() {
         let c = parse_hash("0x4fa1ea6a1b435bb0309c7432be6087bd326962a13709669be5695ddf6049fc22");
         assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 3, c).is_ok());
         assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 3, c).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_goldilocks_keccak256_blowup_8() {
+        let c = parse_hash("0xd1c38173a7fa41dfe43e96a8e8c5ab340107f05b203317b2ef9c3a23e8228379");
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, c).is_ok());
     }
 
     /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
