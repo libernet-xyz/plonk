@@ -1045,6 +1045,7 @@ where
         gamma: G,
     ) -> Result<(Polynomial<G>, Polynomial<G>, Polynomial<G>)> {
         let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
+        let base_generator = G::from(F::MULTIPLICATIVE_GENERATOR);
 
         let accumulator = {
             let mut accumulator = vec![G::ZERO; self.degree_bound + 1];
@@ -1061,7 +1062,7 @@ where
                     accumulator[i + 1] *=
                         (witness_value + beta * G::from(self.sigma_values[j][i]) + gamma)
                             .invert_unwrap();
-                    generator_power *= G::MULTIPLICATIVE_GENERATOR;
+                    generator_power *= base_generator;
                 }
                 omega_power *= omega;
             }
@@ -1100,7 +1101,7 @@ where
                         .map(|column| {
                             let column = Self::embed_polynomial(column)
                                 + Polynomial::with_coefficients(vec![gamma, beta * power]);
-                            power *= G::MULTIPLICATIVE_GENERATOR;
+                            power *= base_generator;
                             column
                         })
                         .collect::<Vec<_>>()
@@ -1570,13 +1571,14 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> CompressedCircuit<F, G, H> {
             let mut numerator = G::ONE;
             let mut denominator = G::ONE;
             let mut generator_power = G::ONE;
+            let base_generator = G::from(F::MULTIPLICATIVE_GENERATOR);
             let offset = num_gate_selectors + num_sigma_polynomials;
             for column_index in 0..self.num_columns {
                 let variable = points[&xi][offset + column_index];
                 let sigma = sigma[column_index];
                 numerator *= variable + beta * generator_power * xi + gamma;
                 denominator *= variable + beta * sigma + gamma;
-                generator_power *= G::MULTIPLICATIVE_GENERATOR;
+                generator_power *= base_generator;
             }
             (numerator, denominator)
         };
@@ -1694,7 +1696,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_2() {
-        let c = parse_hash("0x2732a0cce5e03109e372c39515b4e3cc7aae87adfde949418c7f5918e4cea1f9");
+        let c = parse_hash("0xef45d5554477717f4bc1befbc7f29e9f0f9220b059a359bd69283e884264964e");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, c).is_ok());
     }
