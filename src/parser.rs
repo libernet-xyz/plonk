@@ -240,7 +240,7 @@ mod tests {
     use super::*;
     use crate::expr::{make_const, rvar, var};
     use crate::lexer;
-    use starkom_bluesky::Scalar as BS;
+    use starkom_bluesky::{Scalar as BS, from_const};
 
     fn parse<F: Field>(s: &'static str) -> Constraint<F> {
         let tokens = lexer::tokenize(s).unwrap();
@@ -254,9 +254,9 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert_eq!(parse::<BS>("0 == 0"), make_const(0));
-        assert_eq!(parse::<BS>("12 == 0"), make_const(12));
-        assert_eq!(parse::<BS>("56 == 34"), make_const(22));
+        assert_eq!(parse::<BS>("0 == 0"), make_const(from_const(0)));
+        assert_eq!(parse::<BS>("12 == 0"), make_const(from_const(12)));
+        assert_eq!(parse::<BS>("56 == 34"), make_const(from_const(22)));
     }
 
     #[test]
@@ -292,8 +292,14 @@ mod tests {
         assert_eq!(parse::<BS>("var(0) + var(0) == 0"), var(0) * 2);
         assert_eq!(parse::<BS>("var(0) + var(1) == 0"), var(0) + var(1));
         assert_eq!(parse::<BS>("var(1) + var(0) == 0"), var(0) + var(1));
-        assert_eq!(parse::<BS>("var(0) + 42 == 0"), var(0) + make_const(42));
-        assert_eq!(parse::<BS>("42 + var(0) == 0"), var(0) + make_const(42));
+        assert_eq!(
+            parse::<BS>("var(0) + 42 == 0"),
+            var(0) + make_const(from_const(42))
+        );
+        assert_eq!(
+            parse::<BS>("42 + var(0) == 0"),
+            var(0) + make_const(from_const(42))
+        );
         assert_eq!(
             parse::<BS>("var(0) + var(1) + var(2) == 0"),
             var(0) + var(1) + var(2)
@@ -314,8 +320,11 @@ mod tests {
         assert_eq!(parse::<BS>("var(0) - var(0) == 0"), nop());
         assert_eq!(parse::<BS>("var(0) - var(1) == 0"), var(0) - var(1));
         assert_eq!(parse::<BS>("var(1) - var(0) == 0"), var(1) - var(0));
-        assert_eq!(parse::<BS>("var(0) - 42 == 0"), var(0) - make_const(42));
-        assert_eq!(parse::<BS>("42 - var(0) == 0"), make_const(42) - var(0));
+        assert_eq!(parse::<BS>("var(0) - 42 == 0"), var(0) - 42);
+        assert_eq!(
+            parse::<BS>("42 - var(0) == 0"),
+            make_const(from_const(42)) - var(0)
+        );
         assert_eq!(
             parse::<BS>("var(0) - var(1) - var(2) == 0"),
             var(0) - var(1) - var(2)
@@ -330,8 +339,8 @@ mod tests {
         assert_eq!(parse::<BS>("var(0) * var(0) == 0"), var(0) ^ 2);
         assert_eq!(parse::<BS>("var(0) * var(1) == 0"), var(0) * var(1));
         assert_eq!(parse::<BS>("var(1) * var(0) == 0"), var(0) * var(1));
-        assert_eq!(parse::<BS>("var(0) * 42 == 0"), var(0) * make_const(42));
-        assert_eq!(parse::<BS>("42 * var(0) == 0"), var(0) * make_const(42));
+        assert_eq!(parse::<BS>("var(0) * 42 == 0"), var(0) * 42);
+        assert_eq!(parse::<BS>("42 * var(0) == 0"), var(0) * 42);
         assert_eq!(
             parse::<BS>("var(0) * var(1) * var(2) == 0"),
             var(0) * var(1) * var(2)
@@ -349,13 +358,13 @@ mod tests {
 
     #[test]
     fn test_power() {
-        assert_eq!(parse::<BS>("var(0) ^ 0 == 0"), make_const(1));
+        assert_eq!(parse::<BS>("var(0) ^ 0 == 0"), make_const(from_const(1)));
         assert_eq!(parse::<BS>("var(0) ^ 1 == 0"), var(0));
         assert_eq!(parse::<BS>("var(0) ^ 2 == 0"), var(0) ^ 2);
-        assert_eq!(parse::<BS>("var(0) ^ +0 == 0"), make_const(1));
+        assert_eq!(parse::<BS>("var(0) ^ +0 == 0"), make_const(from_const(1)));
         assert_eq!(parse::<BS>("var(0) ^ +1 == 0"), var(0));
         assert_eq!(parse::<BS>("var(0) ^ +2 == 0"), var(0) ^ 2);
-        assert_eq!(parse::<BS>("var(0) ^ -0 == 0"), make_const(1));
+        assert_eq!(parse::<BS>("var(0) ^ -0 == 0"), make_const(from_const(1)));
         assert_eq!(parse::<BS>("var(0) ^ -1 == 0"), var(0) ^ -1);
         assert_eq!(parse::<BS>("var(0) ^ -2 == 0"), var(0) ^ -2);
     }
@@ -380,11 +389,17 @@ mod tests {
 
     #[test]
     fn test_division() {
-        assert_eq!(parse::<BS>("var(0) / var(0) == 0"), make_const(1));
+        assert_eq!(
+            parse::<BS>("var(0) / var(0) == 0"),
+            make_const(from_const(1))
+        );
         assert_eq!(parse::<BS>("var(0) / var(1) == 0"), var(0) / var(1));
         assert_eq!(parse::<BS>("var(1) / var(0) == 0"), var(1) / var(0));
-        assert_eq!(parse::<BS>("var(0) / 42 == 0"), var(0) / make_const(42));
-        assert_eq!(parse::<BS>("42 / var(0) == 0"), make_const(42) / var(0));
+        assert_eq!(parse::<BS>("var(0) / 42 == 0"), var(0) / 42);
+        assert_eq!(
+            parse::<BS>("42 / var(0) == 0"),
+            make_const(from_const(42)) / var(0)
+        );
         assert_eq!(
             parse::<BS>("var(0) / var(1) / var(2) == 0"),
             var(0) / var(1) / var(2)
@@ -396,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_brackets() {
-        assert_eq!(parse::<BS>("(42) == 0"), make_const(42));
+        assert_eq!(parse::<BS>("(42) == 0"), make_const(from_const(42)));
         assert_eq!(parse::<BS>("(var(0)) == 0"), var(0));
         assert_eq!(parse::<BS>("(var(1)) == 0"), var(1));
         assert_eq!(parse::<BS>("(var(1) + var(2)) == 0"), var(1) + var(2));
@@ -416,15 +431,15 @@ mod tests {
     fn test_equality() {
         assert_eq!(
             parse::<BS>("(var(0) + var(1)) * var(2) == 42"),
-            (var(0) + var(1)) * var(2) - make_const(42)
+            (var(0) + var(1)) * var(2) - 42
         );
         assert_eq!(
             parse::<BS>("42 == (var(0) + var(1)) * var(2)"),
-            make_const(42) - (var(0) + var(1)) * var(2)
+            make_const(from_const(42)) - (var(0) + var(1)) * var(2)
         );
         assert_eq!(
             parse::<BS>("42 * var(2) ^ -1 == var(0) + var(1)"),
-            make_const(42) * (var(2) ^ -1) - var(0) - var(1)
+            make_const(from_const(42)) * (var(2) ^ -1) - var(0) - var(1)
         );
     }
 }

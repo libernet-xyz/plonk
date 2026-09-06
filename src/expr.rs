@@ -30,8 +30,8 @@ pub fn rvar<F: Field>(column_index: usize, rotation: isize) -> Constraint<F> {
 
 /// Short-hand for [`Constraint::make_const`].
 #[inline]
-pub fn make_const<F: Field>(value: isize) -> Constraint<F> {
-    Constraint::make_const(isize_to_scalar(value))
+pub fn make_const<F: Field>(value: F) -> Constraint<F> {
+    Constraint::make_const(value)
 }
 
 /// Represents a variable in a [`Constraint`] expression.
@@ -900,13 +900,13 @@ mod tests {
 
     #[test]
     fn test_remap_variables_preserves_constant_terms() {
-        let constraint: Constraint<Scalar> = (var(0) + make_const(7)).remap_variables(2);
-        assert_eq!(constraint, var(2) + make_const(7));
+        let constraint: Constraint<Scalar> = (var(0) + 7).remap_variables(2);
+        assert_eq!(constraint, var(2) + 7);
     }
 
     #[test]
     fn test_remap_variables_zero_offset_is_identity() {
-        let constraint: Constraint<Scalar> = var(0) * var(1) + make_const(9);
+        let constraint: Constraint<Scalar> = var(0) * var(1) + 9;
         assert_eq!(constraint.clone().remap_variables(0), constraint);
     }
 
@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn test_min_column_index_constant() {
-        let constraint: Constraint<Scalar> = make_const(5);
+        let constraint: Constraint<Scalar> = make_const(from_const(5));
         assert_eq!(constraint.get_min_column_index(), 0);
     }
 
@@ -973,7 +973,7 @@ mod tests {
 
     #[test]
     fn test_min_column_index_constant_term_does_not_mask_variable_minimum() {
-        let constraint: Constraint<Scalar> = var(5) + make_const(3);
+        let constraint: Constraint<Scalar> = var(5) + 3;
         assert_eq!(constraint.get_min_column_index(), 5);
     }
 
@@ -992,14 +992,14 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        let constraint = Constraint::nop();
+        let constraint: Constraint<Scalar> = Constraint::nop();
         assert_eq!(constraint, Constraint::default());
         assert_eq!(evaluate(&constraint, []), from_const(0));
         assert_eq!(constraint.to_string(), "0");
     }
 
     fn test_constant_impl(value: Scalar) {
-        let constraint = Constraint {
+        let constraint: Constraint<Scalar> = Constraint {
             monomials: BTreeMap::from([(BTreeMap::default(), value)]),
         };
         assert_eq!(constraint.get_free_variables(), BTreeSet::default());
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_variable_0() {
-        let constraint = var(0);
+        let constraint: Constraint<Scalar> = var(0);
         assert_eq!(
             constraint.get_free_variables(),
             BTreeSet::from([Variable::new(0, 0)])
@@ -1032,7 +1032,7 @@ mod tests {
 
     #[test]
     fn test_variable_1() {
-        let constraint = var(1);
+        let constraint: Constraint<Scalar> = var(1);
         assert_eq!(
             constraint.get_free_variables(),
             BTreeSet::from([Variable::new(1, 0)])
@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn test_rotated_variable_1() {
-        let constraint = rvar(2, 1);
+        let constraint: Constraint<Scalar> = rvar(2, 1);
         assert_eq!(
             constraint.get_free_variables(),
             BTreeSet::from([Variable::new(2, 1)])
@@ -1060,7 +1060,7 @@ mod tests {
 
     #[test]
     fn test_rotated_variable_2() {
-        let constraint = rvar(2, -1);
+        let constraint: Constraint<Scalar> = rvar(2, -1);
         assert_eq!(
             constraint.get_free_variables(),
             BTreeSet::from([Variable::new(2, -1)])
@@ -1074,7 +1074,7 @@ mod tests {
 
     #[test]
     fn test_sum_1() {
-        let constraint = var(0) + var(1);
+        let constraint: Constraint<Scalar> = var(0) + var(1);
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             from_const(46)
@@ -1092,7 +1092,7 @@ mod tests {
 
     #[test]
     fn test_sum_2() {
-        let constraint = var(1) + var(0);
+        let constraint: Constraint<Scalar> = var(1) + var(0);
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             from_const(46)
@@ -1110,7 +1110,7 @@ mod tests {
 
     #[test]
     fn test_sum_3() {
-        let constraint = rvar(2, -1) + rvar(2, 1);
+        let constraint: Constraint<Scalar> = rvar(2, -1) + rvar(2, 1);
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             from_const(46)
@@ -1128,7 +1128,7 @@ mod tests {
 
     #[test]
     fn test_another_sum() {
-        let constraint = var(0) + var(1) + var(2);
+        let constraint: Constraint<Scalar> = var(0) + var(1) + var(2);
         assert_eq!(
             evaluate(
                 &constraint,
@@ -1155,7 +1155,7 @@ mod tests {
 
     #[test]
     fn test_add_scalar_1() {
-        let constraint = var(0) + from_const(12);
+        let constraint: Constraint<Scalar> = var(0) + from_const(12);
         assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(46));
         assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(68));
         assert_eq!(constraint.to_string(), "12 + var(0)");
@@ -1163,7 +1163,7 @@ mod tests {
 
     #[test]
     fn test_add_scalar_2() {
-        let constraint = var(0) + from_const(34);
+        let constraint: Constraint<Scalar> = var(0) + from_const(34);
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(46));
         assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(90));
         assert_eq!(constraint.to_string(), "34 + var(0)");
@@ -1171,7 +1171,7 @@ mod tests {
 
     #[test]
     fn test_add_another_scalar() {
-        let constraint = var(0) + from_const(34) + from_const(56);
+        let constraint: Constraint<Scalar> = var(0) + from_const(34) + from_const(56);
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(102));
         assert_eq!(evaluate(&constraint, [from_const(78)]), from_const(168));
         assert_eq!(constraint.to_string(), "90 + var(0)");
@@ -1179,14 +1179,14 @@ mod tests {
 
     #[test]
     fn test_optimize_sum_1() {
-        let constraint = var(0) + var(0) * -from_const(1);
+        let constraint: Constraint<Scalar> = var(0) + var(0) * -from_const(1);
         assert_eq!(evaluate(&constraint, []), from_const(0));
         assert_eq!(constraint.to_string(), "0");
     }
 
     #[test]
     fn test_optimize_sum_2() {
-        let constraint = var(0) + var(1) * -from_const(1);
+        let constraint: Constraint<Scalar> = var(0) + var(1) * -from_const(1);
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             -from_const(22)
@@ -1200,7 +1200,8 @@ mod tests {
 
     #[test]
     fn test_optimize_sum_3() {
-        let constraint = var(0) + var(1) * -from_const(1) + var(0) * -from_const(1);
+        let constraint: Constraint<Scalar> =
+            var(0) + var(1) * -from_const(1) + var(0) * -from_const(1);
         assert_eq!(evaluate(&constraint, [from_const(12)]), -from_const(12));
         assert_eq!(evaluate(&constraint, [from_const(34)]), -from_const(34));
         assert_eq!(constraint.to_string(), "-1 * var(1)");
@@ -1208,7 +1209,7 @@ mod tests {
 
     #[test]
     fn test_negate_variable() {
-        let constraint = -var(0);
+        let constraint: Constraint<Scalar> = -var(0);
         assert_eq!(evaluate(&constraint, [from_const(12)]), -from_const(12));
         assert_eq!(evaluate(&constraint, [from_const(34)]), -from_const(34));
         assert_eq!(constraint.to_string(), "-1 * var(0)");
@@ -1216,7 +1217,7 @@ mod tests {
 
     #[test]
     fn test_negate_sum() {
-        let constraint = -(var(0) + var(1) + from_const(12));
+        let constraint: Constraint<Scalar> = -(var(0) + var(1) + from_const(12));
         assert_eq!(
             evaluate(&constraint, [from_const(34), from_const(56)]),
             -from_const(102)
@@ -1230,7 +1231,7 @@ mod tests {
 
     #[test]
     fn test_diff_1() {
-        let constraint = var(0) - var(1);
+        let constraint: Constraint<Scalar> = var(0) - var(1);
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             -from_const(22)
@@ -1248,7 +1249,7 @@ mod tests {
 
     #[test]
     fn test_diff_2() {
-        let constraint = var(1) - var(0);
+        let constraint: Constraint<Scalar> = var(1) - var(0);
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             from_const(22)
@@ -1266,7 +1267,7 @@ mod tests {
 
     #[test]
     fn test_diff_3() {
-        let constraint = rvar(2, -1) - rvar(2, 1);
+        let constraint: Constraint<Scalar> = rvar(2, -1) - rvar(2, 1);
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             -from_const(22)
@@ -1284,7 +1285,7 @@ mod tests {
 
     #[test]
     fn test_another_diff() {
-        let constraint = var(0) - var(1) - var(2);
+        let constraint: Constraint<Scalar> = var(0) - var(1) - var(2);
         assert_eq!(
             evaluate(
                 &constraint,
@@ -1311,7 +1312,7 @@ mod tests {
 
     #[test]
     fn test_sub_scalar_1() {
-        let constraint = var(0) - from_const(12);
+        let constraint: Constraint<Scalar> = var(0) - from_const(12);
         assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(22));
         assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(44));
         assert_eq!(constraint.to_string(), "-12 + var(0)");
@@ -1319,7 +1320,7 @@ mod tests {
 
     #[test]
     fn test_sub_scalar_2() {
-        let constraint = var(0) - from_const(34);
+        let constraint: Constraint<Scalar> = var(0) - from_const(34);
         assert_eq!(evaluate(&constraint, [from_const(12)]), -from_const(22));
         assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(22));
         assert_eq!(constraint.to_string(), "-34 + var(0)");
@@ -1327,7 +1328,7 @@ mod tests {
 
     #[test]
     fn test_sub_another_scalar() {
-        let constraint = var(0) - from_const(34) - from_const(56);
+        let constraint: Constraint<Scalar> = var(0) - from_const(34) - from_const(56);
         assert_eq!(evaluate(&constraint, [from_const(12)]), -from_const(78));
         assert_eq!(evaluate(&constraint, [from_const(78)]), -from_const(12));
         assert_eq!(constraint.to_string(), "-90 + var(0)");
@@ -1335,14 +1336,14 @@ mod tests {
 
     #[test]
     fn test_optimize_diff_1() {
-        let constraint = var(0) - var(0);
+        let constraint: Constraint<Scalar> = var(0) - var(0);
         assert_eq!(evaluate(&constraint, []), from_const(0));
         assert_eq!(constraint.to_string(), "0");
     }
 
     #[test]
     fn test_optimize_diff_2() {
-        let constraint = var(0) - var(1) * -from_const(1);
+        let constraint: Constraint<Scalar> = var(0) - var(1) * -from_const(1);
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             from_const(46)
@@ -1356,7 +1357,7 @@ mod tests {
 
     #[test]
     fn test_optimize_diff_3() {
-        let constraint = var(0) - var(1) - var(0);
+        let constraint: Constraint<Scalar> = var(0) - var(1) - var(0);
         assert_eq!(evaluate(&constraint, [from_const(12)]), -from_const(12));
         assert_eq!(evaluate(&constraint, [from_const(34)]), -from_const(34));
         assert_eq!(constraint.to_string(), "-1 * var(1)");
@@ -1364,7 +1365,7 @@ mod tests {
 
     #[test]
     fn test_product_1() {
-        let constraint = var(0) * var(1);
+        let constraint: Constraint<Scalar> = var(0) * var(1);
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             from_const(408)
@@ -1382,7 +1383,7 @@ mod tests {
 
     #[test]
     fn test_product_2() {
-        let constraint = var(1) * var(0);
+        let constraint: Constraint<Scalar> = var(1) * var(0);
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             from_const(408)
@@ -1400,7 +1401,7 @@ mod tests {
 
     #[test]
     fn test_product_3() {
-        let constraint = rvar(2, -1) * rvar(2, 1);
+        let constraint: Constraint<Scalar> = rvar(2, -1) * rvar(2, 1);
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             from_const(408)
@@ -1418,7 +1419,7 @@ mod tests {
 
     #[test]
     fn test_another_product() {
-        let constraint = var(0) * var(1) * var(2);
+        let constraint: Constraint<Scalar> = var(0) * var(1) * var(2);
         assert_eq!(
             evaluate(
                 &constraint,
@@ -1445,7 +1446,7 @@ mod tests {
 
     #[test]
     fn test_product_same_variable() {
-        let constraint = var(0) * var(0);
+        let constraint: Constraint<Scalar> = var(0) * var(0);
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(144));
         assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(1156));
         assert_eq!(constraint.to_string(), "var(0) ^ 2");
@@ -1453,7 +1454,7 @@ mod tests {
 
     #[test]
     fn test_mul_scalar_1() {
-        let constraint = var(0) * from_const(12);
+        let constraint: Constraint<Scalar> = var(0) * from_const(12);
         assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(408));
         assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(672));
         assert_eq!(constraint.to_string(), "12 * var(0)");
@@ -1461,7 +1462,7 @@ mod tests {
 
     #[test]
     fn test_mul_scalar_2() {
-        let constraint = var(0) * from_const(34);
+        let constraint: Constraint<Scalar> = var(0) * from_const(34);
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(408));
         assert_eq!(evaluate(&constraint, [from_const(56)]), from_const(1904));
         assert_eq!(constraint.to_string(), "34 * var(0)");
@@ -1469,7 +1470,7 @@ mod tests {
 
     #[test]
     fn test_mul_another_scalar() {
-        let constraint = var(0) * from_const(34) * from_const(56);
+        let constraint: Constraint<Scalar> = var(0) * from_const(34) * from_const(56);
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(22848));
         assert_eq!(evaluate(&constraint, [from_const(78)]), from_const(148512));
         assert_eq!(constraint.to_string(), "1904 * var(0)");
@@ -1477,21 +1478,21 @@ mod tests {
 
     #[test]
     fn test_mul_by_zero() {
-        let constraint = var(0) * from_const(0);
+        let constraint: Constraint<Scalar> = var(0) * from_const(0);
         assert_eq!(evaluate(&constraint, []), from_const(0));
         assert_eq!(constraint.to_string(), "0");
     }
 
     #[test]
     fn test_optimize_product_1() {
-        let constraint = var(0) * (var(0) ^ -1);
+        let constraint: Constraint<Scalar> = var(0) * (var(0) ^ -1);
         assert_eq!(evaluate(&constraint, []), from_const(1));
         assert_eq!(constraint.to_string(), "1");
     }
 
     #[test]
     fn test_optimize_product_2() {
-        let constraint = var(0) * (var(0) ^ -1) * var(1);
+        let constraint: Constraint<Scalar> = var(0) * (var(0) ^ -1) * var(1);
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
         assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
         assert_eq!(constraint.to_string(), "var(1)");
@@ -1499,7 +1500,7 @@ mod tests {
 
     #[test]
     fn test_optimize_product_3() {
-        let constraint = (var(0) ^ 2) * (var(0) ^ -1);
+        let constraint: Constraint<Scalar> = (var(0) ^ 2) * (var(0) ^ -1);
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
         assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
         assert_eq!(constraint.to_string(), "var(0)");
@@ -1507,28 +1508,28 @@ mod tests {
 
     #[test]
     fn test_pow_zero_exponent() {
-        let constraint = var(0) ^ 0;
+        let constraint: Constraint<Scalar> = var(0) ^ 0;
         assert_eq!(evaluate(&constraint, []), from_const(1));
         assert_eq!(constraint.to_string(), "1");
     }
 
     #[test]
     fn test_pow_zero_exponent_on_sum() {
-        let constraint = (var(0) + var(1)) ^ 0;
+        let constraint: Constraint<Scalar> = (var(0) + var(1)) ^ 0;
         assert_eq!(evaluate(&constraint, []), from_const(1));
         assert_eq!(constraint.to_string(), "1");
     }
 
     #[test]
     fn test_pow_zero_exponent_of_zero() {
-        let constraint = make_const(0) ^ 0;
+        let constraint: Constraint<Scalar> = make_const(from_const(0)) ^ 0;
         assert_eq!(evaluate(&constraint, []), from_const(1));
         assert_eq!(constraint.to_string(), "1");
     }
 
     #[test]
     fn test_pow_one_exponent() {
-        let constraint = var(0) ^ 1;
+        let constraint: Constraint<Scalar> = var(0) ^ 1;
         assert_eq!(evaluate(&constraint, [from_const(12)]), from_const(12));
         assert_eq!(evaluate(&constraint, [from_const(34)]), from_const(34));
         assert_eq!(constraint.to_string(), "var(0)");
@@ -1536,7 +1537,7 @@ mod tests {
 
     #[test]
     fn test_pow_one_exponent_on_sum() {
-        let constraint = (var(0) + var(1)) ^ 1;
+        let constraint: Constraint<Scalar> = (var(0) + var(1)) ^ 1;
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             from_const(46)
@@ -1546,7 +1547,7 @@ mod tests {
 
     #[test]
     fn test_pow_positive_exponent() {
-        let constraint = var(0) ^ 3;
+        let constraint: Constraint<Scalar> = var(0) ^ 3;
         assert_eq!(
             evaluate(&constraint, [from_const(12)]),
             from_const(12).pow_small_vartime(3)
@@ -1560,7 +1561,7 @@ mod tests {
 
     #[test]
     fn test_pow_negative_exponent() {
-        let constraint = var(0) ^ -2;
+        let constraint: Constraint<Scalar> = var(0) ^ -2;
         assert_eq!(
             evaluate(&constraint, [from_const(12)]),
             from_const(12).invert_unwrap().pow_small_vartime(2)
@@ -1574,20 +1575,20 @@ mod tests {
 
     #[test]
     fn test_pow_constant_positive_exponent() {
-        let constraint = make_const(2) ^ 3;
+        let constraint: Constraint<Scalar> = make_const(from_const(2)) ^ 3;
         assert_eq!(evaluate(&constraint, []), from_const(8));
         assert_eq!(constraint.to_string(), "8");
     }
 
     #[test]
     fn test_pow_constant_negative_exponent() {
-        let constraint = make_const(2) ^ -1;
+        let constraint: Constraint<Scalar> = make_const(from_const(2)) ^ -1;
         assert_eq!(evaluate(&constraint, []), from_const(2).invert_unwrap());
     }
 
     #[test]
     fn test_bitxor_assign() {
-        let mut constraint = var(0);
+        let mut constraint: Constraint<Scalar> = var(0);
         constraint ^= 3;
         assert_eq!(
             evaluate(&constraint, [from_const(12)]),
@@ -1598,7 +1599,7 @@ mod tests {
 
     #[test]
     fn test_squared_sum() {
-        let constraint = (var(0) + var(1)) ^ 2;
+        let constraint: Constraint<Scalar> = (var(0) + var(1)) ^ 2;
         assert_eq!(
             constraint,
             (var(0) ^ 2) + (var(1) ^ 2) + var(0) * var(1) * 2
@@ -1615,7 +1616,7 @@ mod tests {
 
     #[test]
     fn test_cubed_sum() {
-        let constraint = (var(0) + var(1)) ^ 3;
+        let constraint: Constraint<Scalar> = (var(0) + var(1)) ^ 3;
         assert_eq!(
             evaluate(&constraint, [from_const(12), from_const(34)]),
             (from_const(12) + from_const(34)).pow_small_vartime(3)
@@ -1631,13 +1632,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot raise 0 to a negative power")]
     fn test_pow_zero_to_negative_exponent_panics_1() {
-        let _: Constraint<Scalar> = make_const(0) ^ -1;
+        let _: Constraint<Scalar> = make_const(from_const(0)) ^ -1;
     }
 
     #[test]
     #[should_panic(expected = "cannot raise 0 to a negative power")]
     fn test_pow_zero_to_negative_exponent_panics_2() {
-        let _: Constraint<Scalar> = make_const(0) ^ -2;
+        let _: Constraint<Scalar> = make_const(from_const(0)) ^ -2;
     }
 
     #[test]
