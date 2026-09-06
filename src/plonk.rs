@@ -729,12 +729,14 @@ where
 ///
 /// The API in the implementation mostly mirrors that of the underlying PCS proof.
 #[derive(Debug, Clone)]
-pub struct Proof<F: Field256, H: Hasher<F>> {
-    commitment: pcs::Commitment<F, H>,
-    inner_proof: pcs::Proof<F, H>,
+pub struct Proof<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
+    openings: BTreeMap<Cell, F>,
+    commitment: pcs::Commitment<G, H>,
+    inner_proof: pcs::Proof<G, H>,
+    _data: PhantomData<F>,
 }
 
-impl<F: Field256, H: Hasher<F>> Proof<F, H> {
+impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
     /// Returns the proven degree bound.
     pub fn degree_bound(&self) -> usize {
         self.inner_proof.degree_bound()
@@ -756,6 +758,11 @@ impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// chunks of the grand quotient.
     pub fn num_polys(&self) -> usize {
         self.inner_proof.num_polys()
+    }
+
+    /// Returns a reference to the opened witness locations.
+    pub fn openings(&self) -> &BTreeMap<Cell, F> {
+        &self.openings
     }
 }
 
@@ -961,6 +968,7 @@ where
         Ok(())
     }
 
+    /// Converts a polynomial over F to one over G.
     fn embed_polynomial(polynomial: &Polynomial<F>) -> Polynomial<G> {
         Polynomial::with_coefficients(
             polynomial
@@ -972,6 +980,11 @@ where
         )
     }
 
+    /// Converts a polynomial over F to one over G, scaling it by a factor in the process.
+    ///
+    /// This function is equivalent to `embed_polynomial(...) * scale`, but it's faster when G is an
+    /// extension tower of F because multiplications between F and G are faster than those between G
+    /// and G.
     fn embed_and_scale_polynomial(polynomial: &Polynomial<F>, scale: G) -> Polynomial<G> {
         Polynomial::with_coefficients(
             polynomial
@@ -1127,7 +1140,7 @@ where
         &self,
         mut witness: Witness<F>,
         options: ProvingOptions,
-    ) -> Result<Proof<G, H>> {
+    ) -> Result<Proof<F, G, H>> {
         witness.blind();
         if witness.num_rows() != self.num_rows {
             return Err(anyhow!(
@@ -1223,9 +1236,25 @@ where
         ));
         let inner_proof = prover.prove(&commitment);
 
+        let openings = self
+            .public_rows
+            .iter()
+            .map(|&row| {
+                (0..self.num_columns)
+                    .map(|column_index| {
+                        let cell = witness.cell(row, column_index);
+                        (cell, witness.get_at(cell))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flatten()
+            .collect();
+
         Ok(Proof {
+            openings,
             commitment,
             inner_proof,
+            _data: PhantomData,
         })
     }
 
@@ -1277,7 +1306,7 @@ where
 
     pub fn verify<H: Hasher<G>>(
         &self,
-        proof: &Proof<G, H>,
+        proof: &Proof<F, G, H>,
         options: ProvingOptions,
     ) -> Result<BTreeMap<Cell, F>> {
         self.as_compressed::<H>(options).verify(proof)
@@ -1360,7 +1389,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> CompressedCircuit<F, G, H> {
     ///
     /// The returned map will have exactly `N` entries for every row in [`Self::public_rows`], with
     /// `N` being the [number of columns](`Self::num_columns`).
-    pub fn verify(&self, proof: &Proof<G, H>) -> Result<BTreeMap<Cell, F>> {
+    pub fn verify(&self, proof: &Proof<F, G, H>) -> Result<BTreeMap<Cell, F>> {
         let commitment = &proof.commitment;
         let inner_proof = &proof.inner_proof;
 
@@ -1443,12 +1472,37 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> CompressedCircuit<F, G, H> {
                 ));
             }
         }
+
+        let openings = proof.openings();
         for &row in &self.public_rows {
-            let z = omega.pow_small(row);
-            if !points.contains_key(&z) {
-                return Err(anyhow!(
-                    "the proof doesn't have an opening for public row {row}"
-                ));
+            let z = omega.pow_small_vartime(row);
+            let offset = num_gate_selectors + num_sigma_polynomials;
+            match points.get(&z) {
+                Some(values) => {
+                    for column_index in 0..self.num_columns {
+                        match openings.get(&Cell::new(row, column_index)) {
+                            Some(&value) => {
+                                if G::from(value) != values[offset + column_index] {
+                                    return Err(anyhow!(
+                                        "incorrect value opened at ({row}, {column_index}): got {}, want {}",
+                                        value,
+                                        values[column_index]
+                                    ));
+                                }
+                            }
+                            None => {
+                                return Err(anyhow!(
+                                    "the proof doesn't have an opening for public cell ({row}, {column_index})"
+                                ));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    return Err(anyhow!(
+                        "the proof doesn't have an opening for public row {row}"
+                    ));
+                }
             }
         }
 
@@ -1556,18 +1610,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> CompressedCircuit<F, G, H> {
             return Err(anyhow!("constraint violation"));
         }
 
-        Ok(self
-            .public_rows
-            .iter()
-            .map(|&row| {
-                let offset = num_gate_selectors + num_sigma_polynomials;
-                (0..self.num_columns).into_iter().map(move |column| {
-                    let x = omega.pow_small_vartime(row);
-                    (Cell::new(row, column), points[&x][offset + column])
-                })
-            })
-            .flatten()
-            .collect())
+        Ok(openings.clone())
     }
 }
 
