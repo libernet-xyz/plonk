@@ -475,13 +475,16 @@ impl<F: Field> Constraint<F> {
     /// publicly known, so our timing doesn't reveal anything sensitive. Besides, this function is
     /// used by the verifier code, where we don't have anything to leak and we want to maximize
     /// performance.
-    pub fn evaluate<'a, S: Index<&'a Variable, Output = F>>(&'a self, substitution: &S) -> F {
-        let mut result = F::ZERO;
+    pub fn evaluate<'a, G: Field + From<F>>(
+        &'a self,
+        substitution: &impl Index<&'a Variable, Output = G>,
+    ) -> G {
+        let mut result = G::ZERO;
         for (variables, &coefficient) in &self.monomials {
-            let mut monomial_value = coefficient;
-            if monomial_value == F::ZERO {
+            if coefficient == F::ZERO {
                 continue;
             }
+            let mut monomial_value: G = coefficient.into();
             for (variable, &exponent) in variables {
                 let variable_value = substitution[variable];
                 match exponent {
