@@ -4,15 +4,12 @@ use crate::utils::{self, padded_circuit_size};
 use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
-use starkom_bluesky::Scalar;
-use starkom_ff::Field;
+use starkom_ff::{Field, Field256};
 use starkom_pcs::{self as pcs, hash::Hasher};
-use starkom_poly;
+use starkom_poly::Polynomial;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::LazyLock;
-
-type Polynomial = starkom_poly::Polynomial<Scalar>;
 
 /// Default blowup factor (16) in logarithmic form.
 ///
@@ -138,12 +135,12 @@ impl Default for ProvingOptions {
     }
 }
 
-pub trait CircuitView {
+pub trait CircuitView<F: Field, G: Field256 + From<F>> {
     /// Returns a reference to the [`CircuitBuilder`].
-    fn builder(&self) -> &CircuitBuilder;
+    fn builder(&self) -> &CircuitBuilder<F, G>;
 
     /// Returns a mutable reference to the [`CircuitBuilder`].
-    fn builder_mut(&mut self) -> &mut CircuitBuilder;
+    fn builder_mut(&mut self) -> &mut CircuitBuilder<F, G>;
 
     /// Returns the number of columns included in the view.
     ///
@@ -210,7 +207,7 @@ pub trait CircuitView {
     /// not forbidden to refer to external cells from within the gate constraint by using rotations
     /// or overflowing column numbers. For example, it's okay to place a gate at row 0 and refer to
     /// `rvar(0, -1)`, or to place it at the rightmost column and refer to `var(1)`.
-    fn add_gate(&mut self, row: usize, constraint: Constraint<Scalar>) {
+    fn add_gate(&mut self, row: usize, constraint: Constraint<F>) {
         let root_cell = self.cell(row, 0);
         assert!(self.contains_cell(root_cell));
         self.builder_mut().add_gate_internal(root_cell, constraint);
@@ -238,7 +235,7 @@ pub trait CircuitView {
         column_offset: usize,
         width: Option<usize>,
         height: Option<usize>,
-    ) -> impl CircuitView {
+    ) -> impl CircuitView<F, G> {
         let width = width.unwrap_or(self.width().unwrap() - column_offset);
         let height = height.unwrap_or(self.height().unwrap() - row_offset);
         if let Some(parent_width) = self.width() {
@@ -265,7 +262,7 @@ pub trait CircuitView {
         column_offset: usize,
         width: Option<usize>,
         height: Option<usize>,
-        callback: impl FnOnce(&mut CircuitSectionBuilder),
+        callback: impl FnOnce(&mut CircuitSectionBuilder<F, G>),
     ) -> &mut Self {
         self.sub_fn_or(row_offset, column_offset, width, height, |view| {
             callback(view);
@@ -281,7 +278,7 @@ pub trait CircuitView {
         column_offset: usize,
         width: Option<usize>,
         height: Option<usize>,
-        callback: impl FnOnce(&mut CircuitSectionBuilder) -> Result<()>,
+        callback: impl FnOnce(&mut CircuitSectionBuilder<F, G>) -> Result<()>,
     ) -> Result<&mut Self> {
         let width = width.unwrap_or(self.width().unwrap() - column_offset);
         let height = height.unwrap_or(self.height().unwrap() - row_offset);
@@ -308,7 +305,7 @@ pub trait CircuitView {
         &mut self,
         row_offset: usize,
         column_offset: usize,
-        chip: &impl Chip<I, O>,
+        chip: &impl Chip<F, I, O>,
         inputs: [Option<Cell>; I],
     ) -> Result<[Option<Cell>; O]> {
         let chip_width = chip.width();
@@ -333,9 +330,9 @@ pub trait CircuitView {
 }
 
 #[derive(Debug)]
-pub struct CircuitViewGenerator<'a> {
+pub struct CircuitViewGenerator<'a, F: Field, G: Field256 + From<F>> {
     /// Reference to the [`CircuitBuilder`].
-    builder: &'a mut CircuitBuilder,
+    builder: &'a mut CircuitBuilder<F, G>,
 
     /// Row offset where all sub-sections are rooted.
     row_offset: usize,
@@ -350,8 +347,8 @@ pub struct CircuitViewGenerator<'a> {
     count: usize,
 }
 
-impl<'a> CircuitViewGenerator<'a> {
-    pub fn get(&'a mut self, index: usize) -> CircuitSectionBuilder<'a> {
+impl<'a, F: Field, G: Field256 + From<F>> CircuitViewGenerator<'a, F, G> {
+    pub fn get(&'a mut self, index: usize) -> CircuitSectionBuilder<'a, F, G> {
         assert!(index < self.count);
         CircuitSectionBuilder::new(
             self.builder,
@@ -379,7 +376,7 @@ struct GateInstance {
 
 /// Allows building PLONK [`Circuit`]s.
 #[derive(Debug, Default, Clone)]
-pub struct CircuitBuilder {
+pub struct CircuitBuilder<F: Field, G: Field256 + From<F>> {
     /// Current number of rows in the circuit.
     num_rows: usize,
 
@@ -397,17 +394,19 @@ pub struct CircuitBuilder {
     /// NOTE: in order to minimize the number of different gate types stored in a circuit, the
     /// constraints stored in this map are _not_ [remapped](`Constraint::remap_variables`). This map
     /// basically keeps "raw gate types".
-    gates: BTreeMap<Constraint<Scalar>, Vec<Cell>>,
+    gates: BTreeMap<Constraint<F>, Vec<Cell>>,
 
     /// Cell partitioning inferred from the connections made with [`Self::connect`].
     partitioner: Partitioner,
 
     /// List of rows that are revealed in the proofs.
     public_rows: BTreeSet<usize>,
+
+    _data: PhantomData<G>,
 }
 
-impl CircuitBuilder {
-    fn add_gate_internal(&mut self, mut root_cell: Cell, mut constraint: Constraint<Scalar>) {
+impl<F: Field, G: Field256 + From<F>> CircuitBuilder<F, G> {
+    fn add_gate_internal(&mut self, mut root_cell: Cell, mut constraint: Constraint<F>) {
         {
             let min_column_index = constraint.get_min_column_index();
             root_cell = root_cell.remap(Cell::new(0, min_column_index));
@@ -460,10 +459,10 @@ impl CircuitBuilder {
         self.public_rows = BTreeSet::from_iter(gates);
     }
 
-    fn make_selector(degree_bound: usize, activation_row_set: BTreeSet<usize>) -> Polynomial {
-        let mut selector_values = vec![Scalar::ZERO; degree_bound];
+    fn make_selector(degree_bound: usize, activation_row_set: BTreeSet<usize>) -> Polynomial<F> {
+        let mut selector_values = vec![F::ZERO; degree_bound];
         for row in activation_row_set {
-            selector_values[row] = Scalar::ONE;
+            selector_values[row] = F::ONE;
         }
         Polynomial::encode2(selector_values)
     }
@@ -472,11 +471,11 @@ impl CircuitBuilder {
         &self,
         degree_bound: usize,
     ) -> (
-        BTreeMap<Constraint<Scalar>, BTreeSet<GateInstance>>,
-        Vec<Polynomial>,
+        BTreeMap<Constraint<F>, BTreeSet<GateInstance>>,
+        Vec<Polynomial<F>>,
     ) {
         // Keys are (constraint, column_index) pairs; values are activation row sets.
-        let mut row_set_map: BTreeMap<(Constraint<Scalar>, usize), BTreeSet<usize>> =
+        let mut row_set_map: BTreeMap<(Constraint<F>, usize), BTreeSet<usize>> =
             BTreeMap::default();
         for (constraint, root_cells) in &self.gates {
             for root_cell in root_cells.as_slice() {
@@ -488,7 +487,7 @@ impl CircuitBuilder {
 
         // Roughly the inverse of `row_set_map`: keys are activation row sets, values are the list
         // of (constraint, column_index) instances that activate at those rows.
-        let mut gates_by_row_set: BTreeMap<BTreeSet<usize>, Vec<(Constraint<Scalar>, usize)>> =
+        let mut gates_by_row_set: BTreeMap<BTreeSet<usize>, Vec<(Constraint<F>, usize)>> =
             BTreeMap::default();
         for ((constraint, column_index), row_set) in row_set_map {
             gates_by_row_set
@@ -497,8 +496,8 @@ impl CircuitBuilder {
                 .push((constraint, column_index));
         }
 
-        let mut gates: BTreeMap<Constraint<Scalar>, BTreeSet<GateInstance>> = BTreeMap::default();
-        let mut selectors: Vec<Polynomial> = vec![];
+        let mut gates: BTreeMap<Constraint<F>, BTreeSet<GateInstance>> = BTreeMap::default();
+        let mut selectors: Vec<Polynomial<F>> = vec![];
 
         for (selector_index, (activation_row_set, gate_instances)) in
             gates_by_row_set.into_iter().enumerate()
@@ -516,9 +515,9 @@ impl CircuitBuilder {
     }
 
     /// Compiles the circuit built so far into a [`Circuit`] object.
-    pub fn build(mut self, options: CompilationOptions) -> Result<Circuit> {
+    pub fn build(mut self, options: CompilationOptions) -> Result<Circuit<F, G>> {
         if options.canonicalize_constraints {
-            let mut old_gates: BTreeMap<Constraint<Scalar>, Vec<Cell>> = BTreeMap::default();
+            let mut old_gates: BTreeMap<Constraint<F>, Vec<Cell>> = BTreeMap::default();
             std::mem::swap(&mut self.gates, &mut old_gates);
             for (constraint, mut root_cells) in old_gates {
                 self.gates
@@ -547,24 +546,24 @@ impl CircuitBuilder {
 
         let (gates, selectors) = Self::build_gates_and_selectors(&self, degree_bound);
 
-        let sigma_values: Vec<Vec<Scalar>> = {
-            let mut sigma = vec![Scalar::ZERO; degree_bound * self.num_columns];
-            let omega = Polynomial::domain_element2(1, degree_bound);
-            let mut k = Scalar::ONE;
+        let sigma_values: Vec<Vec<F>> = {
+            let mut sigma = vec![F::ZERO; degree_bound * self.num_columns];
+            let omega = Polynomial::<F>::domain_element2(1, degree_bound);
+            let mut k = F::ONE;
             for i in 0..self.num_columns {
                 let offset = i * degree_bound;
                 sigma[offset] = k;
                 for j in 1..degree_bound {
                     sigma[offset + j] = sigma[offset + j - 1] * omega;
                 }
-                k *= Scalar::MULTIPLICATIVE_GENERATOR;
+                k *= F::MULTIPLICATIVE_GENERATOR;
             }
             for node in self.partitioner.iter_nodes() {
                 let indices: Vec<usize> = node
                     .iter()
                     .map(|cell| cell.column() * degree_bound + cell.row())
                     .collect();
-                let mut permuted: Vec<Scalar> = indices.iter().map(|&i| sigma[i]).collect();
+                let mut permuted: Vec<F> = indices.iter().map(|&i| sigma[i]).collect();
                 permuted.rotate_left(1);
                 for i in 0..indices.len() {
                     sigma[indices[i]] = permuted[i];
@@ -591,16 +590,17 @@ impl CircuitBuilder {
             sigma,
             sigma_values,
             public_rows: self.public_rows,
+            _data: PhantomData,
         })
     }
 }
 
-impl CircuitView for CircuitBuilder {
-    fn builder(&self) -> &CircuitBuilder {
+impl<F: Field, G: Field256 + From<F>> CircuitView<F, G> for CircuitBuilder<F, G> {
+    fn builder(&self) -> &CircuitBuilder<F, G> {
         self
     }
 
-    fn builder_mut(&mut self) -> &mut CircuitBuilder {
+    fn builder_mut(&mut self) -> &mut CircuitBuilder<F, G> {
         self
     }
 
@@ -623,9 +623,9 @@ impl CircuitView for CircuitBuilder {
 
 /// Implements [`CircuitView`] for a sub-section of the circuit.
 #[derive(Debug)]
-pub struct CircuitSectionBuilder<'a> {
+pub struct CircuitSectionBuilder<'a, F: Field, G: Field256 + From<F>> {
     /// Reference to the parent [`CircuitBuilder`].
-    builder: &'a mut CircuitBuilder,
+    builder: &'a mut CircuitBuilder<F, G>,
 
     /// Row offset of the sub-section.
     row_offset: usize,
@@ -640,9 +640,9 @@ pub struct CircuitSectionBuilder<'a> {
     height: usize,
 }
 
-impl<'a> CircuitSectionBuilder<'a> {
+impl<'a, F: Field, G: Field256 + From<F>> CircuitSectionBuilder<'a, F, G> {
     fn new(
-        builder: &'a mut CircuitBuilder,
+        builder: &'a mut CircuitBuilder<F, G>,
         row_offset: usize,
         column_offset: usize,
         width: usize,
@@ -658,12 +658,12 @@ impl<'a> CircuitSectionBuilder<'a> {
     }
 }
 
-impl<'a> CircuitView for CircuitSectionBuilder<'a> {
-    fn builder(&self) -> &CircuitBuilder {
+impl<'a, F: Field, G: Field256 + From<F>> CircuitView<F, G> for CircuitSectionBuilder<'a, F, G> {
+    fn builder(&self) -> &CircuitBuilder<F, G> {
         self.builder
     }
 
-    fn builder_mut(&mut self) -> &mut CircuitBuilder {
+    fn builder_mut(&mut self) -> &mut CircuitBuilder<F, G> {
         self.builder
     }
 
@@ -688,12 +688,12 @@ impl<'a> CircuitView for CircuitSectionBuilder<'a> {
 ///
 /// The API in the implementation mostly mirrors that of the underlying PCS proof.
 #[derive(Debug, Clone)]
-pub struct Proof<H: Hasher<Scalar>> {
-    commitment: pcs::Commitment<Scalar, H>,
-    inner_proof: pcs::Proof<Scalar, H>,
+pub struct Proof<F: Field256, H: Hasher<F>> {
+    commitment: pcs::Commitment<F, H>,
+    inner_proof: pcs::Proof<F, H>,
 }
 
-impl<H: Hasher<Scalar>> Proof<H> {
+impl<F: Field256, H: Hasher<F>> Proof<F, H> {
     /// Returns the proven degree bound.
     pub fn degree_bound(&self) -> usize {
         self.inner_proof.degree_bound()
@@ -720,7 +720,7 @@ impl<H: Hasher<Scalar>> Proof<H> {
 
 /// A PLONK circuit.
 #[derive(Debug, Clone)]
-pub struct Circuit {
+pub struct Circuit<F: Field, G: Field256 + From<F>> {
     /// The raw number of rows of the circuit.
     ///
     /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
@@ -748,25 +748,27 @@ pub struct Circuit {
     ///
     /// The size of this pool is not (necessarily) the number of rows: [`CircuitBuilder`]'s
     /// algorithm tries to reuse selectors as much as possible.
-    selectors: Vec<Polynomial>,
+    selectors: Vec<Polynomial<F>>,
 
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
     /// second component is the set of instances of that gate across the circuit.
-    gates: BTreeMap<Constraint<Scalar>, BTreeSet<GateInstance>>,
+    gates: BTreeMap<Constraint<F>, BTreeSet<GateInstance>>,
 
     /// Sigma polynomials of the permutation argument, one for every witness column.
-    sigma: Vec<Polynomial>,
+    sigma: Vec<Polynomial<F>>,
 
     /// The [sigma polynomials](`Self::sigma`) expressed on the value domain.
     ///
     /// The layout is analogous to [`Self::sigma`] itself: the values are indexed column-first.
-    sigma_values: Vec<Vec<Scalar>>,
+    sigma_values: Vec<Vec<F>>,
 
     /// List of gates that are revealed in the proofs. Each element is a row index.
     public_rows: BTreeSet<usize>,
+
+    _data: PhantomData<G>,
 }
 
-impl Circuit {
+impl<F: Field, G: Field256 + From<F>> Circuit<F, G> {
     pub fn num_rows(&self) -> usize {
         self.num_rows
     }
@@ -791,7 +793,7 @@ impl Circuit {
     }
 
     /// Makes an empty [`Witness`] objects suitable for use with this circuit.
-    pub fn make_witness(&self) -> Witness {
+    pub fn make_witness(&self) -> Witness<F> {
         Witness::new(
             self.num_rows,
             self.num_columns,
@@ -807,7 +809,7 @@ impl Circuit {
 
     /// Performs various checks to verify that the provided `witness` is compatible with this
     /// circuit and doesn't violate any constraints.
-    pub fn check_witness(&self, witness: &Witness) -> Result<()> {
+    pub fn check_witness(&self, witness: &Witness<F>) -> Result<()> {
         if witness.num_rows() != self.num_rows {
             return Err(anyhow!(
                 "wrong number of rows: got {}, want {}",
@@ -839,7 +841,7 @@ impl Circuit {
                     .decode2()
                     .into_iter()
                     .enumerate()
-                    .filter(|(_, value)| *value != Scalar::ZERO)
+                    .filter(|(_, value)| *value != F::ZERO)
                     .map(|(index, _)| index)
                     .collect()
             })
@@ -849,7 +851,7 @@ impl Circuit {
                 let variables = constraint.get_free_variables();
                 for &row in &active_row_set[gate_instance.selector_index] {
                     let root_cell = Cell::new(row, gate_instance.column_index);
-                    let substitution: BTreeMap<Variable, Scalar> = variables
+                    let substitution: BTreeMap<Variable, F> = variables
                         .iter()
                         .map(|variable| {
                             (
@@ -858,7 +860,7 @@ impl Circuit {
                             )
                         })
                         .collect();
-                    if constraint.evaluate(&substitution) != Scalar::ZERO {
+                    if constraint.evaluate(&substitution) != F::ZERO {
                         return Err(anyhow!(
                             "gate constraint `{}` violated at row {}, column {}",
                             constraint,
@@ -870,18 +872,18 @@ impl Circuit {
             }
         }
 
-        let cell_by_identity_value: BTreeMap<Scalar, Cell> = {
+        let cell_by_identity_value: BTreeMap<F, Cell> = {
             let mut cell_by_identity_value = BTreeMap::default();
-            let omega = Polynomial::domain_element2(1, self.degree_bound);
-            let mut generator_power = Scalar::ONE;
+            let omega = Polynomial::<F>::domain_element2(1, self.degree_bound);
+            let mut generator_power = F::ONE;
             for column in 0..self.num_columns {
-                let mut omega_power = Scalar::ONE;
+                let mut omega_power = F::ONE;
                 for row in 0..self.degree_bound {
                     cell_by_identity_value
                         .insert(generator_power * omega_power, Cell::new(row, column));
                     omega_power *= omega;
                 }
-                generator_power *= Scalar::MULTIPLICATIVE_GENERATOR;
+                generator_power *= F::MULTIPLICATIVE_GENERATOR;
             }
             cell_by_identity_value
         };
@@ -910,13 +912,34 @@ impl Circuit {
         Ok(())
     }
 
+    fn embed_polynomial(polynomial: &Polynomial<F>) -> Polynomial<G> {
+        Polynomial::with_coefficients(
+            polynomial
+                .coefficients()
+                .iter()
+                .copied()
+                .map(G::from)
+                .collect(),
+        )
+    }
+
+    fn make_committer<H: Hasher<G>>(&self, options: &ProvingOptions) -> pcs::Committer<G, H> {
+        let circuit_polynomials = self
+            .selectors
+            .iter()
+            .map(Self::embed_polynomial)
+            .chain(self.sigma.iter().map(Self::embed_polynomial))
+            .collect();
+        pcs::Committer::<G, H>::new(self.degree_bound, options.blowup_log2, circuit_polynomials)
+    }
+
     fn get_variable_substitution(
         &self,
-        omega: Scalar,
-        omega_inv: Scalar,
-        columns: &[Polynomial],
-    ) -> BTreeMap<Variable, Polynomial> {
-        let mut substitution: BTreeMap<Variable, Polynomial> = BTreeMap::default();
+        omega: G,
+        omega_inv: G,
+        columns: &[Polynomial<F>],
+    ) -> BTreeMap<Variable, Polynomial<G>> {
+        let mut substitution: BTreeMap<Variable, Polynomial<G>> = BTreeMap::default();
         for (constraint, instances) in &self.gates {
             for instance in instances {
                 for variable in constraint
@@ -926,7 +949,7 @@ impl Circuit {
                 {
                     if !substitution.contains_key(&variable) {
                         let column = variable.rotate_column(
-                            columns[variable.column_index()].clone(),
+                            Self::embed_polynomial(&columns[variable.column_index()]),
                             omega,
                             omega_inv,
                         );
@@ -943,33 +966,34 @@ impl Circuit {
     /// and the recurrence constraint.
     fn build_permutation_argument(
         &self,
-        witness: &Witness,
-        columns: &[Polynomial],
-        beta: Scalar,
-        gamma: Scalar,
-    ) -> Result<(Polynomial, Polynomial, Polynomial)> {
-        let omega = Polynomial::domain_element2(1, self.degree_bound);
+        witness: &Witness<F>,
+        columns: &[Polynomial<F>],
+        beta: G,
+        gamma: G,
+    ) -> Result<(Polynomial<G>, Polynomial<G>, Polynomial<G>)> {
+        let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
 
         let accumulator = {
-            let mut accumulator = vec![Scalar::ZERO; self.degree_bound + 1];
+            let mut accumulator = vec![G::ZERO; self.degree_bound + 1];
 
-            accumulator[0] = Scalar::ONE;
-            let mut omega_power = Scalar::ONE;
+            accumulator[0] = G::ONE;
+            let mut omega_power = G::ONE;
             for i in 0..self.degree_bound {
-                let mut generator_power = Scalar::ONE;
+                let mut generator_power = G::ONE;
                 accumulator[i + 1] = accumulator[i];
                 for j in 0..self.num_columns {
-                    let witness_value = witness.get_at(Cell::new(i, j));
+                    let witness_value: G = witness.get_at(Cell::new(i, j)).into();
                     accumulator[i + 1] *=
                         witness_value + beta * generator_power * omega_power + gamma;
                     accumulator[i + 1] *=
-                        (witness_value + beta * self.sigma_values[j][i] + gamma).invert_unwrap();
-                    generator_power *= Scalar::MULTIPLICATIVE_GENERATOR;
+                        (witness_value + beta * G::from(self.sigma_values[j][i]) + gamma)
+                            .invert_unwrap();
+                    generator_power *= G::MULTIPLICATIVE_GENERATOR;
                 }
                 omega_power *= omega;
             }
 
-            if accumulator.pop().unwrap() != Scalar::ONE {
+            if accumulator.pop().unwrap() != G::ONE {
                 return Err(anyhow!("permutation accumulator wraparound check failed"));
             }
 
@@ -985,21 +1009,25 @@ impl Circuit {
                         columns
                             .iter()
                             .zip(self.sigma.iter())
-                            .map(|(column, sigma)| column.clone() + sigma.clone() * beta + gamma),
+                            .map(|(column, sigma)| {
+                                Self::embed_polynomial(column)
+                                    + Self::embed_polynomial(sigma) * beta
+                                    + gamma
+                            }),
                     )
                     .collect::<Vec<_>>()
                     .as_slice(),
             );
 
-            let mut power = Scalar::ONE;
+            let mut power = G::ONE;
             let rhs = Polynomial::multiply_batch(
                 std::iter::once(&accumulator).chain(
                     columns
                         .iter()
                         .map(|column| {
-                            let column = column.clone()
+                            let column = Self::embed_polynomial(column)
                                 + Polynomial::with_coefficients(vec![gamma, beta * power]);
-                            power *= Scalar::MULTIPLICATIVE_GENERATOR;
+                            power *= G::MULTIPLICATIVE_GENERATOR;
                             column
                         })
                         .collect::<Vec<_>>()
@@ -1010,15 +1038,15 @@ impl Circuit {
             lhs - rhs
         };
 
-        let fixpoint_constraint = (accumulator.clone() - Scalar::ONE)
-            * Polynomial::lagrange0_2(self.degree_bound).clone();
+        let fixpoint_constraint =
+            (accumulator.clone() - G::ONE) * Polynomial::lagrange0_2(self.degree_bound).clone();
 
         Ok((accumulator, fixpoint_constraint, recurrence_constraint))
     }
 
     /// Splits the quotient polynomial in chunks so that it can be batch-committed even though its
     /// degree is much higher than the bound configured in the underlying PCS.
-    fn split_quotient(&self, quotient: Polynomial) -> Vec<Polynomial> {
+    fn split_quotient(&self, quotient: Polynomial<G>) -> Vec<Polynomial<G>> {
         let degree_bound = quotient_degree_bound(
             self.degree_bound,
             self.num_columns,
@@ -1026,7 +1054,7 @@ impl Circuit {
         );
         let mut coefficients = quotient.take();
         assert!(coefficients.len() <= degree_bound);
-        coefficients.resize(degree_bound, Scalar::ZERO);
+        coefficients.resize(degree_bound, G::ZERO);
         coefficients
             .chunks(self.degree_bound)
             .map(|coefficients| Polynomial::with_coefficients(coefficients.to_vec()))
@@ -1035,11 +1063,11 @@ impl Circuit {
 
     /// Proves correctness of the given witness, or returns an error in case of a constraint
     /// violation.
-    pub fn prove<H: Hasher<Scalar>>(
+    pub fn prove<H: Hasher<G>>(
         &self,
-        mut witness: Witness,
+        mut witness: Witness<F>,
         options: ProvingOptions,
-    ) -> Result<Proof<H>> {
+    ) -> Result<Proof<G, H>> {
         witness.blind();
         if witness.num_rows() != self.num_rows {
             return Err(anyhow!(
@@ -1063,30 +1091,19 @@ impl Circuit {
             ));
         }
 
-        let circuit_polynomials = self
-            .selectors
-            .iter()
-            .cloned()
-            .chain(self.sigma.iter().cloned())
-            .collect();
-
-        let mut committer = pcs::Committer::<Scalar, H>::new(
-            self.degree_bound,
-            options.blowup_log2,
-            circuit_polynomials,
-        );
+        let mut committer = self.make_committer::<H>(&options);
 
         let columns = witness.clone().encode();
-        committer.add_batch(columns.clone());
+        committer.add_batch(columns.iter().map(Self::embed_polynomial).collect());
 
-        let omega = Polynomial::domain_element2(1, self.degree_bound);
+        let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
         let omega_inv = omega.invert_vartime().unwrap();
 
         let gate_constraint = {
             let substitution = self.get_variable_substitution(omega, omega_inv, columns.as_slice());
             let delta = H::challenge(*DST_DELTA, &[committer.transcript_hash()]);
-            let mut gate_constraint = Polynomial::default();
-            let mut power = Scalar::ONE;
+            let mut gate_constraint = Polynomial::<G>::default();
+            let mut power = G::ONE;
             for (constraint, instances) in &self.gates {
                 for instance in instances {
                     let constraint = if instance.column_index != 0 {
@@ -1142,15 +1159,11 @@ impl Circuit {
         })
     }
 
-    pub fn to_compressed<H: Hasher<Scalar>>(self, options: ProvingOptions) -> CompressedCircuit<H> {
-        let committer = pcs::Committer::<Scalar, H>::new(
-            self.degree_bound,
-            options.blowup_log2,
-            self.selectors
-                .into_iter()
-                .chain(self.sigma.into_iter())
-                .collect(),
-        );
+    pub fn to_compressed<H: Hasher<G>>(
+        self,
+        options: ProvingOptions,
+    ) -> CompressedCircuit<F, G, H> {
+        let committer = self.make_committer::<H>(&options);
         CompressedCircuit {
             num_rows: self.num_rows,
             num_blinding_rows: self.num_blinding_rows,
@@ -1164,23 +1177,15 @@ impl Circuit {
                 .collect(),
             public_rows: self.public_rows,
             circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
-            _data: Default::default(),
+            _data: PhantomData,
         }
     }
 
-    pub fn as_compressed<H: Hasher<Scalar>>(
+    pub fn as_compressed<H: Hasher<G>>(
         &self,
         options: ProvingOptions,
-    ) -> CompressedCircuit<H> {
-        let committer = pcs::Committer::<Scalar, H>::new(
-            self.degree_bound,
-            options.blowup_log2,
-            self.selectors
-                .iter()
-                .cloned()
-                .chain(self.sigma.iter().cloned())
-                .collect(),
-        );
+    ) -> CompressedCircuit<F, G, H> {
+        let committer = self.make_committer::<H>(&options);
         CompressedCircuit {
             num_rows: self.num_rows,
             num_blinding_rows: self.num_blinding_rows,
@@ -1200,11 +1205,11 @@ impl Circuit {
         }
     }
 
-    pub fn verify<H: Hasher<Scalar>>(
+    pub fn verify<H: Hasher<G>>(
         &self,
-        proof: &Proof<H>,
+        proof: &Proof<G, H>,
         options: ProvingOptions,
-    ) -> Result<BTreeMap<Cell, Scalar>> {
+    ) -> Result<BTreeMap<Cell, F>> {
         self.as_compressed::<H>(options).verify(proof)
     }
 }
@@ -1214,7 +1219,7 @@ impl Circuit {
 /// This struct is much smaller than the original circuit but still allows full verification of a
 /// proof for the circuit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompressedCircuit<H: Hasher<Scalar>> {
+pub struct CompressedCircuit<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
     /// The raw number of rows of the circuit.
     ///
     /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
@@ -1236,7 +1241,7 @@ pub struct CompressedCircuit<H: Hasher<Scalar>> {
 
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
     /// second component is the set of instances of that gate across the circuit.
-    gates: Vec<(Constraint<Scalar>, Vec<GateInstance>)>,
+    gates: Vec<(Constraint<F>, Vec<GateInstance>)>,
 
     /// List of rows that are revealed in the proofs.
     public_rows: BTreeSet<usize>,
@@ -1244,10 +1249,10 @@ pub struct CompressedCircuit<H: Hasher<Scalar>> {
     /// Merkle root of the circuit selectors and sigma polynomials.
     circuit_commitment: H256,
 
-    _data: PhantomData<H>,
+    _data: PhantomData<(G, H)>,
 }
 
-impl<H: Hasher<Scalar>> CompressedCircuit<H> {
+impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> CompressedCircuit<F, G, H> {
     pub fn num_rows(&self) -> usize {
         self.num_rows
     }
@@ -1290,7 +1295,7 @@ impl<H: Hasher<Scalar>> CompressedCircuit<H> {
     ///
     /// The returned map will have exactly `N` entries for every row in [`Self::public_rows`], with
     /// `N` being the [number of columns](`Self::num_columns`).
-    pub fn verify(&self, proof: &Proof<H>) -> Result<BTreeMap<Cell, Scalar>> {
+    pub fn verify(&self, proof: &Proof<G, H>) -> Result<BTreeMap<Cell, F>> {
         let commitment = &proof.commitment;
         let inner_proof = &proof.inner_proof;
 
@@ -1353,7 +1358,7 @@ impl<H: Hasher<Scalar>> CompressedCircuit<H> {
             ));
         }
 
-        let omega = Polynomial::domain_element2(1, self.degree_bound);
+        let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
         let omega_inv = omega.invert_vartime().unwrap();
 
         let xi = H::challenge(
@@ -1384,27 +1389,27 @@ impl<H: Hasher<Scalar>> CompressedCircuit<H> {
 
         inner_proof.verify(&commitment)?;
 
-        let sigma: Vec<Scalar> = {
+        let sigma: Vec<G> = {
             let offset = num_gate_selectors;
             (0..self.num_columns)
                 .map(|i| points[&xi][offset + i])
                 .collect()
         };
 
-        let gate_constraint: Scalar = {
-            let selectors: Vec<Scalar> = (0..num_gate_selectors).map(|i| points[&xi][i]).collect();
+        let gate_constraint: G = {
+            let selectors: Vec<G> = (0..num_gate_selectors).map(|i| points[&xi][i]).collect();
             let delta = H::challenge(
                 *DST_DELTA,
                 &[commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
             );
-            let mut result = Scalar::ZERO;
-            let mut power = Scalar::ONE;
+            let mut result = G::ZERO;
+            let mut power = G::ONE;
             for (constraint, gate_instances) in &self.gates {
                 for instance in gate_instances {
                     let constraint = constraint
                         .clone()
                         .remap_variables(instance.column_index as isize);
-                    let substitution: BTreeMap<Variable, Scalar> = constraint
+                    let substitution: BTreeMap<Variable, G> = constraint
                         .get_free_variables()
                         .into_iter()
                         .map(|variable| {
@@ -1443,21 +1448,21 @@ impl<H: Hasher<Scalar>> CompressedCircuit<H> {
         );
 
         let (permutation_numerator, permutation_denominator) = {
-            let mut numerator = Scalar::ONE;
-            let mut denominator = Scalar::ONE;
-            let mut generator_power = Scalar::ONE;
+            let mut numerator = G::ONE;
+            let mut denominator = G::ONE;
+            let mut generator_power = G::ONE;
             let offset = num_gate_selectors + num_sigma_polynomials;
             for column_index in 0..self.num_columns {
                 let variable = points[&xi][offset + column_index];
                 let sigma = sigma[column_index];
                 numerator *= variable + beta * generator_power * xi + gamma;
                 denominator *= variable + beta * sigma + gamma;
-                generator_power *= Scalar::MULTIPLICATIVE_GENERATOR;
+                generator_power *= G::MULTIPLICATIVE_GENERATOR;
             }
             (numerator, denominator)
         };
 
-        let quotient: Scalar = {
+        let quotient: G = {
             let offset = num_gate_selectors
                 + num_sigma_polynomials
                 + num_witness_columns
@@ -1466,7 +1471,7 @@ impl<H: Hasher<Scalar>> CompressedCircuit<H> {
                 .map(|i| points[&xi][offset + i] * xi.pow_small(i * self.degree_bound))
                 .sum()
         };
-        let zero = xi.pow_small(self.degree_bound) - Scalar::ONE;
+        let zero = xi.pow_small(self.degree_bound) - G::ONE;
 
         let alpha = H::challenge(
             *DST_ALPHA,
@@ -1476,8 +1481,8 @@ impl<H: Hasher<Scalar>> CompressedCircuit<H> {
         let permutation_recurrence_constraint = shifted_permutation_accumulator
             * permutation_denominator
             - permutation_accumulator * permutation_numerator;
-        let permutation_fixpoint_constraint = (permutation_accumulator - Scalar::from_const(1))
-            * Self::lagrange0(xi, self.degree_bound);
+        let permutation_fixpoint_constraint =
+            (permutation_accumulator - G::ONE) * Self::lagrange0(xi, self.degree_bound);
 
         let full_constraint = gate_constraint
             + alpha * permutation_fixpoint_constraint
@@ -1506,7 +1511,8 @@ mod tests {
     use super::*;
     use crate::expr::var;
     use crate::witness::WitnessView;
-    use starkom_bluesky::from_const;
+    use starkom_bluesky::{Scalar as BS, from_const};
+    use starkom_goldilocks::{GL, GL4};
     use starkom_pcs::hash::{Keccak256Hash, Sha2Hash};
 
     fn parse_hash(s: &'static str) -> H256 {
@@ -1520,12 +1526,12 @@ mod tests {
 
     // This function tests the circuit from Vitalik's PLONK tutorial,
     // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
-    fn test_vitalik_circuit_impl<H: Hasher<Scalar>>(
+    fn test_vitalik_circuit_impl<F: Field, G: Field256 + From<F>, H: Hasher<G>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
         commitment: H256,
     ) -> Result<()> {
-        let mut builder = CircuitBuilder::default();
+        let mut builder = CircuitBuilder::<F, G>::default();
         builder.add_gate(0, (var(0) ^ 2) - var(1));
         builder.connect(cell(0, 0).into(), cell(1, 0).into());
         builder.connect(cell(0, 1).into(), cell(1, 1).into());
@@ -1545,13 +1551,13 @@ mod tests {
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 3);
-        witness.set(cell(0, 0), from_const(3));
-        witness.set(cell(0, 1), from_const(9));
-        witness.set(cell(1, 0), from_const(3));
-        witness.set(cell(1, 1), from_const(9));
-        witness.set(cell(1, 2), from_const(35));
-        witness.set(cell(2, 0), from_const(3));
-        witness.set(cell(2, 1), from_const(35));
+        witness.set(cell(0, 0), 3u8.into());
+        witness.set(cell(0, 1), 9u8.into());
+        witness.set(cell(1, 0), 3u8.into());
+        witness.set(cell(1, 1), 9u8.into());
+        witness.set(cell(1, 2), 35u8.into());
+        witness.set(cell(2, 0), 3u8.into());
+        witness.set(cell(2, 1), 35u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit.prove::<H>(witness, options.clone())?;
@@ -1562,61 +1568,68 @@ mod tests {
         let circuit = circuit.to_compressed(options);
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
-        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
-        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+        assert_eq!(public_inputs[&cell(2, 0)], 3u8.into());
+        assert_eq!(public_inputs[&cell(2, 1)], 35u8.into());
         Ok(())
     }
 
     #[test]
-    fn test_vitalik_circuit_sha2_blowup_2() {
+    fn test_vitalik_circuit_bluesky_sha2_blowup_2() {
         let c = parse_hash("0x2732a0cce5e03109e372c39515b4e3cc7aae87adfde949418c7f5918e4cea1f9");
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 1, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 1, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 1, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 1, c).is_ok());
+    }
+
+    #[test]
+    fn test_vitalik_circuit_goldilocks_sha2_blowup_2() {
+        let c = parse_hash("0x2732a0cce5e03109e372c39515b4e3cc7aae87adfde949418c7f5918e4cea1f9");
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_keccak256_blowup_2() {
         let c = parse_hash("0xa4e2f7c1507afba18f2996fd89dd570f1bd466fdf14c8bc0d65a015c88aa8e20");
-        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(false, 1, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(true, 1, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 1, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 1, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_4() {
         let c = parse_hash("0xd81086a421590d6b5517c86495fcc3f52c983ff49e9d7e9cbc034fdb7cb77782");
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 2, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 2, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 2, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 2, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_keccak256_blowup_4() {
         let c = parse_hash("0x44197f3984298e3c6d20bc0a5be4ff0dca39b54f0c601f67367c3f72cfb1bb93");
-        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(false, 2, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(true, 2, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 2, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 2, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_sha2_blowup_8() {
         let c = parse_hash("0xdb14b315aa52e49402a85544104520629b245a2fcecf33b15eebb39e0c711aa5");
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(false, 3, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Sha2Hash<Scalar>>(true, 3, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 3, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 3, c).is_ok());
     }
 
     #[test]
     fn test_vitalik_circuit_keccak256_blowup_8() {
         let c = parse_hash("0x4fa1ea6a1b435bb0309c7432be6087bd326962a13709669be5695ddf6049fc22");
-        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(false, 3, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<Keccak256Hash<Scalar>>(true, 3, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 3, c).is_ok());
+        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 3, c).is_ok());
     }
 
     /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
     /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81).
-    fn test_vitalik_circuit_variation_impl<H: Hasher<Scalar>>(
+    fn test_vitalik_circuit_variation_impl<F: Field, G: Field256 + From<F>, H: Hasher<G>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
         commitment: H256,
     ) -> Result<()> {
-        let mut builder = CircuitBuilder::default();
+        let mut builder = CircuitBuilder::<F, G>::default();
         builder.add_gate(0, (var(0) ^ 2) - var(1));
         let x = cell(0, 0);
         let square = cell(0, 1);
@@ -1647,18 +1660,18 @@ mod tests {
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), 8);
         assert_eq!(witness.num_columns(), 4);
-        witness.set(cell(0, 0), from_const(3));
-        witness.set(cell(0, 1), from_const(9));
-        witness.set(cell(1, 0), from_const(3));
-        witness.set(cell(1, 1), from_const(4));
-        witness.set(cell(1, 2), from_const(12));
-        witness.set(cell(2, 0), from_const(3));
-        witness.set(cell(2, 1), from_const(9));
-        witness.set(cell(2, 2), from_const(12));
-        witness.set(cell(2, 3), from_const(44));
-        witness.set(cell(3, 0), from_const(3));
-        witness.set(cell(3, 1), from_const(4));
-        witness.set(cell(3, 2), from_const(44));
+        witness.set(cell(0, 0), 3u8.into());
+        witness.set(cell(0, 1), 9u8.into());
+        witness.set(cell(1, 0), 3u8.into());
+        witness.set(cell(1, 1), 4u8.into());
+        witness.set(cell(1, 2), 12u8.into());
+        witness.set(cell(2, 0), 3u8.into());
+        witness.set(cell(2, 1), 9u8.into());
+        witness.set(cell(2, 2), 12u8.into());
+        witness.set(cell(2, 3), 44u8.into());
+        witness.set(cell(3, 0), 3u8.into());
+        witness.set(cell(3, 1), 4u8.into());
+        witness.set(cell(3, 2), 44u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
         let options = ProvingOptions { blowup_log2 };
         let proof = circuit.prove::<H>(witness, options.clone())?;
@@ -1669,9 +1682,9 @@ mod tests {
         let circuit = circuit.to_compressed(options);
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
-        assert_eq!(public_inputs[&x_out], from_const(3));
-        assert_eq!(public_inputs[&y_out], from_const(4));
-        assert_eq!(public_inputs[&result_out], from_const(44));
+        assert_eq!(public_inputs[&x_out], 3u8.into());
+        assert_eq!(public_inputs[&y_out], 4u8.into());
+        assert_eq!(public_inputs[&result_out], 44u8.into());
         Ok(())
     }
 

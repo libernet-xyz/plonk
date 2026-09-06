@@ -1,11 +1,9 @@
 use crate::chip::Chip;
 use crate::utils::padded_circuit_size;
 use anyhow::Result;
-use starkom_bluesky::Scalar;
 use starkom_ff::Field;
+use starkom_poly::Polynomial;
 use std::collections::{BTreeMap, BTreeSet, btree_map};
-
-type Polynomial = starkom_poly::Polynomial<Scalar>;
 
 /// A cell in a circuit or witness, uniquely identified by a row number and a column number.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -90,19 +88,19 @@ impl CellOffset for i32 {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CellOrUnconstrained {
+pub enum CellOrUnconstrained<F: Field> {
     Cell(Cell),
-    Unconstrained(Scalar),
+    Unconstrained(F),
 }
 
-impl From<Cell> for CellOrUnconstrained {
+impl<F: Field> From<Cell> for CellOrUnconstrained<F> {
     fn from(cell: Cell) -> Self {
         CellOrUnconstrained::Cell(cell)
     }
 }
 
-impl From<Scalar> for CellOrUnconstrained {
-    fn from(value: Scalar) -> Self {
+impl<F: Field> From<F> for CellOrUnconstrained<F> {
+    fn from(value: F) -> Self {
         CellOrUnconstrained::Unconstrained(value)
     }
 }
@@ -179,12 +177,12 @@ impl Partitioner {
     }
 }
 
-pub trait WitnessView {
+pub trait WitnessView<F: Field> {
     /// Returns a reference to the [`Witness`].
-    fn witness(&self) -> &Witness;
+    fn witness(&self) -> &Witness<F>;
 
     /// Returns a mutable reference to the [`Witness`].
-    fn witness_mut(&mut self) -> &mut Witness;
+    fn witness_mut(&mut self) -> &mut Witness<F>;
 
     /// Returns the number of columns included in the view.
     ///
@@ -240,12 +238,12 @@ pub trait WitnessView {
     }
 
     /// Reads a witness cell.
-    fn get_at(&self, cell: Cell) -> Scalar {
+    fn get_at(&self, cell: Cell) -> F {
         self.witness().get_internal(cell)
     }
 
     /// Reads a witness cell or unconstrained value.
-    fn get(&self, cell_or_unconstrained: CellOrUnconstrained) -> Scalar {
+    fn get(&self, cell_or_unconstrained: CellOrUnconstrained<F>) -> F {
         match cell_or_unconstrained {
             CellOrUnconstrained::Cell(cell) => self.get_at(cell),
             CellOrUnconstrained::Unconstrained(value) => value,
@@ -253,12 +251,12 @@ pub trait WitnessView {
     }
 
     /// Updates a witness cell.
-    fn set(&mut self, cell: Cell, value: Scalar) {
+    fn set(&mut self, cell: Cell, value: F) {
         self.witness_mut().set_internal(cell, value);
     }
 
     /// Copies a witness cell to another and returns the copied value.
-    fn copy(&mut self, src_cell: CellOrUnconstrained, dst_cell: Cell) -> Scalar {
+    fn copy(&mut self, src_cell: CellOrUnconstrained<F>, dst_cell: Cell) -> F {
         match src_cell {
             CellOrUnconstrained::Cell(src_cell) => {
                 self.witness_mut().copy_internal(src_cell, dst_cell)
@@ -283,7 +281,7 @@ pub trait WitnessView {
         column_offset: usize,
         width: Option<usize>,
         height: Option<usize>,
-    ) -> impl WitnessView {
+    ) -> impl WitnessView<F> {
         let parent_width = self.width();
         let parent_height = self.height();
         let width = width.unwrap_or(parent_width - column_offset);
@@ -308,7 +306,7 @@ pub trait WitnessView {
         column_offset: usize,
         width: Option<usize>,
         height: Option<usize>,
-        callback: impl FnOnce(&mut WitnessSection),
+        callback: impl FnOnce(&mut WitnessSection<F>),
     ) -> &mut Self {
         self.sub_fn_or(row_offset, column_offset, width, height, |view| {
             callback(view);
@@ -324,7 +322,7 @@ pub trait WitnessView {
         column_offset: usize,
         width: Option<usize>,
         height: Option<usize>,
-        callback: impl FnOnce(&mut WitnessSection) -> Result<()>,
+        callback: impl FnOnce(&mut WitnessSection<F>) -> Result<()>,
     ) -> Result<&mut Self> {
         let parent_width = self.width();
         let parent_height = self.height();
@@ -349,9 +347,9 @@ pub trait WitnessView {
         &mut self,
         row_offset: usize,
         column_offset: usize,
-        chip: &impl Chip<I, O>,
-        inputs: [CellOrUnconstrained; I],
-    ) -> Result<[CellOrUnconstrained; O]> {
+        chip: &impl Chip<F, I, O>,
+        inputs: [CellOrUnconstrained<F>; I],
+    ) -> Result<[CellOrUnconstrained<F>; O]> {
         let parent_width = self.width();
         let parent_height = self.height();
         let chip_width = chip.width();
@@ -372,9 +370,9 @@ pub trait WitnessView {
 }
 
 #[derive(Debug)]
-pub struct WitnessViewGenerator<'a> {
+pub struct WitnessViewGenerator<'a, F: Field> {
     /// Reference to the parent [`Witness`].
-    witness: &'a mut Witness,
+    witness: &'a mut Witness<F>,
 
     /// Row offset where all sub-sections are rooted.
     row_offset: usize,
@@ -389,8 +387,8 @@ pub struct WitnessViewGenerator<'a> {
     count: usize,
 }
 
-impl<'a> WitnessViewGenerator<'a> {
-    pub fn get(&'a mut self, index: usize) -> WitnessSection<'a> {
+impl<'a, F: Field> WitnessViewGenerator<'a, F> {
+    pub fn get(&'a mut self, index: usize) -> WitnessSection<'a, F> {
         assert!(index < self.count);
         WitnessSection::new(
             self.witness,
@@ -403,7 +401,7 @@ impl<'a> WitnessViewGenerator<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct Witness {
+pub struct Witness<F: Field> {
     /// The number of witness rows *not* including the blinding rows.
     num_rows: usize,
 
@@ -419,10 +417,10 @@ pub struct Witness {
     /// Witness table cells, indexed column-first.
     ///
     /// The column-first indexing allows quickly interpolating polynomials for the columns.
-    data: Vec<Vec<Scalar>>,
+    data: Vec<Vec<F>>,
 }
 
-impl Witness {
+impl<F: Field> Witness<F> {
     pub(crate) fn new<R: IntoIterator<Item = isize>>(
         num_rows: usize,
         num_columns: usize,
@@ -433,7 +431,7 @@ impl Witness {
             num_rows,
             num_blinding_rows,
             degree_bound,
-            data: vec![vec![Scalar::ZERO; degree_bound]; num_columns],
+            data: vec![vec![F::ZERO; degree_bound]; num_columns],
         }
     }
 
@@ -453,15 +451,15 @@ impl Witness {
         self.data.len()
     }
 
-    fn get_internal(&self, cell: Cell) -> Scalar {
+    fn get_internal(&self, cell: Cell) -> F {
         self.data[cell.column()][cell.row()]
     }
 
-    fn set_internal(&mut self, cell: Cell, value: Scalar) {
+    fn set_internal(&mut self, cell: Cell, value: F) {
         self.data[cell.column()][cell.row()] = value;
     }
 
-    fn copy_internal(&mut self, src_cell: Cell, dst_cell: Cell) -> Scalar {
+    fn copy_internal(&mut self, src_cell: Cell, dst_cell: Cell) -> F {
         let value = self.data[src_cell.column()][src_cell.row()];
         self.data[dst_cell.column()][dst_cell.row()] = value;
         value
@@ -473,12 +471,12 @@ impl Witness {
     pub(crate) fn blind(&mut self) {
         for i in 0..self.num_columns() {
             for j in 0..self.num_blinding_rows {
-                self.data[i][self.num_rows + j] = Scalar::random_default();
+                self.data[i][self.num_rows + j] = F::random_default();
             }
         }
     }
 
-    pub(crate) fn encode(self) -> Vec<Polynomial> {
+    pub(crate) fn encode(self) -> Vec<Polynomial<F>> {
         self.data
             .iter()
             .map(|data| Polynomial::encode2(data.clone()))
@@ -486,12 +484,12 @@ impl Witness {
     }
 }
 
-impl WitnessView for Witness {
-    fn witness(&self) -> &Witness {
+impl<F: Field> WitnessView<F> for Witness<F> {
+    fn witness(&self) -> &Witness<F> {
         self
     }
 
-    fn witness_mut(&mut self) -> &mut Witness {
+    fn witness_mut(&mut self) -> &mut Witness<F> {
         self
     }
 
@@ -513,17 +511,17 @@ impl WitnessView for Witness {
 }
 
 #[derive(Debug)]
-pub struct WitnessSection<'a> {
-    witness: &'a mut Witness,
+pub struct WitnessSection<'a, F: Field> {
+    witness: &'a mut Witness<F>,
     row_offset: usize,
     column_offset: usize,
     width: usize,
     height: usize,
 }
 
-impl<'a> WitnessSection<'a> {
+impl<'a, F: Field> WitnessSection<'a, F> {
     fn new(
-        witness: &'a mut Witness,
+        witness: &'a mut Witness<F>,
         row_offset: usize,
         column_offset: usize,
         width: usize,
@@ -539,12 +537,12 @@ impl<'a> WitnessSection<'a> {
     }
 }
 
-impl<'a> WitnessView for WitnessSection<'a> {
-    fn witness(&self) -> &Witness {
+impl<'a, F: Field> WitnessView<F> for WitnessSection<'a, F> {
+    fn witness(&self) -> &Witness<F> {
         self.witness
     }
 
-    fn witness_mut(&mut self) -> &mut Witness {
+    fn witness_mut(&mut self) -> &mut Witness<F> {
         self.witness
     }
 
@@ -569,7 +567,9 @@ impl<'a> WitnessView for WitnessSection<'a> {
 mod tests {
     use super::*;
     use anyhow::anyhow;
-    use starkom_bluesky::from_const;
+    use starkom_bluesky::{Scalar, from_const};
+
+    type Witness = super::Witness<Scalar>;
 
     #[inline]
     fn cell(row: usize, column: usize) -> Cell {
