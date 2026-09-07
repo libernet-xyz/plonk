@@ -1697,7 +1697,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_2() {
-        let c = parse_hash("0xef45d5554477717f4bc1befbc7f29e9f0f9220b059a359bd69283e884264964e");
+        let c = parse_hash("0x9be02841a3960dc5cdc7670684a76e273b268233379a1032439ad4e694156e8b");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, c).is_ok());
     }
@@ -1711,7 +1711,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_2() {
-        let c = parse_hash("0xeac3cd914a28b35b75dee8ecc5296d882b0c7c7e22bc4b1ddc58fd5a04e4c96f");
+        let c = parse_hash("0xb3769d8e96f9451ee877f1fcfa9e1080df5fa936c5a600d7083ec8d8c63415a5");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, c).is_ok());
     }
@@ -1725,7 +1725,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_4() {
-        let c = parse_hash("0x40f93e0e525edbbb9785091a4e00df73d2635291b32389ec4445ff4e1906dd19");
+        let c = parse_hash("0x2c4d905cb935dbf8a6fb05e5cfaa4717713089743d6b420a31120bc9b1737bee");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, c).is_ok());
     }
@@ -1739,7 +1739,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_4() {
-        let c = parse_hash("0x8cd3aa0999f7adb690f056a70fbe4d166e7bbe789f067ed9b1960ffa1c62f29e");
+        let c = parse_hash("0x763a2ca086ca2b9e3cccd8d1b74923b81fead3d42e9c620d48b53d96faca7c4c");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, c).is_ok());
     }
@@ -1753,7 +1753,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_8() {
-        let c = parse_hash("0x0b868fd1478007ea28b86466888d89d866235edd95a083c145cccf5adaa00f6b");
+        let c = parse_hash("0x54ac897a7572ad828cc704993966fc73d46cee7ef99e221d84ecf316fd57adea");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, c).is_ok());
     }
@@ -1767,7 +1767,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_8() {
-        let c = parse_hash("0xd1c38173a7fa41dfe43e96a8e8c5ab340107f05b203317b2ef9c3a23e8228379");
+        let c = parse_hash("0x614c8437eb47487cc1d7f6aea250682adbca64434e207eb2e8dc6af4fccd36a3");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, c).is_ok());
     }
@@ -1851,7 +1851,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_variation_goldilocks_blowup_2() {
-        let c = parse_hash("0x7d8cad0df6c4288a4abccd5e8ab7c56b164a30a0ec0bc398d9f3792701cfbb28");
+        let c = parse_hash("0xe1fab592065fde64e2c31867d27fd3b12e5b18c73de3a79791698d88fa2a6587");
         assert!(test_vitalik_circuit_variation_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, c).is_ok());
         assert!(test_vitalik_circuit_variation_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, c).is_ok());
     }
@@ -1865,7 +1865,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_variation_goldilocks_blowup_4() {
-        let c = parse_hash("0x4c74d355df50c1b56d175fa09172bc2ae4ee60f5587aa557d05dd5e2584c3c73");
+        let c = parse_hash("0xf416839b98f2acca1a8e44fa4f9e2338d5cf79c209835f181a27657484d9d443");
         assert!(test_vitalik_circuit_variation_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, c).is_ok());
         assert!(test_vitalik_circuit_variation_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, c).is_ok());
     }
