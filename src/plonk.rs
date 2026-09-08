@@ -1049,24 +1049,30 @@ where
         assert_eq!(G::from(omega_base), omega);
 
         let accumulator = {
-            let mut accumulator = vec![G::ZERO; self.degree_bound + 1];
+            let mut numerators = vec![G::ONE; self.degree_bound + 1];
+            let mut denominators = vec![G::ONE; self.degree_bound + 1];
 
-            accumulator[0] = G::ONE;
             let mut omega_power = F::ONE;
             for i in 0..self.degree_bound {
                 let mut generator_power = F::ONE;
-                accumulator[i + 1] = accumulator[i];
+                numerators[i + 1] = numerators[i];
+                denominators[i + 1] = denominators[i];
                 for j in 0..self.num_columns {
                     let witness_value: G = witness.get_at(Cell::new(i, j)).into();
-                    accumulator[i + 1] *=
+                    numerators[i + 1] *=
                         witness_value + beta * (generator_power * omega_power) + gamma;
-                    accumulator[i + 1] *=
-                        (witness_value + beta * G::from(self.sigma_values[j][i]) + gamma)
-                            .invert_unwrap();
+                    denominators[i + 1] *= witness_value + beta * self.sigma_values[j][i] + gamma;
                     generator_power *= F::MULTIPLICATIVE_GENERATOR;
                 }
                 omega_power *= omega_base;
             }
+
+            G::invert_batch(&mut denominators);
+            let mut accumulator: Vec<G> = numerators
+                .into_iter()
+                .zip(denominators)
+                .map(|(numerator, inverse_denominator)| numerator * inverse_denominator)
+                .collect();
 
             if accumulator.pop().unwrap() != G::ONE {
                 return Err(anyhow!("permutation accumulator wraparound check failed"));
