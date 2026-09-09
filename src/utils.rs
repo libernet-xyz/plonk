@@ -11,7 +11,7 @@ pub(crate) fn make_dst(s: &'static [u8]) -> H256 {
     H256::from_slice(hasher.finalize().as_slice())
 }
 
-/// Converts an [`isize`] to a [`Scalar`], wrapping negative values around.
+/// Converts an [`isize`] to a field element, wrapping negative values around.
 pub(crate) fn isize_to_scalar<F: Field>(value: isize) -> F {
     let abs = value.unsigned_abs();
     if value < 0 {
@@ -29,6 +29,8 @@ pub(crate) fn is_pseudo_negative<F: Field>(&value: &F) -> bool {
     value.to_u256() > (F::MAX.to_u256() >> 1)
 }
 
+/// Converts a field element to [`isize`], using [`is_pseudo_negative`] to decide when a field
+/// element is to be interpreted as a negative / wrapped-around value.
 pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
     if is_pseudo_negative(&value) {
         let abs = (F::MAX - value + F::ONE).to_u256();
