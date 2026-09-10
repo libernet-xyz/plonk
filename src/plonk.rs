@@ -1135,13 +1135,12 @@ where
         let chunks = self.get_permutation_chunks();
         let num_chunks = chunks.len();
 
-        let accumulators = {
-            // Running products of the numerators and the denominators of every cell preceding the
-            // start of each chunk, in row-major order. Accumulating the two separately lets
-            // Montgomery batch inversion invert the whole denominator vector with a single field
-            // inversion, instead of one inversion per cell.
-            let mut numerators = vec![G::ONE; self.degree_bound * num_chunks];
-            let mut denominators = vec![G::ONE; self.degree_bound * num_chunks];
+        let accumulators: Vec<Polynomial<G>> = {
+            // NOTE: `numerators` and `denominators` are `num_chunks * degree_bound` matrices in
+            // column-major order, with each column holding one partial product's running value at
+            // every row.
+            let mut numerators = vec![G::ZERO; self.degree_bound * num_chunks];
+            let mut denominators = vec![G::ZERO; self.degree_bound * num_chunks];
 
             let mut numerator = G::ONE;
             let mut denominator = G::ONE;
@@ -1149,8 +1148,8 @@ where
             for i in 0..self.degree_bound {
                 let mut generator_power = F::ONE;
                 for (c, chunk) in chunks.clone().enumerate() {
-                    numerators[i * num_chunks + c] = numerator;
-                    denominators[i * num_chunks + c] = denominator;
+                    numerators[c * self.degree_bound + i] = numerator;
+                    denominators[c * self.degree_bound + i] = denominator;
                     for j in chunk {
                         let witness_value: G = witness.get_at(Cell::new(i, j)).into();
                         numerator *= witness_value + beta * (generator_power * omega_power) + gamma;
@@ -1162,25 +1161,21 @@ where
             }
 
             if numerator != denominator {
-                return Err(anyhow!("permutation accumulator wraparound check failed"));
+                return Err(anyhow!("wire constraint violation"));
             }
 
-            G::invert_batch(&mut denominators);
-            let values: Vec<G> = numerators
-                .into_iter()
-                .zip(denominators)
-                .map(|(numerator, inverse_denominator)| numerator * inverse_denominator)
-                .collect();
+            let values: Vec<G> = {
+                G::invert_batch(&mut denominators);
+                for (numerator, inverse_denominator) in numerators.iter_mut().zip(denominators) {
+                    *numerator *= inverse_denominator;
+                }
+                numerators
+            };
 
-            (0..num_chunks)
-                .map(|c| {
-                    Polynomial::encode2(
-                        (0..self.degree_bound)
-                            .map(|i| values[i * num_chunks + c])
-                            .collect(),
-                    )
-                })
-                .collect::<Vec<Polynomial<G>>>()
+            values
+                .chunks(self.degree_bound)
+                .map(|values| Polynomial::encode2(values.to_vec()))
+                .collect()
         };
 
         let shifted = accumulators[0].clone().shift_domain_by(omega);
@@ -1579,8 +1574,6 @@ where
         let num_sigma_polynomials = self.num_columns;
         let num_witness_columns = self.num_columns;
         let permutation_chunks = self.get_permutation_chunks();
-        // The accumulator plus one partial product per chunk except the last, whose successor is
-        // the shifted accumulator rather than a polynomial of its own.
         let num_permutation_accumulators = permutation_chunks.len();
         let num_quotient_chunks = self.get_num_quotient_chunks();
         let expected_polynomials = num_gate_selectors
