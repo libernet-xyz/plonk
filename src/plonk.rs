@@ -66,12 +66,33 @@ fn get_rotation_set<'a, F: Field>(
 /// general [degree bound](`Circuit::degree_bound`) `N` because the constraint equations involve
 /// several polynomial multiplications, such as the gate selectors multiplied by the gate
 /// constraints combined with the witness columns.
+///
+/// The algorithm uses the formula `(N - 1) * E`, where `E = max(max_gate_degree, 1)`. The
+/// rationale behind it is:
+///
+/// * each column has degree less than or equal to `N - 1`;
+/// * the grand gate constraint has degree less than or equal to
+///   `(N - 1) * (1 + max_gate_degree)` (the selector contributes one factor, degree composition
+///   with the constraint columns contributes `max_gate_degree` more);
+/// * each helper authentication constraint of the permutation argument is the product of two
+///   committed columns, so it has degree less than or equal to `2 * (N - 1)`, which is where the
+///   floor of 1 on `E` comes from;
+/// * the boundary constraint has degree less than or equal to `2 * (N - 1)` too, and the
+///   recurrence constraint is linear in the committed columns, so neither exceeds the above;
+/// * the grand PLONK constraint therefore has degree less than or equal to `(N - 1) * (1 + E)`;
+/// * dividing that by the zero polynomial (`x^N - 1`, degree-N) yields a quotient with degree
+///   `(N - 1) * (1 + E) - N`;
+/// * so the degree bound of the quotient is `(N - 1) * (1 + E) - N + 1`
+/// * ... which simplifies to `(N - 1) * E`.
 fn quotient_degree_bound<'a, F: Field>(
     degree_bound: usize,
     gate_constraints: impl Iterator<Item = &'a Constraint<F>>,
 ) -> usize {
-    // TODO
-    todo!()
+    let max_gate_degree = gate_constraints
+        .map(|constraint| constraint.get_degree())
+        .max()
+        .unwrap_or(0);
+    (degree_bound - 1) * std::cmp::max(max_gate_degree, 1)
 }
 
 fn lagrange0<F: Field256>(x: F, n: usize) -> F {
@@ -1055,7 +1076,7 @@ where
     /// They are authenticated by adding the following constraints to the grand quotient:
     ///
     ///   h_{N_i}(xi) * (W_i(xi) + beta * g^i * xi + gamma) - 1 = 0 mod H
-    ///   h_{D_i}(xi) * (W_i(xi) + beta * sigma_i * xi + gamma) - 1 = 0 mod H
+    ///   h_{D_i}(xi) * (W_i(xi) + beta * sigma_i(xi) + gamma) - 1 = 0 mod H
     ///
     /// where `xi` is the master Fiat-Shamir challenge.
     ///
@@ -1092,14 +1113,14 @@ where
 
         let mut generator_power = F::ONE;
         for i in 0..self.num_columns {
-            let offset = i * self.num_columns;
+            let offset = i * self.degree_bound;
             let mut omega_power = F::ONE;
             for j in 0..self.degree_bound {
                 let witness_value: G = witness.get_at(Cell::new(j, i)).into();
                 numerator_table[offset + j] =
                     witness_value + beta * (generator_power * omega_power) + gamma;
                 denominator_table[offset + j] =
-                    witness_value + beta * (self.sigma_values[i][j] * omega_power) + gamma;
+                    witness_value + beta * self.sigma_values[i][j] + gamma;
                 omega_power *= omega_base;
             }
             generator_power *= F::MULTIPLICATIVE_GENERATOR;
@@ -1123,8 +1144,8 @@ where
             accumulator[i + 1] = accumulator[i]
                 + (0..self.num_columns)
                     .map(|j| {
-                        numerator_table[j * self.num_columns + i]
-                            - denominator_table[j * self.num_columns + i]
+                        numerator_table[j * self.degree_bound + i]
+                            - denominator_table[j * self.degree_bound + i]
                     })
                     .sum::<G>();
         }
@@ -1711,12 +1732,17 @@ where
             )
         };
 
-        let quotient: G = points[&xi][num_gate_selectors
-            + num_sigma_polynomials
-            + num_witness_columns
-            + num_permutation_accumulators
-            + num_permutation_numerator_helpers
-            + num_permutation_denominator_helpers];
+        let quotient: G = {
+            let offset = num_gate_selectors
+                + num_sigma_polynomials
+                + num_witness_columns
+                + num_permutation_accumulators
+                + num_permutation_numerator_helpers
+                + num_permutation_denominator_helpers;
+            (0..num_quotient_chunks)
+                .map(|i| points[&xi][offset + i] * xi.pow_small(i * self.degree_bound))
+                .sum()
+        };
         let zero = xi.pow_small(self.degree_bound) - G::ONE;
 
         let alpha = H::challenge(
@@ -1811,7 +1837,7 @@ mod tests {
         assert_eq!(proof.degree_bound(), 8);
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
-        assert_eq!(proof.num_polys(), 13);
+        assert_eq!(proof.num_polys(), 18);
         let circuit = circuit.to_compressed(options);
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
@@ -1964,7 +1990,7 @@ mod tests {
         assert_eq!(proof.degree_bound(), 8);
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(proof.extended_domain_size(), 8 << blowup_log2);
-        assert_eq!(proof.num_polys(), 16);
+        assert_eq!(proof.num_polys(), 22);
         let circuit = circuit.to_compressed(options);
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
