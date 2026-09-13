@@ -1,6 +1,6 @@
 use crate::chip::Chip;
 use crate::expr::{Constraint, Variable};
-use crate::utils::{self, padded_circuit_size};
+use crate::utils::{self, encode_cell, encode_usize, padded_circuit_size};
 use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
@@ -36,6 +36,8 @@ static DST_GAMMA: LazyLock<H256> =
 
 static DST_DELTA: LazyLock<H256> =
     LazyLock::new(|| utils::make_dst(b"starkom/plonk/challenge/delta"));
+
+static DST_PSI: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/plonk/challenge/psi"));
 
 static DST_XI: LazyLock<H256> = LazyLock::new(|| utils::make_dst(b"starkom/plonk/challenge/xi"));
 
@@ -97,6 +99,26 @@ fn quotient_degree_bound<'a, F: Field>(
 
 fn lagrange0<F: Field256>(x: F, n: usize) -> F {
     (x.pow_small(n) - F::ONE) * (F::from(n as u64) * (x - F::ONE)).invert_unwrap()
+}
+
+/// Derives the Fiat-Shamir challenge used to batch the public cell constraints of all columns in a
+/// single constraint. See [`Circuit::build_public_cell_constraint`] for details.
+///
+/// NOTE: the claimed public values MUST be part of the transcript. The witness polynomials are
+/// domain-shifted by the DEEP layer in the PCS before getting committed to any Merkle tree, so none
+/// of the Merkle roots provided by the PCS are bound to the public inputs.
+fn public_cell_challenge<F: Field, G: Field256, H: Hasher<G>>(
+    transcript_hash: H256,
+    public_inputs: &BTreeMap<Cell, F>,
+) -> G {
+    let mut transcript = Vec::with_capacity(public_inputs.len() * 2 + 2);
+    transcript.push(transcript_hash);
+    transcript.push(encode_usize(public_inputs.len()));
+    for (cell, value) in public_inputs {
+        transcript.push(encode_cell(*cell));
+        transcript.push(H256::from_slice(&value.to_u256().to_big_endian()));
+    }
+    H::challenge(*DST_PSI, transcript.as_slice())
 }
 
 /// Circuit compilation & proving options.
@@ -419,8 +441,8 @@ where
     /// Cell partitioning inferred from the connections made with [`Self::connect`].
     partitioner: Partitioner,
 
-    /// List of rows that are revealed in the proofs.
-    public_rows: BTreeSet<usize>,
+    /// List of cells that are revealed in the proofs.
+    public_cells: BTreeSet<Cell>,
 
     _data: PhantomData<G>,
 }
@@ -479,8 +501,8 @@ where
     ///
     /// Ideally you should call this method only once after adding all gates, right before
     /// [`Self::build`].
-    pub fn declare_public_rows<I: IntoIterator<Item = usize>>(&mut self, gates: I) {
-        self.public_rows = BTreeSet::from_iter(gates);
+    pub fn declare_public_cells<I: IntoIterator<Item = Cell>>(&mut self, cells: I) {
+        self.public_cells = BTreeSet::from_iter(cells);
     }
 
     fn make_selector(degree_bound: usize, activation_row_set: BTreeSet<usize>) -> Polynomial<F> {
@@ -613,7 +635,7 @@ where
             gates,
             sigma,
             sigma_values,
-            public_rows: self.public_rows,
+            public_cells: self.public_cells,
             _data: PhantomData,
         })
     }
@@ -729,7 +751,7 @@ where
 /// The API in the implementation mostly mirrors that of the underlying PCS proof.
 #[derive(Debug, Clone)]
 pub struct Proof<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
-    openings: BTreeMap<Cell, F>,
+    public_inputs: BTreeMap<Cell, F>,
     commitment: pcs::Commitment<G, H>,
     inner_proof: pcs::Proof<G, H>,
     _data: PhantomData<F>,
@@ -761,9 +783,9 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
         self.inner_proof.num_polys()
     }
 
-    /// Returns a reference to the opened witness locations.
-    pub fn openings(&self) -> &BTreeMap<Cell, F> {
-        &self.openings
+    /// Returns a reference to the map of the revealed witness locations and corresponding values.
+    pub fn public_inputs(&self) -> &BTreeMap<Cell, F> {
+        &self.public_inputs
     }
 }
 
@@ -815,8 +837,8 @@ where
     /// The layout is analogous to [`Self::sigma`] itself: the values are indexed column-first.
     sigma_values: Vec<Vec<F>>,
 
-    /// List of gates that are revealed in the proofs. Each element is a row index.
-    public_rows: BTreeSet<usize>,
+    /// List of witness cells that are revealed in the proofs.
+    public_cells: BTreeSet<Cell>,
 
     _data: PhantomData<G>,
 }
@@ -845,8 +867,8 @@ where
             .sum()
     }
 
-    pub fn public_rows(&self) -> &BTreeSet<usize> {
-        &self.public_rows
+    pub fn public_cells(&self) -> &BTreeSet<Cell> {
+        &self.public_cells
     }
 
     /// Makes an empty [`Witness`] objects suitable for use with this circuit.
@@ -1196,6 +1218,59 @@ where
         ))
     }
 
+    /// Builds the constraint that binds every [public cell](Self::public_cells) to its claimed
+    /// value.
+    ///
+    /// Writing `S_j` for the selector of the public cells of column `j`, `W_j` for the j-th witness
+    /// column, and `v_{ij}` for the claimed value of cell `(i, j)`, the constraint of a single
+    /// column is:
+    ///
+    ///   S_j(X) * W_j(X) - PI_j(X) = 0 mod H
+    ///
+    /// with `PI_j` interpolating `v_{ij}` at every public row of column `j` and zero elsewhere: at
+    /// a public row that reduces to `W_j(w^i) = v_{ij}`, while at all other rows both terms vanish
+    /// identically, leaving the rest of the row unconstrained (and therefore still private).
+    ///
+    /// All columns are batched in a single constraint with the powers of the
+    /// [`psi`](`public_cell_challenge`) challenge:
+    ///
+    ///   Sum(psi^j * S_j(X) * W_j(X)) - PI(X) = 0 mod H
+    ///
+    /// where `PI` interpolates `Sum(psi^j * v_{ij})` at every row. Note that `S_j` is entirely
+    /// determined by public information, so it's never committed: the verifier reconstructs
+    /// `S_j(xi)` in closed form out of the Lagrange bases of the public rows.
+    ///
+    /// The resulting constraint has degree `2 * (N - 1)`, so it never exceeds the
+    /// [quotient degree bound](`quotient_degree_bound`).
+    fn build_public_cell_constraint(
+        &self,
+        columns: &[Polynomial<F>],
+        public_inputs: &BTreeMap<Cell, F>,
+        psi: G,
+    ) -> Polynomial<G> {
+        let mut cells_by_column: BTreeMap<usize, Vec<(usize, F)>> = BTreeMap::new();
+        for (cell, &value) in public_inputs {
+            cells_by_column
+                .entry(cell.column())
+                .or_default()
+                .push((cell.row(), value));
+        }
+        let mut public_inputs = vec![G::ZERO; self.degree_bound];
+        let mut constraint = Polynomial::<G>::default();
+        for (&column_index, cells) in &cells_by_column {
+            let power = psi.pow_small(column_index);
+            let mut selector = vec![F::ZERO; self.degree_bound];
+            for &(row, value) in cells {
+                selector[row] = F::ONE;
+                public_inputs[row] += power * value;
+            }
+            constraint += Self::embed_polynomial(&Polynomial::encode2(selector)).multiply(
+                Self::embed_and_scale_polynomial(&columns[column_index], power),
+            );
+        }
+        constraint - Polynomial::encode2(public_inputs)
+    }
+
     /// Splits the quotient polynomial in chunks so that it can be batch-committed even though its
     /// degree is much higher than the bound configured in the underlying PCS.
     fn split_quotient(&self, quotient: Polynomial<G>) -> Vec<Polynomial<G>> {
@@ -1302,6 +1377,17 @@ where
                 .collect(),
         );
 
+        let public_inputs: BTreeMap<Cell, F> = self
+            .public_cells
+            .iter()
+            .map(|&cell| (cell, witness.get_at(cell)))
+            .collect();
+
+        let public_cell_constraint = {
+            let psi = public_cell_challenge::<F, G, H>(committer.transcript_hash(), &public_inputs);
+            self.build_public_cell_constraint(columns.as_slice(), &public_inputs, psi)
+        };
+
         let alpha = H::challenge(*DST_ALPHA, &[committer.transcript_hash()]);
 
         let quotient = {
@@ -1316,6 +1402,8 @@ where
                 power *= alpha;
             }
             constraint += permutation_recurrence_constraint * power;
+            power *= alpha;
+            constraint += public_cell_constraint * power;
             constraint.divide_by_zero(self.degree_bound)?
         };
         committer.add_batch(self.split_quotient(quotient));
@@ -1328,27 +1416,12 @@ where
                 .map(|rotation| {
                     xi * if rotation < 0 { omega_inv } else { omega }
                         .pow_small(rotation.unsigned_abs())
-                })
-                .chain(self.public_rows.iter().map(|&row| omega.pow_small(row))),
+                }),
         ));
         let inner_proof = prover.prove(&commitment);
 
-        let openings = self
-            .public_rows
-            .iter()
-            .map(|&row| {
-                (0..self.num_columns)
-                    .map(|column_index| {
-                        let cell = witness.cell(row, column_index);
-                        (cell, witness.get_at(cell))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .flatten()
-            .collect();
-
         Ok(Proof {
-            openings,
+            public_inputs,
             commitment,
             inner_proof,
             _data: PhantomData,
@@ -1371,7 +1444,7 @@ where
                 .into_iter()
                 .map(|(constraint, instances)| (constraint, instances.into_iter().collect()))
                 .collect(),
-            public_rows: self.public_rows,
+            public_cells: self.public_cells,
             circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
             _data: PhantomData,
         }
@@ -1395,7 +1468,7 @@ where
                     (constraint.clone(), instances.iter().cloned().collect())
                 })
                 .collect(),
-            public_rows: self.public_rows.clone(),
+            public_cells: self.public_cells.clone(),
             circuit_commitment: committer.root_hash(COMMIT_INDEX_CIRCUIT),
             _data: Default::default(),
         }
@@ -1443,8 +1516,8 @@ where
     /// second component is the set of instances of that gate across the circuit.
     gates: Vec<(Constraint<F>, Vec<GateInstance>)>,
 
-    /// List of rows that are revealed in the proofs.
-    public_rows: BTreeSet<usize>,
+    /// List of witness cells that are revealed in the proofs.
+    public_cells: BTreeSet<Cell>,
 
     /// Merkle root of the circuit selectors and sigma polynomials.
     circuit_commitment: H256,
@@ -1469,8 +1542,8 @@ where
         self.num_columns
     }
 
-    pub fn public_rows(&self) -> &BTreeSet<usize> {
-        &self.public_rows
+    pub fn public_cells(&self) -> &BTreeSet<Cell> {
+        &self.public_cells
     }
 
     pub fn commitment(&self) -> H256 {
@@ -1488,11 +1561,11 @@ where
         .div_ceil(self.degree_bound)
     }
 
-    /// Verifies a [`Proof`], returning the map of proven public values if successful or an error
+    /// Verifies a [`Proof`], returning the map of proven public inputs if successful or an error
     /// otherwise.
     ///
-    /// The returned map will have exactly `N` entries for every row in [`Self::public_rows`], with
-    /// `N` being the [number of columns](`Self::num_columns`).
+    /// The returned map has exactly one entry for every cell in [`Self::public_cells`]. Any extra
+    /// opening the proof may carry is ignored.
     pub fn verify(&self, proof: &Proof<F, G, H>) -> Result<BTreeMap<Cell, F>> {
         let commitment = &proof.commitment;
         let inner_proof = &proof.inner_proof;
@@ -1581,38 +1654,18 @@ where
             }
         }
 
-        let openings = proof.openings();
-        for &row in &self.public_rows {
-            let z = omega.pow_small_vartime(row);
-            let offset = num_gate_selectors + num_sigma_polynomials;
-            match points.get(&z) {
-                Some(values) => {
-                    for column_index in 0..self.num_columns {
-                        match openings.get(&Cell::new(row, column_index)) {
-                            Some(&value) => {
-                                if G::from(value) != values[offset + column_index] {
-                                    return Err(anyhow!(
-                                        "incorrect value opened at ({row}, {column_index}): got {}, want {}",
-                                        value,
-                                        values[column_index]
-                                    ));
-                                }
-                            }
-                            None => {
-                                return Err(anyhow!(
-                                    "the proof doesn't have an opening for public cell ({row}, {column_index})"
-                                ));
-                            }
-                        }
-                    }
-                }
-                None => {
-                    return Err(anyhow!(
-                        "the proof doesn't have an opening for public row {row}"
-                    ));
-                }
-            }
-        }
+        let public_inputs: BTreeMap<Cell, F> = self
+            .public_cells
+            .iter()
+            .map(|&cell| match proof.public_inputs().get(&cell) {
+                Some(&value) => Ok((cell, value)),
+                None => Err(anyhow!(
+                    "the proof doesn't have an opening for public cell ({}, {})",
+                    cell.row(),
+                    cell.column()
+                )),
+            })
+            .collect::<Result<_>>()?;
 
         inner_proof.verify(&commitment)?;
 
@@ -1693,16 +1746,18 @@ where
             &[commitment.transcript_hash(COMMIT_INDEX_WITNESS + 1)],
         );
 
+        let witness_columns: Vec<G> = {
+            let offset = num_gate_selectors + num_sigma_polynomials;
+            (0..self.num_columns)
+                .map(|i| points[&xi][offset + i])
+                .collect()
+        };
+
         let (
             permutation_numerator_constraints,
             permutation_denominator_constraints,
             permutation_recurrence_constraint,
         ) = {
-            let witness_offset = num_gate_selectors + num_sigma_polynomials;
-            let witness_columns: Vec<G> = (0..self.num_columns)
-                .map(|i| points[&xi][witness_offset + i])
-                .collect();
-
             let mut generator_power = F::ONE;
             let (numerator_constraints, denominator_constraints): (Vec<G>, Vec<G>) = (0..self
                 .num_columns)
@@ -1753,6 +1808,37 @@ where
         let permutation_boundary_constraint =
             permutation_accumulator * lagrange0(xi, self.degree_bound);
 
+        let public_cell_constraint: G = {
+            let psi = public_cell_challenge::<F, G, H>(
+                commitment.transcript_hash(COMMIT_INDEX_PERMUTATION_ARGUMENT + 1),
+                &public_inputs,
+            );
+            let rows: Vec<usize> = public_inputs
+                .keys()
+                .map(Cell::row)
+                .collect::<BTreeSet<usize>>()
+                .into_iter()
+                .collect();
+            let mut lagrange: Vec<G> = rows
+                .iter()
+                .map(|&row| G::from(self.degree_bound as u64) * (xi - omega.pow_small_vartime(row)))
+                .collect();
+            G::invert_batch(lagrange.as_mut_slice());
+            let lagrange: BTreeMap<usize, G> = rows
+                .iter()
+                .zip(lagrange)
+                .map(|(&row, inverse)| (row, omega.pow_small_vartime(row) * zero * inverse))
+                .collect();
+            public_inputs
+                .iter()
+                .map(|(cell, &value)| {
+                    psi.pow_small(cell.column())
+                        * lagrange[&cell.row()]
+                        * (witness_columns[cell.column()] - G::from(value))
+                })
+                .sum()
+        };
+
         let full_constraint = {
             let mut result = gate_constraint + alpha * permutation_boundary_constraint;
             let mut power = alpha.square();
@@ -1765,13 +1851,15 @@ where
                 power *= alpha;
             }
             result += power * permutation_recurrence_constraint;
+            power *= alpha;
+            result += power * public_cell_constraint;
             result
         };
         if full_constraint != quotient * zero {
             return Err(anyhow!("constraint violation"));
         }
 
-        Ok(openings.clone())
+        Ok(public_inputs)
     }
 }
 
@@ -1813,7 +1901,7 @@ mod tests {
         builder.connect(cell(0, 0).into(), cell(2, 0).into());
         builder.connect(cell(1, 2).into(), cell(2, 1).into());
         builder.add_gate(2, Constraint::nop());
-        builder.declare_public_rows([2]);
+        builder.declare_public_cells([cell(2, 0), cell(2, 1)]);
         let circuit = builder.build(CompilationOptions {
             canonicalize_constraints,
         })?;
@@ -1837,7 +1925,10 @@ mod tests {
         let proof = circuit.prove::<H>(witness, options.clone())?;
         assert_eq!(proof.degree_bound(), expected_degree_bound);
         assert_eq!(proof.blowup_log2(), blowup_log2);
-        assert_eq!(proof.extended_domain_size(), expected_degree_bound << blowup_log2);
+        assert_eq!(
+            proof.extended_domain_size(),
+            expected_degree_bound << blowup_log2
+        );
         assert_eq!(proof.num_polys(), 18);
         let circuit = circuit.to_compressed(options);
         assert_eq!(circuit.commitment(), commitment);
@@ -1962,7 +2053,7 @@ mod tests {
         builder.connect(y.into(), y_out.into());
         let result_out = cell(3, 2);
         builder.connect(result.into(), result_out.into());
-        builder.declare_public_rows([3]);
+        builder.declare_public_cells([x_out, y_out, result_out]);
         let circuit = builder.build(CompilationOptions {
             canonicalize_constraints,
         })?;
@@ -1991,7 +2082,10 @@ mod tests {
         let proof = circuit.prove::<H>(witness, options.clone())?;
         assert_eq!(proof.degree_bound(), expected_degree_bound);
         assert_eq!(proof.blowup_log2(), blowup_log2);
-        assert_eq!(proof.extended_domain_size(), expected_degree_bound << blowup_log2);
+        assert_eq!(
+            proof.extended_domain_size(),
+            expected_degree_bound << blowup_log2
+        );
         assert_eq!(proof.num_polys(), 22);
         let circuit = circuit.to_compressed(options);
         assert_eq!(circuit.commitment(), commitment);
@@ -2039,7 +2133,7 @@ mod tests {
         builder.connect(cell(0, 0).into(), cell(2, 0).into());
         builder.connect(cell(1, 2).into(), cell(2, 1).into());
         builder.add_gate(2, Constraint::nop());
-        builder.declare_public_rows([2]);
+        builder.declare_public_cells([cell(2, 0), cell(2, 1)]);
         builder
             .build(CompilationOptions {
                 canonicalize_constraints: false,
@@ -2114,5 +2208,61 @@ mod tests {
         witness.set(cell(2, 1), from_const(35));
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("wire constraint violated"));
+    }
+
+    fn prove_vitalik_circuit() -> (
+        CompressedCircuit<BS, BS, Sha2Hash<BS>>,
+        Proof<BS, BS, Sha2Hash<BS>>,
+    ) {
+        let circuit = build_vitalik_circuit();
+        let mut witness = circuit.make_witness();
+        witness.set(cell(0, 0), from_const(3));
+        witness.set(cell(0, 1), from_const(9));
+        witness.set(cell(1, 0), from_const(3));
+        witness.set(cell(1, 1), from_const(9));
+        witness.set(cell(1, 2), from_const(35));
+        witness.set(cell(2, 0), from_const(3));
+        witness.set(cell(2, 1), from_const(35));
+        let options = ProvingOptions { blowup_log2: 1 };
+        let proof = circuit.prove(witness, options.clone()).unwrap();
+        (circuit.to_compressed(options), proof)
+    }
+
+    #[test]
+    fn test_public_cells_are_proven() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_tampered_public_cell_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        proof.public_inputs.insert(cell(2, 1), from_const(36));
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(error.to_string().contains("constraint violation"));
+    }
+
+    #[test]
+    fn test_missing_public_cell_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        proof.public_inputs.remove(&cell(2, 1));
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("doesn't have an opening for public cell")
+        );
+    }
+
+    #[test]
+    fn test_extra_opening_is_not_reported_as_public() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        proof.public_inputs.insert(cell(1, 2), from_const(35));
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert!(!public_inputs.contains_key(&cell(1, 2)));
     }
 }

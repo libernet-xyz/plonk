@@ -1,3 +1,4 @@
+use crate::witness::Cell;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
 use sha3::Digest;
@@ -9,6 +10,21 @@ pub(crate) fn make_dst(s: &'static [u8]) -> H256 {
     let mut hasher = sha3::Sha3_256::new();
     hasher.update(s);
     H256::from_slice(hasher.finalize().as_slice())
+}
+
+/// Encodes a [`usize`] into an [`H256`] for use in Fiat-Shamir transcripts.
+pub(crate) fn encode_usize(value: usize) -> H256 {
+    let mut bytes = [0u8; 32];
+    bytes[24..32].copy_from_slice(&(value as u64).to_be_bytes());
+    H256::from_slice(&bytes)
+}
+
+/// Encodes a [`Cell`] into an [`H256`] for use in Fiat-Shamir transcripts.
+pub(crate) fn encode_cell(cell: Cell) -> H256 {
+    let mut bytes = [0u8; 32];
+    bytes[8..16].copy_from_slice(&(cell.row() as u64).to_be_bytes());
+    bytes[24..32].copy_from_slice(&(cell.column() as u64).to_be_bytes());
+    H256::from_slice(&bytes)
 }
 
 /// Converts an [`isize`] to a field element, wrapping negative values around.
