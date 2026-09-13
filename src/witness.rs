@@ -426,7 +426,7 @@ impl<F: Field> Witness<F> {
         num_columns: usize,
         rotations: R,
     ) -> Self {
-        let (degree_bound, num_blinding_rows) = padded_circuit_size(num_rows, rotations);
+        let (degree_bound, num_blinding_rows) = padded_circuit_size::<F>(num_rows, rotations);
         Self {
             num_rows,
             num_blinding_rows,
