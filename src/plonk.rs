@@ -69,18 +69,20 @@ fn get_rotation_set<'a, F: Field>(
 /// several polynomial multiplications, such as the gate selectors multiplied by the gate
 /// constraints combined with the witness columns.
 ///
-/// The algorithm uses the formula `(N - 1) * E`, where `E = max(max_gate_degree, 1)`. The
-/// rationale behind it is:
+/// The algorithm uses the formula `(N - 1) * E`, where `E = max(max_gate_degree, 2)`. The rationale
+/// behind it is:
 ///
 /// * each column has degree less than or equal to `N - 1`;
 /// * the grand gate constraint has degree less than or equal to
 ///   `(N - 1) * (1 + max_gate_degree)` (the selector contributes one factor, degree composition
 ///   with the constraint columns contributes `max_gate_degree` more);
-/// * each helper authentication constraint of the permutation argument is the product of two
-///   committed columns, so it has degree less than or equal to `2 * (N - 1)`, which is where the
-///   floor of 1 on `E` comes from;
-/// * the boundary constraint has degree less than or equal to `2 * (N - 1)` too, and the
-///   recurrence constraint is linear in the committed columns, so neither exceeds the above;
+/// * each helper authentication constraint of the permutation argument is the product of three
+///   polynomials of degree less than `N` (the helper column, the numerator factor, and the
+///   denominator factor), so it has degree less than or equal to `3 * (N - 1)`, which is where the
+///   floor of 2 on `E` comes from;
+/// * the boundary and public cell constraints have degree less than or equal to `2 * (N - 1)`, and
+///   the recurrence constraint is linear in the committed columns, so none of them exceeds the
+///   above;
 /// * the grand PLONK constraint therefore has degree less than or equal to `(N - 1) * (1 + E)`;
 /// * dividing that by the zero polynomial (`x^N - 1`, degree-N) yields a quotient with degree
 ///   `(N - 1) * (1 + E) - N`;
@@ -94,7 +96,7 @@ fn quotient_degree_bound<'a, F: Field>(
         .map(|constraint| constraint.get_degree())
         .max()
         .unwrap_or(0);
-    (degree_bound - 1) * std::cmp::max(max_gate_degree, 1)
+    (degree_bound - 1) * std::cmp::max(max_gate_degree, 2)
 }
 
 fn lagrange0<F: Field256>(x: F, n: usize) -> F {
@@ -1059,8 +1061,7 @@ where
 
     /// Builds the polynomials used in the LogUp permutation argument. The components of the
     /// returned tuple are, respectively: the accumulator, the boundary constraint, the helper
-    /// columns for the numerators, the helper columns for the denominators, and the recurrence
-    /// constraint.
+    /// columns, the helper authentication constraints, and the recurrence constraint.
     ///
     /// We use the Fiat-Shamir challenge `gamma` as the LogUp abstract variable. The numerator
     /// factors of the standard PLONK permutation argument are:
@@ -1087,25 +1088,27 @@ where
     ///   [log(N(X))]' = Sum(1 / (W_i(X) + beta * g^i * X + gamma))
     ///   [log(D(X))]' = Sum(1 / (W_i(X) + beta * sigma_i(X) + gamma))
     ///
-    /// Our helper polynomial columns are the interpolants of the rational values materialized at
-    /// every row:
+    /// Rather than committing one helper column per fraction we pair the numerator and the
+    /// denominator of every witness column, so that a single helper column per witness column
+    /// interpolates the difference of the two rational values materialized at every row:
     ///
-    ///   h_{N_i}(X) = FFT^-1(1 / (W_i(X) + beta * g^i * X + gamma))
-    ///   h_{D_i}(X) = FFT^-1(1 / (W_i(X) + beta * sigma_i(X) + gamma))
+    ///   h_i(X) = FFT^-1(1 / N_i(X) - 1 / D_i(X))
     ///
     /// (`FFT^-1` is the inverse Fourier Transform, as implemented in [`Polynomial::encode2`].)
     ///
-    /// They are authenticated by adding the following constraints to the grand quotient:
+    /// Since `1 / N - 1 / D = (D - N) / (N * D)`, the helpers are authenticated by adding the
+    /// following constraint to the grand quotient:
     ///
-    ///   h_{N_i}(xi) * (W_i(xi) + beta * g^i * xi + gamma) - 1 = 0 mod H
-    ///   h_{D_i}(xi) * (W_i(xi) + beta * sigma_i(xi) + gamma) - 1 = 0 mod H
+    ///   h_i(X) * N_i(X) * D_i(X) + N_i(X) - D_i(X) = 0 mod H
     ///
-    /// where `xi` is the master Fiat-Shamir challenge.
+    /// which pins `h_i` to the intended value at every row where `N_i * D_i` doesn't vanish; the
+    /// probability of `N_i` or `D_i` vanishing at some row is negligible over the choice of
+    /// `gamma`.
     ///
     /// The boundary and recurrence constraints of the log-derived accumulator are:
     ///
     ///   Z(X) * L_0(X) = 0 mod H
-    ///   Z(wX) - Z(X) - Sum(h_{N_i}(X)) + Sum(h_{D_i}(X)) = 0 mod H
+    ///   Z(wX) - Z(X) - Sum(h_i(X)) = 0 mod H
     ///
     /// where [`L_0`](`lagrange0`) is the Lagrange basis that activates at w^0 = 1 and vanishes
     /// everywhere else.
@@ -1117,10 +1120,8 @@ where
     ) -> Result<(
         Polynomial<G>,      // accumulator
         Polynomial<G>,      // boundary constraint
-        Vec<Polynomial<G>>, // numerator helpers
-        Vec<Polynomial<G>>, // numerator helper constraints
-        Vec<Polynomial<G>>, // denominator helpers
-        Vec<Polynomial<G>>, // denominator helper constraints
+        Vec<Polynomial<G>>, // helper columns
+        Vec<Polynomial<G>>, // helper constraints
         Polynomial<G>,      // recurrence constraint
     )> {
         let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
@@ -1152,7 +1153,6 @@ where
             .chunks(self.degree_bound)
             .map(|helper| Polynomial::encode2(helper.iter().copied().collect()))
             .collect();
-
         let denominators: Vec<Polynomial<G>> = denominator_table
             .chunks(self.degree_bound)
             .map(|helper| Polynomial::encode2(helper.iter().copied().collect()))
@@ -1178,42 +1178,46 @@ where
 
         let accumulator = Polynomial::<G>::encode2(accumulator);
 
-        let numerator_helpers: Vec<Polynomial<G>> = numerator_table
+        let helpers: Vec<Polynomial<G>> = numerator_table
             .chunks(self.degree_bound)
-            .map(|helper| Polynomial::encode2(helper.iter().copied().collect()))
+            .zip(denominator_table.chunks(self.degree_bound))
+            .map(|(numerators, denominators)| {
+                Polynomial::encode2(
+                    numerators
+                        .iter()
+                        .zip(denominators.iter())
+                        .map(|(&numerator, &denominator)| numerator - denominator)
+                        .collect(),
+                )
+            })
             .collect();
 
-        let denominator_helpers: Vec<Polynomial<G>> = denominator_table
-            .chunks(self.degree_bound)
-            .map(|helper| Polynomial::encode2(helper.iter().copied().collect()))
-            .collect();
-
-        let numerator_helper_constraints: Vec<Polynomial<G>> = numerator_helpers
+        let identity = Polynomial::with_coefficients(vec![F::ZERO, F::ONE]);
+        let helper_constraints: Vec<Polynomial<G>> = helpers
             .iter()
-            .zip(numerators.into_iter())
-            .map(|(helper, inverse_helper)| helper.clone().multiply(inverse_helper) - G::ONE)
-            .collect();
-
-        let denominator_helper_constraints: Vec<Polynomial<G>> = denominator_helpers
-            .iter()
-            .zip(denominators.into_iter())
-            .map(|(helper, inverse_helper)| helper.clone().multiply(inverse_helper) - G::ONE)
+            .zip(numerators.into_iter().zip(denominators.into_iter()))
+            .enumerate()
+            .map(|(i, (helper, (numerator, denominator)))| {
+                Polynomial::multiply_batch([helper, &numerator, &denominator])
+                    + Self::embed_and_scale_polynomial(
+                        &(identity.clone() * F::MULTIPLICATIVE_GENERATOR.pow_small_vartime(i)
+                            - self.sigma[i].clone()),
+                        beta,
+                    )
+            })
             .collect();
 
         let boundary_constraint =
             accumulator.clone() * Polynomial::lagrange0_2(self.degree_bound).clone();
         let recurrence_constraint = accumulator.clone().shift_domain_by(omega)
             - accumulator.clone()
-            - numerator_helpers.iter().sum::<Polynomial<G>>()
-            + denominator_helpers.iter().sum::<Polynomial<G>>();
+            - helpers.iter().sum::<Polynomial<G>>();
 
         Ok((
             accumulator,
             boundary_constraint,
-            numerator_helpers,
-            numerator_helper_constraints,
-            denominator_helpers,
-            denominator_helper_constraints,
+            helpers,
+            helper_constraints,
             recurrence_constraint,
         ))
     }
@@ -1360,10 +1364,8 @@ where
         let (
             permutation_accumulator,
             permutation_boundary_constraint,
-            permutation_numerator_helpers,
-            permutation_numerator_helper_constraints,
-            permutation_denominator_helpers,
-            permutation_denominator_helper_constraints,
+            permutation_helpers,
+            permutation_helper_constraints,
             permutation_recurrence_constraint,
         ) = {
             let beta = H::challenge(*DST_BETA, &[committer.transcript_hash()]);
@@ -1372,8 +1374,7 @@ where
         };
         committer.add_batch(
             std::iter::once(permutation_accumulator)
-                .chain(permutation_numerator_helpers.into_iter())
-                .chain(permutation_denominator_helpers.into_iter())
+                .chain(permutation_helpers.into_iter())
                 .collect(),
         );
 
@@ -1393,12 +1394,8 @@ where
         let quotient = {
             let mut constraint = gate_constraint + permutation_boundary_constraint * alpha;
             let mut power = alpha.square();
-            for permutation_numerator_constraint in permutation_numerator_helper_constraints {
-                constraint += permutation_numerator_constraint * power;
-                power *= alpha;
-            }
-            for permutation_denomimator_constraint in permutation_denominator_helper_constraints {
-                constraint += permutation_denomimator_constraint * power;
+            for permutation_helper_constraint in permutation_helper_constraints {
+                constraint += permutation_helper_constraint * power;
                 power *= alpha;
             }
             constraint += permutation_recurrence_constraint * power;
@@ -1614,15 +1611,13 @@ where
         let num_sigma_polynomials = self.num_columns;
         let num_witness_columns = self.num_columns;
         let num_permutation_accumulators = 1;
-        let num_permutation_numerator_helpers = self.num_columns;
-        let num_permutation_denominator_helpers = self.num_columns;
+        let num_permutation_helpers = self.num_columns;
         let num_quotient_chunks = self.get_num_quotient_chunks();
         let expected_polynomials = num_gate_selectors
             + num_sigma_polynomials
             + num_witness_columns
             + num_permutation_accumulators
-            + num_permutation_numerator_helpers
-            + num_permutation_denominator_helpers
+            + num_permutation_helpers
             + num_quotient_chunks;
 
         if inner_proof.num_polys() != expected_polynomials {
@@ -1717,21 +1712,11 @@ where
             let index = num_gate_selectors + num_sigma_polynomials + num_witness_columns;
             (points[&xi][index], points[&(xi * omega)][index])
         };
-        let permutation_numerator_helpers: Vec<G> = {
+        let permutation_helpers: Vec<G> = {
             let offset = num_gate_selectors
                 + num_sigma_polynomials
                 + num_witness_columns
                 + num_permutation_accumulators;
-            (0..self.num_columns)
-                .map(|i| points[&xi][offset + i])
-                .collect()
-        };
-        let permutation_denominator_helpers: Vec<G> = {
-            let offset = num_gate_selectors
-                + num_sigma_polynomials
-                + num_witness_columns
-                + num_permutation_accumulators
-                + num_permutation_numerator_helpers;
             (0..self.num_columns)
                 .map(|i| points[&xi][offset + i])
                 .collect()
@@ -1753,38 +1738,22 @@ where
                 .collect()
         };
 
-        let (
-            permutation_numerator_constraints,
-            permutation_denominator_constraints,
-            permutation_recurrence_constraint,
-        ) = {
+        let (permutation_helper_constraints, permutation_recurrence_constraint) = {
             let mut generator_power = F::ONE;
-            let (numerator_constraints, denominator_constraints): (Vec<G>, Vec<G>) = (0..self
-                .num_columns)
+            let helper_constraints: Vec<G> = (0..self.num_columns)
                 .map(|i| {
-                    let constraints = (
-                        permutation_numerator_helpers[i]
-                            * (witness_columns[i] + beta * generator_power * xi + gamma)
-                            - G::ONE,
-                        permutation_denominator_helpers[i]
-                            * (witness_columns[i] + beta * sigma[i] + gamma)
-                            - G::ONE,
-                    );
+                    let constraints = permutation_helpers[i]
+                        * (witness_columns[i] + beta * generator_power * xi + gamma)
+                        * (witness_columns[i] + beta * sigma[i] + gamma)
+                        + beta * (generator_power * xi - sigma[i]);
                     generator_power *= F::MULTIPLICATIVE_GENERATOR;
                     constraints
                 })
-                .unzip();
-
+                .collect();
             let recurrence_constraint = shifted_permutation_accumulator
                 - permutation_accumulator
-                - permutation_numerator_helpers.into_iter().sum::<G>()
-                + permutation_denominator_helpers.into_iter().sum::<G>();
-
-            (
-                numerator_constraints,
-                denominator_constraints,
-                recurrence_constraint,
-            )
+                - permutation_helpers.into_iter().sum::<G>();
+            (helper_constraints, recurrence_constraint)
         };
 
         let quotient: G = {
@@ -1792,8 +1761,7 @@ where
                 + num_sigma_polynomials
                 + num_witness_columns
                 + num_permutation_accumulators
-                + num_permutation_numerator_helpers
-                + num_permutation_denominator_helpers;
+                + num_permutation_helpers;
             (0..num_quotient_chunks)
                 .map(|i| points[&xi][offset + i] * xi.pow_small(i * self.degree_bound))
                 .sum()
@@ -1842,11 +1810,7 @@ where
         let full_constraint = {
             let mut result = gate_constraint + alpha * permutation_boundary_constraint;
             let mut power = alpha.square();
-            for constraint in permutation_numerator_constraints {
-                result += power * constraint;
-                power *= alpha;
-            }
-            for constraint in permutation_denominator_constraints {
+            for constraint in permutation_helper_constraints {
                 result += power * constraint;
                 power *= alpha;
             }
@@ -1929,7 +1893,7 @@ mod tests {
             proof.extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
-        assert_eq!(proof.num_polys(), 18);
+        assert_eq!(proof.num_polys(), 15);
         let circuit = circuit.to_compressed(options);
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
@@ -2086,7 +2050,7 @@ mod tests {
             proof.extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
-        assert_eq!(proof.num_polys(), 22);
+        assert_eq!(proof.num_polys(), 18);
         let circuit = circuit.to_compressed(options);
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
