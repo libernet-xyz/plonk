@@ -405,12 +405,6 @@ pub struct Witness<F: Field> {
     /// The number of witness rows *not* including the blinding rows.
     num_rows: usize,
 
-    /// Number of blinding rows used in the circuit.
-    ///
-    /// This is calculated by [`padded_circuit_size`] and depends on how many different variable
-    /// rotations were used across all constraints.
-    num_blinding_rows: usize,
-
     /// Padded circuit size, including the blinding rows and rounded up to the next power of 2.
     degree_bound: usize,
 
@@ -426,10 +420,9 @@ impl<F: Field> Witness<F> {
         num_columns: usize,
         rotations: R,
     ) -> Self {
-        let (degree_bound, num_blinding_rows) = padded_circuit_size::<F>(num_rows, rotations);
+        let degree_bound = padded_circuit_size::<F>(num_rows, rotations);
         Self {
             num_rows,
-            num_blinding_rows,
             degree_bound,
             data: vec![vec![F::ZERO; degree_bound]; num_columns],
         }
@@ -467,10 +460,14 @@ impl<F: Field> Witness<F> {
 
     /// Fills in the blinding rows of the witness with random values.
     ///
-    /// The affected rows are the last [`Self::num_blinding_rows`] before the power-of-two padding.
+    /// All padding rows are used as blinding rows, so they are always exactly
+    /// [`degree_bound`](`Self::degree_bound`) - [`num_rows`](`Self::num_rows`). The `degree_bound`
+    /// is calculated upstream by [`padded_circuit_size`], which always ensures there is enough
+    /// padding / blinding to warrant zero-knowledge.
     pub(crate) fn blind(&mut self) {
+        let num_blinding_rows = self.degree_bound - self.num_rows;
         for i in 0..self.num_columns() {
-            for j in 0..self.num_blinding_rows {
+            for j in 0..num_blinding_rows {
                 self.data[i][self.num_rows + j] = F::random_default();
             }
         }

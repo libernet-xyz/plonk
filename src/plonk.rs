@@ -581,7 +581,7 @@ where
             }
         }
 
-        let (degree_bound, num_blinding_rows) = padded_circuit_size::<F>(
+        let degree_bound = padded_circuit_size::<F>(
             self.num_rows,
             self.gates.iter().flat_map(|(constraint, _)| {
                 constraint
@@ -630,7 +630,6 @@ where
 
         Ok(Circuit {
             num_rows: self.num_rows,
-            num_blinding_rows,
             degree_bound,
             num_columns: self.num_columns,
             selectors,
@@ -803,12 +802,6 @@ where
     /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
     /// padded to the next power of 2.
     num_rows: usize,
-
-    /// Number of blinding rows used in the circuit.
-    ///
-    /// This is calculated by [`padded_circuit_size`] and depends on how many different variable
-    /// rotations were used across all constraints.
-    num_blinding_rows: usize,
 
     /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
     ///
@@ -1457,7 +1450,6 @@ where
         let committer = self.make_committer::<H>(&options);
         CompressedCircuit {
             num_rows: self.num_rows,
-            num_blinding_rows: self.num_blinding_rows,
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
             options,
@@ -1479,7 +1471,6 @@ where
         let committer = self.make_committer::<H>(&options);
         CompressedCircuit {
             num_rows: self.num_rows,
-            num_blinding_rows: self.num_blinding_rows,
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
             options,
@@ -1520,9 +1511,6 @@ where
     /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
     /// padded to the next power of 2.
     num_rows: usize,
-
-    /// Number of blinding rows used in the circuit.
-    num_blinding_rows: usize,
 
     /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
     degree_bound: usize,
