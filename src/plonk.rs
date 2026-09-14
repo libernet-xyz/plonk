@@ -1115,6 +1115,7 @@ where
     fn build_permutation_argument(
         &self,
         witness: &Witness<F>,
+        columns: &[Polynomial<F>],
         beta: G,
         gamma: G,
     ) -> Result<(
@@ -1148,15 +1149,6 @@ where
             }
             generator_power *= F::MULTIPLICATIVE_GENERATOR;
         }
-
-        let numerators: Vec<Polynomial<G>> = numerator_table
-            .chunks(self.degree_bound)
-            .map(|helper| Polynomial::encode2(helper.iter().copied().collect()))
-            .collect();
-        let denominators: Vec<Polynomial<G>> = denominator_table
-            .chunks(self.degree_bound)
-            .map(|helper| Polynomial::encode2(helper.iter().copied().collect()))
-            .collect();
 
         G::invert_batch(numerator_table.as_mut_slice());
         G::invert_batch(denominator_table.as_mut_slice());
@@ -1193,17 +1185,23 @@ where
             .collect();
 
         let identity = Polynomial::with_coefficients(vec![F::ZERO, F::ONE]);
+        let mut generator_power = F::ONE;
         let helper_constraints: Vec<Polynomial<G>> = helpers
             .iter()
-            .zip(numerators.into_iter().zip(denominators.into_iter()))
-            .enumerate()
-            .map(|(i, (helper, (numerator, denominator)))| {
-                Polynomial::multiply_batch([helper, &numerator, &denominator])
+            .zip(columns.iter().zip(self.sigma.iter()))
+            .map(|(helper, (column, sigma))| {
+                let witness_column = Self::embed_polynomial(column);
+                let numerator = witness_column.clone()
+                    + Polynomial::with_coefficients(vec![gamma, beta * generator_power]);
+                let denominator =
+                    witness_column + Self::embed_and_scale_polynomial(sigma, beta) + gamma;
+                let constraint = Polynomial::multiply_batch([helper, &numerator, &denominator])
                     + Self::embed_and_scale_polynomial(
-                        &(identity.clone() * F::MULTIPLICATIVE_GENERATOR.pow_small_vartime(i)
-                            - self.sigma[i].clone()),
+                        &(identity.clone() * generator_power - sigma.clone()),
                         beta,
-                    )
+                    );
+                generator_power *= F::MULTIPLICATIVE_GENERATOR;
+                constraint
             })
             .collect();
 
@@ -1370,7 +1368,7 @@ where
         ) = {
             let beta = H::challenge(*DST_BETA, &[committer.transcript_hash()]);
             let gamma = H::challenge(*DST_GAMMA, &[committer.transcript_hash()]);
-            self.build_permutation_argument(&witness, beta, gamma)?
+            self.build_permutation_argument(&witness, columns.as_slice(), beta, gamma)?
         };
         committer.add_batch(
             std::iter::once(permutation_accumulator)
