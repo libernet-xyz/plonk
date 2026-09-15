@@ -6,6 +6,7 @@ use starkom_bluesky::Scalar as BS;
 use starkom_ff::Field;
 use starkom_goldilocks::GL;
 use starkom_poly::Polynomial;
+use starkom_schraderbrau::Scalar as SB;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display};
@@ -610,6 +611,12 @@ impl From<BS> for Constraint<BS> {
 
 impl From<GL> for Constraint<GL> {
     fn from(value: GL) -> Self {
+        Constraint::make_const(value)
+    }
+}
+
+impl From<SB> for Constraint<SB> {
+    fn from(value: SB) -> Self {
         Constraint::make_const(value)
     }
 }
