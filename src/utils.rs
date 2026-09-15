@@ -1,109 +1,124 @@
+use crate::witness::Cell;
 use anyhow::{Result, anyhow};
-use primitive_types::H512;
+use primitive_types::{H256, U256};
 use sha3::Digest;
-use starkom_bluesky::Scalar;
-use starkom_ff::{Field, Field256, PrimeField};
+use starkom_ff::Field;
 use std::collections::BTreeSet;
-use std::sync::LazyLock;
 
-/// Hashes an arbitrary text string into a uniformly distributed BlueSky scalar.
-///
-/// Under the hood this function works by hashing the string with SHA3-512 and converting the
-/// resulting 64 bytes to a BlueSky scalar via modular reduction.
-pub(crate) fn hash_to_scalar(message: &[u8]) -> Scalar {
-    let mut hasher = sha3::Sha3_512::new();
-    hasher.update(message);
-    Scalar::from_h512(H512::from_slice(hasher.finalize().as_slice()))
+/// Helper function used to derive domain separator tags used in various contexts.
+pub(crate) fn make_dst(s: &'static [u8]) -> H256 {
+    let mut hasher = sha3::Sha3_256::new();
+    hasher.update(s);
+    H256::from_slice(hasher.finalize().as_slice())
 }
 
-/// Converts an [`isize`] to a [`Scalar`], wrapping negative values around.
-pub(crate) fn isize_to_scalar(value: isize) -> Scalar {
+/// Encodes a [`usize`] into an [`H256`] for use in Fiat-Shamir transcripts.
+pub(crate) fn encode_usize(value: usize) -> H256 {
+    let mut bytes = [0u8; 32];
+    bytes[24..32].copy_from_slice(&(value as u64).to_be_bytes());
+    H256::from_slice(&bytes)
+}
+
+/// Encodes a [`Cell`] into an [`H256`] for use in Fiat-Shamir transcripts.
+pub(crate) fn encode_cell(cell: Cell) -> H256 {
+    let mut bytes = [0u8; 32];
+    bytes[8..16].copy_from_slice(&(cell.row() as u64).to_be_bytes());
+    bytes[24..32].copy_from_slice(&(cell.column() as u64).to_be_bytes());
+    H256::from_slice(&bytes)
+}
+
+/// Converts an [`isize`] to a field element, wrapping negative values around.
+pub(crate) fn isize_to_scalar<F: Field>(value: isize) -> F {
     let abs = value.unsigned_abs();
     if value < 0 {
-        -Scalar::try_from(abs).unwrap()
+        -F::try_from(abs).unwrap()
     } else {
-        Scalar::try_from(abs).unwrap()
+        F::try_from(abs).unwrap()
     }
 }
 
 /// Indicates whether a scalar value looks like a "negative" value.
 ///
 /// In some context (e.g. in constraint expression parsing when interpreting an exponent) we get
-/// [`Scalar`] values that we need to convert to signed [`isize`] values.
-pub(crate) fn is_pseudo_negative(&value: &Scalar) -> bool {
-    static HALF_RANGE: LazyLock<Scalar> = LazyLock::new(|| Scalar::MAX * Scalar::TWO_INV);
-    value > *HALF_RANGE
+/// scalar values that we need to convert to signed [`isize`] values.
+pub(crate) fn is_pseudo_negative<F: Field>(&value: &F) -> bool {
+    value.to_u256() > (F::MAX.to_u256() >> 1)
 }
 
-pub(crate) fn scalar_to_isize(value: Scalar) -> Result<isize> {
-    const MAX: Scalar = Scalar::from_const(isize::MAX as u64);
+/// Converts a field element to [`isize`], using [`is_pseudo_negative`] to decide when a field
+/// element is to be interpreted as a negative / wrapped-around value.
+pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
     if is_pseudo_negative(&value) {
-        let abs = (Scalar::MAX - value + Scalar::ONE).try_to_u128().unwrap() as i128;
-        if abs > -(isize::MIN as i128) {
-            Err(anyhow!("out of range: {}", value))
+        let abs = (F::MAX - value + F::ONE).to_u256();
+        if abs > U256::from((-(isize::MIN as i128)) as u128) {
+            Err(anyhow!("out of range: {} < {}", value, isize::MIN))
         } else {
-            Ok(-abs as isize)
+            Ok((-(abs.as_u128() as i128)) as isize)
         }
     } else {
-        if value > MAX {
-            Err(anyhow!("out of range: {}", value))
+        let value = value.to_u256();
+        if value > U256::from(isize::MAX as u128) {
+            Err(anyhow!("out of range: {} > {}", value, isize::MAX))
         } else {
-            Ok(value.try_to_u64().unwrap() as isize)
+            Ok(value.as_u128() as isize)
         }
     }
 }
 
-/// Calculates the final circuit size (number of rows) by adding the correct number of blinding rows
+/// Calculates the final circuit size (number of rows) by adding the minimum number of blinding rows
 /// and rounding up to the next power of two.
 ///
-/// The returned pair is `(degree_bound, nun_blinding_rows)`, with `degree_bound` indicating the
-/// total number of rows (always a power of two and suitable for use as the size of the evaluation
-/// domain).
+/// The returned value is the total number of rows, always a power of two and suitable for use as
+/// the size of the evaluation domain. Callers are expected to blind *all* of the rows past the
+/// `num_rows` witness rows rather than just the minimum: the extra rows are there anyway due to the
+/// power-of-two rounding, and padding them with random values rather than zeros adds margin at no
+/// cost.
 ///
-/// The number of blinding rows added must be strictly greater than the number of non-public opened
-/// points, so we calculate it as the total number of different variable rotations present in the
-/// circuit plus one. We force the 0 and +1 rotations into the rotation set because the main
-/// challenge xi and the shifted challenge xi*omega are always opened (for the final algebraic check
-/// and the permutation argument, respectively) even if the circuit doesn't use those rotations.
-pub(crate) fn padded_circuit_size<R: IntoIterator<Item = isize>>(
+/// The minimum number of blinding rows is computed so that the added randomness absorbs the
+/// information leak caused by opening all `rotations` used in the circuit and adds an extra 256
+/// bits on top of that.
+///
+/// In the implementation we always force the 0 and +1 rotations into the provided set because the
+/// main challenge xi and the shifted challenge xi*omega are always opened (for the final algebraic
+/// check and the permutation argument, respectively) even if the circuit doesn't use those
+/// rotations.
+///
+/// NOTE: when using the extension field pattern (e.g. F=Goldilocks, G=Goldilocks^4) each opened
+/// rotation `W(xi)`, `W(omega*xi)`, etc. leaks `G::BITS` bits of information about the witness
+/// column `W`, not just `F::BITS` bits! That is because the challenge `xi` is in `G` (not in the
+/// `F` subfield) and touches all coefficients of the polynomial upon evaluation, so an evaluation
+/// yields 256 bits of information. For this reason our formula is:
+///
+///   min_blinding_rows = (num_rotations + 1) * ceil(32 / F::LEN)
+///
+/// ensuring that every opened rotation is absorbed by 256 bits of blinding and 256 bits of excess
+/// are added on top of that.
+pub(crate) fn padded_circuit_size<F: Field>(
     num_rows: usize,
-    rotations: R,
-) -> (usize, usize) {
-    let num_blinding_rows = [0isize, 1isize]
+    rotations: impl IntoIterator<Item = isize>,
+) -> usize {
+    let num_rotations = [0isize, 1isize]
         .into_iter()
         .chain(rotations.into_iter())
         .collect::<BTreeSet<isize>>()
-        .len()
-        + 1;
-    let degree_bound = (num_rows + num_blinding_rows).next_power_of_two();
-    (degree_bound, num_blinding_rows)
+        .len();
+    let min_blinding_rows = (num_rotations + 1) * 32usize.div_ceil(F::LEN);
+    (num_rows + min_blinding_rows).next_power_of_two()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use starkom_bluesky::{from_const, parse_scalar};
-
-    #[test]
-    fn test_hash_to_scalar() {
-        assert_eq!(
-            hash_to_scalar(b"lorem ipsum dolor sit amet"),
-            parse_scalar("0x69c562c4b39c86fc322322c86cfe5be83fbd472c6a38862bdd2f362bfa442ad6")
-        );
-        assert_eq!(
-            hash_to_scalar(b"sator arepo tenet opera rotas"),
-            parse_scalar("0x027880d47636bf77d55804a6cf2d5ec8f09427cdf678e2ed3d74c432cc2efa7a")
-        );
-    }
+    use starkom_bluesky::{Scalar as BS, from_const};
 
     #[test]
     fn test_isize_to_scalar() {
-        assert_eq!(isize_to_scalar(0), from_const(0));
-        assert_eq!(isize_to_scalar(1), from_const(1));
-        assert_eq!(isize_to_scalar(2), from_const(2));
-        assert_eq!(isize_to_scalar(-1), Scalar::MAX);
-        assert_eq!(isize_to_scalar(-2), Scalar::MAX - from_const(1));
-        assert_eq!(isize_to_scalar(-3), Scalar::MAX - from_const(2));
+        assert_eq!(isize_to_scalar::<BS>(0), from_const(0));
+        assert_eq!(isize_to_scalar::<BS>(1), from_const(1));
+        assert_eq!(isize_to_scalar::<BS>(2), from_const(2));
+        assert_eq!(isize_to_scalar::<BS>(-1), BS::MAX);
+        assert_eq!(isize_to_scalar::<BS>(-2), BS::MAX - from_const(1));
+        assert_eq!(isize_to_scalar::<BS>(-3), BS::MAX - from_const(2));
     }
 
     #[test]
@@ -111,10 +126,10 @@ mod tests {
         assert!(!is_pseudo_negative(&from_const(0)));
         assert!(!is_pseudo_negative(&from_const(1)));
         assert!(!is_pseudo_negative(&from_const(2)));
-        assert!(is_pseudo_negative(&(Scalar::MAX)));
-        assert!(is_pseudo_negative(&(Scalar::MAX - from_const(1))));
-        assert!(is_pseudo_negative(&(Scalar::MAX - from_const(2))));
-        let half_range = Scalar::MAX * Scalar::TWO_INV;
+        assert!(is_pseudo_negative(&(BS::MAX)));
+        assert!(is_pseudo_negative(&(BS::MAX - from_const(1))));
+        assert!(is_pseudo_negative(&(BS::MAX - from_const(2))));
+        let half_range = BS::MAX * BS::TWO_INV;
         assert!(!is_pseudo_negative(&(half_range - from_const(2))));
         assert!(!is_pseudo_negative(&(half_range - from_const(1))));
         assert!(!is_pseudo_negative(&(half_range)));
