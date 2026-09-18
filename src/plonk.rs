@@ -1259,8 +1259,9 @@ where
                 selector[row] = F::ONE;
                 public_inputs[row] += power * value;
             }
-            constraint += Self::embed_polynomial(&Polynomial::encode2(selector)).multiply(
-                Self::embed_and_scale_polynomial(&columns[column_index], power),
+            constraint += Self::embed_and_scale_polynomial(
+                &(Polynomial::encode2(selector) * columns[column_index].clone()),
+                power,
             );
         }
         constraint - Polynomial::encode2(public_inputs)
