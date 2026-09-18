@@ -1362,12 +1362,11 @@ where
                     } else {
                         constraint.clone()
                     };
-                    let selector = Self::embed_and_scale_polynomial(
-                        &self.selectors[instance.selector_index],
+                    gate_constraint += Self::embed_and_scale_polynomial(
+                        &(self.selectors[instance.selector_index].clone()
+                            * constraint.compose2(&substitution)),
                         power,
                     );
-                    gate_constraint +=
-                        selector * Self::embed_polynomial(&constraint.compose2(&substitution));
                     power *= delta;
                 }
             }
