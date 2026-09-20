@@ -9,7 +9,6 @@ use starkom_pcs::{self as pcs, hash::Hasher};
 use starkom_poly::Polynomial;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
-use std::ops::Mul;
 use std::sync::LazyLock;
 
 /// Default blowup factor (16) in logarithmic form.
@@ -163,11 +162,7 @@ impl Default for ProvingOptions {
     }
 }
 
-pub trait CircuitView<F: Field, G: Field256 + From<F>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub trait CircuitView<F: Field, G: Field256<BaseField = F>> {
     /// Returns a reference to the [`CircuitBuilder`].
     fn builder(&self) -> &CircuitBuilder<F, G>;
 
@@ -362,11 +357,7 @@ where
 }
 
 #[derive(Debug)]
-pub struct CircuitViewGenerator<'a, F: Field, G: Field256 + From<F>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub struct CircuitViewGenerator<'a, F: Field, G: Field256<BaseField = F>> {
     /// Reference to the [`CircuitBuilder`].
     builder: &'a mut CircuitBuilder<F, G>,
 
@@ -383,11 +374,7 @@ where
     count: usize,
 }
 
-impl<'a, F: Field, G: Field256 + From<F>> CircuitViewGenerator<'a, F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<'a, F: Field, G: Field256<BaseField = F>> CircuitViewGenerator<'a, F, G> {
     pub fn get(&'a mut self, index: usize) -> CircuitSectionBuilder<'a, F, G> {
         assert!(index < self.count);
         CircuitSectionBuilder::new(
@@ -416,11 +403,7 @@ struct GateInstance {
 
 /// Allows building PLONK [`Circuit`]s.
 #[derive(Debug, Default, Clone)]
-pub struct CircuitBuilder<F: Field, G: Field256 + From<F>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub struct CircuitBuilder<F: Field, G: Field256<BaseField = F>> {
     /// Current number of rows in the circuit.
     num_rows: usize,
 
@@ -449,11 +432,7 @@ where
     _data: PhantomData<G>,
 }
 
-impl<F: Field, G: Field256 + From<F>> CircuitBuilder<F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
     fn add_gate_internal(&mut self, mut root_cell: Cell, mut constraint: Constraint<F>) {
         {
             let min_column_index = constraint.get_min_column_index();
@@ -642,11 +621,7 @@ where
     }
 }
 
-impl<F: Field, G: Field256 + From<F>> CircuitView<F, G> for CircuitBuilder<F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<F: Field, G: Field256<BaseField = F>> CircuitView<F, G> for CircuitBuilder<F, G> {
     fn builder(&self) -> &CircuitBuilder<F, G> {
         self
     }
@@ -674,11 +649,7 @@ where
 
 /// Implements [`CircuitView`] for a sub-section of the circuit.
 #[derive(Debug)]
-pub struct CircuitSectionBuilder<'a, F: Field, G: Field256 + From<F>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub struct CircuitSectionBuilder<'a, F: Field, G: Field256<BaseField = F>> {
     /// Reference to the parent [`CircuitBuilder`].
     builder: &'a mut CircuitBuilder<F, G>,
 
@@ -695,11 +666,7 @@ where
     height: usize,
 }
 
-impl<'a, F: Field, G: Field256 + From<F>> CircuitSectionBuilder<'a, F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<'a, F: Field, G: Field256<BaseField = F>> CircuitSectionBuilder<'a, F, G> {
     fn new(
         builder: &'a mut CircuitBuilder<F, G>,
         row_offset: usize,
@@ -717,10 +684,8 @@ where
     }
 }
 
-impl<'a, F: Field, G: Field256 + From<F>> CircuitView<F, G> for CircuitSectionBuilder<'a, F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
+impl<'a, F: Field, G: Field256<BaseField = F>> CircuitView<F, G>
+    for CircuitSectionBuilder<'a, F, G>
 {
     fn builder(&self) -> &CircuitBuilder<F, G> {
         self.builder
@@ -792,11 +757,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
 
 /// A PLONK circuit.
 #[derive(Debug, Clone)]
-pub struct Circuit<F: Field, G: Field256 + From<F>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub struct Circuit<F: Field, G: Field256<BaseField = F>> {
     /// The raw number of rows of the circuit.
     ///
     /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
@@ -838,11 +799,7 @@ where
     _data: PhantomData<G>,
 }
 
-impl<F: Field, G: Field256 + From<F>> Circuit<F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     pub fn num_rows(&self) -> usize {
         self.num_rows
     }
@@ -1118,9 +1075,7 @@ where
         Vec<Polynomial<G>>, // helper constraints
         Polynomial<G>,      // recurrence constraint
     )> {
-        let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
-        let omega_base = Polynomial::<F>::domain_element2(1, self.degree_bound);
-        assert_eq!(G::from(omega_base), omega);
+        let omega = Polynomial::<F>::domain_element2(1, self.degree_bound);
 
         // Helper columns are initially stored in these two flat arrays, expressed in the value
         // domain and laid out in column-major order. Later on they're converted to individual
@@ -1138,7 +1093,7 @@ where
                     witness_value + beta * (generator_power * omega_power) + gamma;
                 denominator_table[offset + j] =
                     witness_value + beta * self.sigma_values[i][j] + gamma;
-                omega_power *= omega_base;
+                omega_power *= omega;
             }
             generator_power *= F::MULTIPLICATIVE_GENERATOR;
         }
@@ -1200,7 +1155,7 @@ where
 
         let boundary_constraint =
             accumulator.clone() * Polynomial::lagrange0_2(self.degree_bound).clone();
-        let recurrence_constraint = accumulator.clone().shift_domain_by(omega)
+        let recurrence_constraint = accumulator.clone().shift_domain_by(omega.into())
             - accumulator.clone()
             - helpers.iter().sum::<Polynomial<G>>();
 
@@ -1344,13 +1299,7 @@ where
         let omega_inv = omega.invert_vartime().unwrap();
 
         let gate_constraint = {
-            let substitution = {
-                let omega_base = Polynomial::<F>::domain_element2(1, self.degree_bound);
-                let omega_inv_base = omega_base.invert_vartime().unwrap();
-                assert_eq!(G::from(omega_base), omega);
-                assert_eq!(G::from(omega_inv_base), omega_inv);
-                self.get_variable_substitution(omega_base, omega_inv_base, columns.as_slice())
-            };
+            let substitution = self.get_variable_substitution(omega, omega_inv, columns.as_slice());
             let delta = H::challenge(*DST_DELTA, &[committer.transcript_hash()]);
             let mut gate_constraint = Polynomial::<G>::default();
             let mut power = G::ONE;
@@ -1501,11 +1450,7 @@ where
 /// This struct is much smaller than the original circuit but still allows full verification of a
 /// proof for the circuit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompressedCircuit<F: Field, G: Field256 + From<F>, H: Hasher<G>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub struct CompressedCircuit<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> {
     /// The raw number of rows of the circuit.
     ///
     /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
@@ -1535,11 +1480,7 @@ where
     _data: PhantomData<(G, H)>,
 }
 
-impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> CompressedCircuit<F, G, H>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G, H> {
     pub fn num_rows(&self) -> usize {
         self.num_rows
     }
