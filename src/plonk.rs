@@ -716,14 +716,14 @@ impl<'a, F: Field, G: Field256<BaseField = F>> CircuitView<F, G>
 ///
 /// The API in the implementation mostly mirrors that of the underlying PCS proof.
 #[derive(Debug, Clone)]
-pub struct Proof<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
+pub struct Proof<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> {
     public_inputs: BTreeMap<Cell, F>,
     commitment: pcs::Commitment<G, H>,
     inner_proof: pcs::Proof<G, H>,
     _data: PhantomData<F>,
 }
 
-impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
+impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> Proof<F, G, H> {
     /// Returns the proven degree bound.
     pub fn degree_bound(&self) -> usize {
         self.inner_proof.degree_bound()
