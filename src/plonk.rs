@@ -9,7 +9,6 @@ use starkom_pcs::{self as pcs, hash::Hasher};
 use starkom_poly::Polynomial;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
-use std::ops::Mul;
 use std::sync::LazyLock;
 
 /// Default blowup factor (16) in logarithmic form.
@@ -163,11 +162,7 @@ impl Default for ProvingOptions {
     }
 }
 
-pub trait CircuitView<F: Field, G: Field256 + From<F>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub trait CircuitView<F: Field, G: Field256<BaseField = F>> {
     /// Returns a reference to the [`CircuitBuilder`].
     fn builder(&self) -> &CircuitBuilder<F, G>;
 
@@ -362,11 +357,7 @@ where
 }
 
 #[derive(Debug)]
-pub struct CircuitViewGenerator<'a, F: Field, G: Field256 + From<F>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub struct CircuitViewGenerator<'a, F: Field, G: Field256<BaseField = F>> {
     /// Reference to the [`CircuitBuilder`].
     builder: &'a mut CircuitBuilder<F, G>,
 
@@ -383,11 +374,7 @@ where
     count: usize,
 }
 
-impl<'a, F: Field, G: Field256 + From<F>> CircuitViewGenerator<'a, F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<'a, F: Field, G: Field256<BaseField = F>> CircuitViewGenerator<'a, F, G> {
     pub fn get(&'a mut self, index: usize) -> CircuitSectionBuilder<'a, F, G> {
         assert!(index < self.count);
         CircuitSectionBuilder::new(
@@ -416,11 +403,7 @@ struct GateInstance {
 
 /// Allows building PLONK [`Circuit`]s.
 #[derive(Debug, Default, Clone)]
-pub struct CircuitBuilder<F: Field, G: Field256 + From<F>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub struct CircuitBuilder<F: Field, G: Field256<BaseField = F>> {
     /// Current number of rows in the circuit.
     num_rows: usize,
 
@@ -449,11 +432,7 @@ where
     _data: PhantomData<G>,
 }
 
-impl<F: Field, G: Field256 + From<F>> CircuitBuilder<F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
     fn add_gate_internal(&mut self, mut root_cell: Cell, mut constraint: Constraint<F>) {
         {
             let min_column_index = constraint.get_min_column_index();
@@ -596,7 +575,7 @@ where
 
         let sigma_values: Vec<Vec<F>> = {
             let mut sigma = vec![F::ZERO; degree_bound * self.num_columns];
-            let omega = Polynomial::<F>::domain_element2(1, degree_bound);
+            let omega = Polynomial::<G>::domain_element2(1, degree_bound);
             let mut k = F::ONE;
             for i in 0..self.num_columns {
                 let offset = i * degree_bound;
@@ -642,11 +621,7 @@ where
     }
 }
 
-impl<F: Field, G: Field256 + From<F>> CircuitView<F, G> for CircuitBuilder<F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<F: Field, G: Field256<BaseField = F>> CircuitView<F, G> for CircuitBuilder<F, G> {
     fn builder(&self) -> &CircuitBuilder<F, G> {
         self
     }
@@ -674,11 +649,7 @@ where
 
 /// Implements [`CircuitView`] for a sub-section of the circuit.
 #[derive(Debug)]
-pub struct CircuitSectionBuilder<'a, F: Field, G: Field256 + From<F>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub struct CircuitSectionBuilder<'a, F: Field, G: Field256<BaseField = F>> {
     /// Reference to the parent [`CircuitBuilder`].
     builder: &'a mut CircuitBuilder<F, G>,
 
@@ -695,11 +666,7 @@ where
     height: usize,
 }
 
-impl<'a, F: Field, G: Field256 + From<F>> CircuitSectionBuilder<'a, F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<'a, F: Field, G: Field256<BaseField = F>> CircuitSectionBuilder<'a, F, G> {
     fn new(
         builder: &'a mut CircuitBuilder<F, G>,
         row_offset: usize,
@@ -717,10 +684,8 @@ where
     }
 }
 
-impl<'a, F: Field, G: Field256 + From<F>> CircuitView<F, G> for CircuitSectionBuilder<'a, F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
+impl<'a, F: Field, G: Field256<BaseField = F>> CircuitView<F, G>
+    for CircuitSectionBuilder<'a, F, G>
 {
     fn builder(&self) -> &CircuitBuilder<F, G> {
         self.builder
@@ -751,14 +716,14 @@ where
 ///
 /// The API in the implementation mostly mirrors that of the underlying PCS proof.
 #[derive(Debug, Clone)]
-pub struct Proof<F: Field, G: Field256 + From<F>, H: Hasher<G>> {
+pub struct Proof<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> {
     public_inputs: BTreeMap<Cell, F>,
     commitment: pcs::Commitment<G, H>,
     inner_proof: pcs::Proof<G, H>,
     _data: PhantomData<F>,
 }
 
-impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
+impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> Proof<F, G, H> {
     /// Returns the proven degree bound.
     pub fn degree_bound(&self) -> usize {
         self.inner_proof.degree_bound()
@@ -792,11 +757,7 @@ impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> Proof<F, G, H> {
 
 /// A PLONK circuit.
 #[derive(Debug, Clone)]
-pub struct Circuit<F: Field, G: Field256 + From<F>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub struct Circuit<F: Field, G: Field256<BaseField = F>> {
     /// The raw number of rows of the circuit.
     ///
     /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
@@ -838,11 +799,7 @@ where
     _data: PhantomData<G>,
 }
 
-impl<F: Field, G: Field256 + From<F>> Circuit<F, G>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     pub fn num_rows(&self) -> usize {
         self.num_rows
     }
@@ -948,7 +905,7 @@ where
 
         let cell_by_identity_value: BTreeMap<F, Cell> = {
             let mut cell_by_identity_value = BTreeMap::default();
-            let omega = Polynomial::<F>::domain_element2(1, self.degree_bound);
+            let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
             let mut generator_power = F::ONE;
             for column in 0..self.num_columns {
                 let mut omega_power = F::ONE;
@@ -1009,7 +966,7 @@ where
                 .coefficients()
                 .iter()
                 .copied()
-                .map(|coefficient| coefficient * scale)
+                .map(|coefficient| scale * coefficient)
                 .collect(),
         )
     }
@@ -1119,8 +1076,6 @@ where
         Polynomial<G>,      // recurrence constraint
     )> {
         let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
-        let omega_base = Polynomial::<F>::domain_element2(1, self.degree_bound);
-        assert_eq!(G::from(omega_base), omega);
 
         // Helper columns are initially stored in these two flat arrays, expressed in the value
         // domain and laid out in column-major order. Later on they're converted to individual
@@ -1138,7 +1093,7 @@ where
                     witness_value + beta * (generator_power * omega_power) + gamma;
                 denominator_table[offset + j] =
                     witness_value + beta * self.sigma_values[i][j] + gamma;
-                omega_power *= omega_base;
+                omega_power *= omega;
             }
             generator_power *= F::MULTIPLICATIVE_GENERATOR;
         }
@@ -1200,7 +1155,7 @@ where
 
         let boundary_constraint =
             accumulator.clone() * Polynomial::lagrange0_2(self.degree_bound).clone();
-        let recurrence_constraint = accumulator.clone().shift_domain_by(omega)
+        let recurrence_constraint = accumulator.clone().shift_domain_by(omega.into())
             - accumulator.clone()
             - helpers.iter().sum::<Polynomial<G>>();
 
@@ -1259,8 +1214,9 @@ where
                 selector[row] = F::ONE;
                 public_inputs[row] += power * value;
             }
-            constraint += Self::embed_polynomial(&Polynomial::encode2(selector)).multiply(
-                Self::embed_and_scale_polynomial(&columns[column_index], power),
+            constraint += Self::embed_and_scale_polynomial(
+                &(Polynomial::encode2(selector) * columns[column_index].clone()),
+                power,
             );
         }
         constraint - Polynomial::encode2(public_inputs)
@@ -1343,13 +1299,7 @@ where
         let omega_inv = omega.invert_vartime().unwrap();
 
         let gate_constraint = {
-            let substitution = {
-                let omega_base = Polynomial::<F>::domain_element2(1, self.degree_bound);
-                let omega_inv_base = omega_base.invert_vartime().unwrap();
-                assert_eq!(G::from(omega_base), omega);
-                assert_eq!(G::from(omega_inv_base), omega_inv);
-                self.get_variable_substitution(omega_base, omega_inv_base, columns.as_slice())
-            };
+            let substitution = self.get_variable_substitution(omega, omega_inv, columns.as_slice());
             let delta = H::challenge(*DST_DELTA, &[committer.transcript_hash()]);
             let mut gate_constraint = Polynomial::<G>::default();
             let mut power = G::ONE;
@@ -1362,12 +1312,11 @@ where
                     } else {
                         constraint.clone()
                     };
-                    let selector = Self::embed_and_scale_polynomial(
-                        &self.selectors[instance.selector_index],
+                    gate_constraint += Self::embed_and_scale_polynomial(
+                        &(self.selectors[instance.selector_index].clone()
+                            * constraint.compose2(&substitution)),
                         power,
                     );
-                    gate_constraint +=
-                        selector * Self::embed_polynomial(&constraint.compose2(&substitution));
                     power *= delta;
                 }
             }
@@ -1501,11 +1450,7 @@ where
 /// This struct is much smaller than the original circuit but still allows full verification of a
 /// proof for the circuit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompressedCircuit<F: Field, G: Field256 + From<F>, H: Hasher<G>>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+pub struct CompressedCircuit<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> {
     /// The raw number of rows of the circuit.
     ///
     /// Unlike [`Self::degree_bound`], this count doesn't include the blinding rows and is not
@@ -1535,11 +1480,7 @@ where
     _data: PhantomData<(G, H)>,
 }
 
-impl<F: Field, G: Field256 + From<F>, H: Hasher<G>> CompressedCircuit<F, G, H>
-where
-    F: Mul<G, Output = G>,
-    G: Mul<F, Output = G>,
-{
+impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G, H> {
     pub fn num_rows(&self) -> usize {
         self.num_rows
     }
@@ -1760,7 +1701,7 @@ where
                     let constraints = permutation_helpers[i]
                         * (witness_columns[i] + beta * generator_power * xi + gamma)
                         * (witness_columns[i] + beta * sigma[i] + gamma)
-                        + beta * (generator_power * xi - sigma[i]);
+                        + beta * (xi * generator_power - sigma[i]);
                     generator_power *= F::MULTIPLICATIVE_GENERATOR;
                     constraints
                 })
@@ -1810,7 +1751,7 @@ where
             let lagrange: BTreeMap<usize, G> = rows
                 .iter()
                 .zip(lagrange)
-                .map(|(&row, inverse)| (row, omega.pow_small_vartime(row) * zero * inverse))
+                .map(|(&row, inverse)| (row, zero * omega.pow_small_vartime(row) * inverse))
                 .collect();
             public_inputs
                 .iter()
@@ -1862,16 +1803,12 @@ mod tests {
 
     // This function tests the circuit from Vitalik's PLONK tutorial,
     // https://vitalik.eth.limo/general/2019/09/22/plonk.html#how-plonk-works.
-    fn test_vitalik_circuit_impl<F: Field, G: Field256 + From<F>, H: Hasher<G>>(
+    fn test_vitalik_circuit_impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
         expected_degree_bound: usize,
         commitment: H256,
-    ) -> Result<()>
-    where
-        F: Mul<G, Output = G>,
-        G: Mul<F, Output = G>,
-    {
+    ) -> Result<()> {
         let mut builder = CircuitBuilder::<F, G>::default();
         builder.add_gate(0, (var(0) ^ 2) - var(1));
         builder.connect(cell(0, 0).into(), cell(1, 0).into());
@@ -1926,7 +1863,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_2() {
-        let c = parse_hash("0x433c9c479ed34977d32f168c703b9137ad141bf458706e5a326d1b3232f3ade8");
+        let c = parse_hash("0x2648e724ff1887b29137a0847bb2913ac68974e0c2809be300c6d726a3fedc20");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, 16, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, 16, c).is_ok());
     }
@@ -1940,7 +1877,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_2() {
-        let c = parse_hash("0xa0b9b4fbf2ba93596857c22f419d3ffb512c6e22c8ffa959c6e1ba8fb6ed4373");
+        let c = parse_hash("0x8ce1153809dd7983b2a77080905e8738d08b8f8b265f9953334a5df9d957a032");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, 16, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, 16, c).is_ok());
     }
@@ -1954,7 +1891,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_4() {
-        let c = parse_hash("0xaf4eeff946bd88847e86b9adf832ff67655ef892ee04948add8bda9a16e7ff16");
+        let c = parse_hash("0xa869c1a1afe38b4bfffdaf0635405cff247ffa6c1f979d31fad29b2b0165070f");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, 16, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, 16, c).is_ok());
     }
@@ -1968,7 +1905,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_4() {
-        let c = parse_hash("0x918b776c8fa6cdeb8ff03f31b5140c44fcad1b31b5d9eed8fc94e1a183fa719c");
+        let c = parse_hash("0xeb4a39af87c7cf2f5f5393a28fa5a9dcf548273fe48138a62b9511c990ee3d4d");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, 16, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, 16, c).is_ok());
     }
@@ -1982,7 +1919,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_8() {
-        let c = parse_hash("0x8488d24cd76fabf61883549476d604b872a910574bb20c1700fc19c3eb8aaff7");
+        let c = parse_hash("0xce2c6c998081e4b694ba1ad53c9e02175c8750acffdca25ae4a3e2329b06a439");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, 16, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, 16, c).is_ok());
     }
@@ -1996,23 +1933,19 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_8() {
-        let c = parse_hash("0x8e5d2984cceb2acfca77d0c141cdc48fa64e71483c57085e7f7b01d8d14df664");
+        let c = parse_hash("0x1c2437168d195f14bc40abe17e255ca5ff80880a4af50331cda9ce0cae74fd18");
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, 16, c).is_ok());
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, 16, c).is_ok());
     }
 
     /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
     /// and z such that x^3 + xy + 5 = z. Valid combinations are (3, 4, 44) and (4, 3, 81).
-    fn test_vitalik_circuit_variation<F: Field, G: Field256 + From<F>, H: Hasher<G>>(
+    fn test_vitalik_circuit_variation<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
         expected_degree_bound: usize,
         commitment: H256,
-    ) -> Result<()>
-    where
-        F: Mul<G, Output = G>,
-        G: Mul<F, Output = G>,
-    {
+    ) -> Result<()> {
         let mut builder = CircuitBuilder::<F, G>::default();
         builder.add_gate(0, (var(0) ^ 2) - var(1));
         let x = cell(0, 0);
@@ -2084,7 +2017,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_variation_goldilocks_blowup_2() {
-        let c = parse_hash("0x68619d108c199a28f7812242e5b029fe6b3a840126542c93bd4f3308518dc484");
+        let c = parse_hash("0xcc0b73bb6e9ff66346461a0386a8fa4d13c147d1bd57f5efc1b6eb35904b4da7");
         assert!(test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, 16, c).is_ok());
         assert!(test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, 16, c).is_ok());
     }
@@ -2098,7 +2031,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_variation_goldilocks_blowup_4() {
-        let c = parse_hash("0x070cb012cb70611bfed184f0f0f46f9335cf9cae0bd85090d09ad9db98c3c144");
+        let c = parse_hash("0xdcf67905aa53204c32ae74523f5e726b2135f068a0dd792aef5837de4d9c62ae");
         assert!(test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 2, 16, c).is_ok());
         assert!(test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 2, 16, c).is_ok());
     }

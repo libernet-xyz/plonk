@@ -2,7 +2,6 @@ use crate::plonk::CircuitView;
 use crate::witness::{Cell, CellOrUnconstrained, WitnessView};
 use anyhow::Result;
 use starkom_ff::{Field, Field256};
-use std::ops::Mul;
 
 /// Represents a reusable PLONK chip that you can use to build circuits.
 ///
@@ -15,14 +14,11 @@ pub trait Chip<F: Field, const I: usize, const O: usize> {
     fn height(&self) -> usize;
 
     /// Builds the chip on the provided [`CircuitView`].
-    fn build<G: Field256 + From<F>>(
+    fn build<G: Field256<BaseField = F>>(
         &self,
         view: &mut impl CircuitView<F, G>,
         inputs: [Option<Cell>; I],
-    ) -> Result<[Option<Cell>; O]>
-    where
-        F: Mul<G, Output = G>,
-        G: Mul<F, Output = G>;
+    ) -> Result<[Option<Cell>; O]>;
 
     /// Witnesses execution of the chip in the provided [`WitnessView`].
     fn witness(
@@ -44,14 +40,11 @@ pub trait DynamicChip<F: Field> {
     fn height(&self) -> usize;
 
     /// Builds the chip on the provided [`CircuitView`].
-    fn build<G: Field256 + From<F>>(
+    fn build<G: Field256<BaseField = F>>(
         &self,
         view: &mut impl CircuitView<F, G>,
         inputs: Vec<Option<Cell>>,
-    ) -> Result<Vec<Option<Cell>>>
-    where
-        F: Mul<G, Output = G>,
-        G: Mul<F, Output = G>;
+    ) -> Result<Vec<Option<Cell>>>;
 
     /// Witnesses execution of the chip in the provided [`WitnessView`].
     fn witness(
