@@ -5,6 +5,7 @@ use crate::witness::Cell;
 use starkom_bluesky::Scalar as BS;
 use starkom_ff::Field;
 use starkom_goldilocks::GL;
+use starkom_koalabear::KB;
 use starkom_poly::Polynomial;
 use starkom_schraderbrau::Scalar as SB;
 use std::cmp::Ordering;
@@ -617,6 +618,12 @@ impl From<GL> for Constraint<GL> {
 
 impl From<SB> for Constraint<SB> {
     fn from(value: SB) -> Self {
+        Constraint::make_const(value)
+    }
+}
+
+impl From<KB> for Constraint<KB> {
+    fn from(value: KB) -> Self {
         Constraint::make_const(value)
     }
 }
