@@ -785,10 +785,9 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> Proof<F, G, H> {
 
     /// Returns the number of committed polynomials.
     ///
-    /// These include the circuit selectors and sigma polynomials, the witness columns, the
-    /// permutation argument accumulator along with its
-    /// [partial products](`Circuit::build_permutation_argument`), and the chunks of the grand
-    /// quotient.
+    /// These include the circuit selectors, the sigma polynomials, the witness columns, the
+    /// permutation argument accumulator, the LogUp helper columns, the chunks of the grand
+    /// quotient, and the FRI randomizer.
     pub fn num_polys(&self) -> usize {
         self.inner_proof.num_polys()
     }
@@ -1075,7 +1074,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     /// The accumulator and helper columns will be committed in the PCS, while the start/end anchor
     /// constraints, helper authentication constraints, and the recurrence constraints are only
     /// included in the grand constraint and the computation of the PLONK quotient. Since `Z` and
-    /// the `h_i`s are committed andwitness-derived, this function blinds them by filling the rows
+    /// the `h_i`s are committed and witness-derived, this function blinds them by filling the rows
     /// corresponding to the padding area with random G values so that they don't leak any
     /// information about the witness ([`padded_circuit_size`] ensures that the padding area has
     /// enough capacity to warrant effective blinding given the number of rotations used in the
