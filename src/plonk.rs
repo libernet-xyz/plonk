@@ -78,8 +78,9 @@ fn get_rotation_set<'a, F: Field>(
 /// * each helper authentication constraint of the permutation argument is the product of three
 ///   polynomials of degree less than `N` (the helper column, the numerator factor, and the
 ///   denominator factor) times the [circuit area selector](`Circuit::circuit_area_selector`) of
-///   degree `N - num_rows`, so it has degree less than or equal to `4 * (N - 1)`, which is where
-///   the floor of 3 on `E` comes from;
+///   degree `N - num_rows`, for a total of `3 * (N - 1) + N - num_rows`; every circuit has at least
+///   one row, so that never exceeds `4 * (N - 1)`, and covering it with the `(N - 1) * (1 + E)`
+///   bound below requires `1 + E >= 4`, hence `E >= 3`;
 /// * the anchor and public cell constraints have degree less than or equal to `2 * (N - 1)`, and
 ///   the recurrence constraint is linear in the committed columns even after being gated, so none
 ///   of them exceeds the above;
@@ -872,6 +873,14 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         &self.public_cells
     }
 
+    pub fn get_max_gate_degree(&self) -> usize {
+        self.gates
+            .iter()
+            .map(|(constraint, _)| constraint.get_degree())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Makes an empty [`Witness`] objects suitable for use with this circuit.
     pub fn make_witness(&self) -> Witness<F> {
         Witness::new(
@@ -1586,6 +1595,14 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         &self.public_cells
     }
 
+    pub fn get_max_gate_degree(&self) -> usize {
+        self.gates
+            .iter()
+            .map(|(constraint, _)| constraint.get_degree())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn commitment(&self) -> H256 {
         self.circuit_commitment
     }
@@ -1926,6 +1943,7 @@ mod tests {
         assert_eq!(circuit.degree_bound(), expected_degree_bound);
         assert_eq!(circuit.num_columns(), 3);
         assert_eq!(circuit.num_gates(), 3);
+        assert_eq!(circuit.get_max_gate_degree(), 2);
         let mut witness = circuit.make_witness();
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), expected_degree_bound);
@@ -2074,6 +2092,7 @@ mod tests {
         assert_eq!(circuit.degree_bound(), expected_degree_bound);
         assert_eq!(circuit.num_columns(), 4);
         assert_eq!(circuit.num_gates(), 3);
+        assert_eq!(circuit.get_max_gate_degree(), 2);
         let mut witness = circuit.make_witness();
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), expected_degree_bound);
