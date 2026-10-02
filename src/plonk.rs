@@ -68,7 +68,7 @@ fn get_rotation_set<'a, F: Field>(
 /// several polynomial multiplications, such as the gate selectors multiplied by the gate
 /// constraints combined with the witness columns.
 ///
-/// The algorithm uses the formula `(N - 1) * E`, where `E = max(max_gate_degree, 2)`. The rationale
+/// The algorithm uses the formula `(N - 1) * E`, where `E = max(max_gate_degree, 3)`. The rationale
 /// behind it is:
 ///
 /// * each column has degree less than or equal to `N - 1`;
@@ -77,11 +77,12 @@ fn get_rotation_set<'a, F: Field>(
 ///   with the constraint columns contributes `max_gate_degree` more);
 /// * each helper authentication constraint of the permutation argument is the product of three
 ///   polynomials of degree less than `N` (the helper column, the numerator factor, and the
-///   denominator factor), so it has degree less than or equal to `3 * (N - 1)`, which is where the
-///   floor of 2 on `E` comes from;
-/// * the boundary and public cell constraints have degree less than or equal to `2 * (N - 1)`, and
-///   the recurrence constraint is linear in the committed columns, so none of them exceeds the
-///   above;
+///   denominator factor) times the [circuit area selector](`Circuit::circuit_area_selector`) of
+///   degree `N - num_rows`, so it has degree less than or equal to `4 * (N - 1)`, which is where
+///   the floor of 3 on `E` comes from;
+/// * the anchor and public cell constraints have degree less than or equal to `2 * (N - 1)`, and
+///   the recurrence constraint is linear in the committed columns even after being gated, so none
+///   of them exceeds the above;
 /// * the grand PLONK constraint therefore has degree less than or equal to `(N - 1) * (1 + E)`;
 /// * dividing that by the zero polynomial (`x^N - 1`, degree-N) yields a quotient with degree
 ///   `(N - 1) * (1 + E) - N`;
@@ -95,9 +96,50 @@ fn quotient_degree_bound<'a, F: Field>(
         .map(|constraint| constraint.get_degree())
         .max()
         .unwrap_or(0);
-    (degree_bound - 1) * std::cmp::max(max_gate_degree, 2)
+    (degree_bound - 1) * std::cmp::max(max_gate_degree, 3)
 }
 
+/// Builds a polynomial vanishes on the padding area. Used to switch the permutation argument off in
+/// the padding area while keeping it active in the circuit area, hence the name.
+///
+/// REQUIRES: `degree_bound` must be strictly greater than `num_rows` (all circuits must have a
+/// padding area to fit blinding rows).
+///
+/// Note that this function computes the vanishing polynomial of the padding area rather than the
+/// Lagrange indicator of the witness rows: the two gate constraints identically, but this one has
+/// degree `N - num_rows` rather than `N - 1`.
+fn make_circuit_area_selector<F: Field>(num_rows: usize, degree_bound: usize) -> Polynomial<F> {
+    let padding_size = degree_bound - num_rows;
+    let omega: F = Polynomial::<F>::domain_element2(1, degree_bound).into();
+    let mut coefficients: Vec<F> = Vec::with_capacity(padding_size);
+    coefficients.push(F::ONE);
+    let mut power = omega.pow_small(num_rows);
+    for i in 0..padding_size {
+        coefficients.push(F::ZERO);
+        for j in (0..=i).rev() {
+            let previous = coefficients[j];
+            coefficients[j + 1] -= power * previous;
+        }
+        power *= omega;
+    }
+    coefficients.reverse();
+    Polynomial::with_coefficients(coefficients)
+}
+
+/// Evaluates [`make_circuit_area_selector`] at a point, without materializing the polynomial.
+fn circuit_area_selector<F: Field>(x: F, num_rows: usize, degree_bound: usize) -> F {
+    let omega: F = Polynomial::<F>::domain_element2(1, degree_bound).into();
+    let mut power = omega.pow_small_vartime(num_rows);
+    let mut result = F::ONE;
+    for _ in num_rows..degree_bound {
+        result *= x - power;
+        power *= omega;
+    }
+    result
+}
+
+/// Evaluates the [Lagrange basis `L_0`](`Polynomial::lagrange0_2`) at a point, without
+/// materializing the polynomial.
 fn lagrange0<F: Field256>(x: F, n: usize) -> F {
     (x.pow_small(n) - F::ONE) * (F::from(n as u64) * (x - F::ONE)).invert_unwrap()
 }
@@ -615,6 +657,7 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
             gates,
             sigma,
             sigma_values,
+            circuit_area_selector: make_circuit_area_selector(self.num_rows, degree_bound),
             public_cells: self.public_cells,
             _data: PhantomData,
         })
@@ -792,6 +835,12 @@ pub struct Circuit<F: Field, G: Field256<BaseField = F>> {
     ///
     /// The layout is analogous to [`Self::sigma`] itself: the values are indexed column-first.
     sigma_values: Vec<Vec<F>>,
+
+    /// Selector that switches the permutation argument off in the padding area.
+    ///
+    /// See [`make_circuit_area_selector`]. It's never committed: the verifier evaluates it directly
+    /// with [`circuit_area_selector`].
+    circuit_area_selector: Polynomial<F>,
 
     /// List of witness cells that are revealed in the proofs.
     public_cells: BTreeSet<Cell>,
@@ -1009,9 +1058,10 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         substitution
     }
 
-    /// Builds the polynomials used in the LogUp permutation argument. The components of the
-    /// returned tuple are, respectively: the accumulator, the boundary constraint, the helper
-    /// columns, the helper authentication constraints, and the recurrence constraint.
+    /// `build_permutation_argument` builds the polynomials used in the LogUp permutation argument.
+    /// The components of the returned tuple are, respectively: the accumulator, the start anchor
+    /// constraint, the end anchor constraint, the helper columns, the helper authentication
+    /// constraints, and the recurrence constraint.
     ///
     /// We use the Fiat-Shamir challenge `gamma` as the LogUp abstract variable. The numerator
     /// factors of the standard PLONK permutation argument are:
@@ -1046,22 +1096,45 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     ///
     /// (`FFT^-1` is the inverse Fourier Transform, as implemented in [`Polynomial::encode2`].)
     ///
-    /// Since `1 / N - 1 / D = (D - N) / (N * D)`, the helpers are authenticated by adding the
-    /// following constraint to the grand quotient:
+    /// Since `1 / N - 1 / D = (D - N) / (N * D)`, the helpers are authenticated by the following
+    /// constraint:
     ///
     ///   h_i(X) * N_i(X) * D_i(X) + N_i(X) - D_i(X) = 0 mod H
     ///
-    /// which pins `h_i` to the intended value at every row where `N_i * D_i` doesn't vanish; the
-    /// probability of `N_i` or `D_i` vanishing at some row is negligible over the choice of
-    /// `gamma`.
+    /// The `h_i` columns are committed like regular witness columns, and as such they must be
+    /// randomized in the padding area to avoid leaking information via the openings of the proof
+    /// (that's critical because the helper columns are derived by combining witness data with
+    /// public information, so reconstructing a full helper column allows an observer to trivially
+    /// derive the corresponding witness column). The padding area has no wiring, so every `N_i` and
+    /// `D_i` pair in that region is always equal and the corresponding cells in `h_i` are always
+    /// zero. Randomizing them causes the above authentication constraint to break in padding area,
+    /// so we gate it with the [circuit area selector](`make_circuit_area_selector`) `V(X)`:
     ///
-    /// The boundary and recurrence constraints of the log-derived accumulator are:
+    ///   V(X) * (h_i(X) * N_i(X) * D_i(X) + N_i(X) - D_i(X)) = 0 mod H
+    ///
+    /// The helper columns are authenticated by adding this gated equation to the grand quotient.
+    ///
+    /// The start anchor and recurrence constraints of the log-derived accumulator is:
     ///
     ///   Z(X) * L_0(X) = 0 mod H
     ///   Z(wX) - Z(X) - Sum(h_i(X)) = 0 mod H
     ///
-    /// where [`L_0`](`lagrange0`) is the Lagrange basis that activates at w^0 = 1 and vanishes
-    /// everywhere else.
+    /// where `L_0` is the Lagrange basis that activates at `w^0` and vanishes everywhere else (see
+    /// [`lagrange0`]).
+    ///
+    /// Since the expression of the recurrence constraint contains `h_i` it suffers from the same
+    /// breakage as the `h_i`s themselves, so this too needs to be gated by `V(X)`. Moreover, gating
+    /// the recurrence constraint means it is no longer guaranteed to loop back to 0 at the end of
+    /// the domain (it will be 0 only because `V(X)` vanishes at that location), so we need to add a
+    /// new anchor constraint for the tail end. As previously explained, the original
+    /// (non-randomized) helper columns `h_i` are always zero in the padding area, so Z never
+    /// changes in that area; that means Z must loop back to 0 when the circuit area ends, on the
+    /// first padding location. So we can add the following end anchor constraint:
+    ///
+    ///   Z(X) * L_{num_rows}(X) = 0 mod H
+    ///
+    /// The start anchor, end anchor, and gated recurrence constraints can all be appended to the
+    /// grand constraint used to generate the PLONK quotient.
     fn build_permutation_argument(
         &self,
         witness: &Witness<F>,
@@ -1070,12 +1143,15 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         gamma: G,
     ) -> Result<(
         Polynomial<G>,      // accumulator
-        Polynomial<G>,      // boundary constraint
+        Polynomial<G>,      // start anchor constraint
+        Polynomial<G>,      // end anchor constraint
         Vec<Polynomial<G>>, // helper columns
         Vec<Polynomial<G>>, // helper constraints
         Polynomial<G>,      // recurrence constraint
     )> {
         let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
+        let omega_inv = omega.invert_vartime().unwrap();
+        let circuit_area_selector = Self::embed_polynomial(&self.circuit_area_selector);
 
         // Helper columns are initially stored in these two flat arrays, expressed in the value
         // domain and laid out in column-major order. Later on they're converted to individual
@@ -1115,6 +1191,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         if accumulator.pop().unwrap() != G::ZERO {
             return Err(anyhow!("permutation accumulator wraparound check failed"));
         }
+        if accumulator[self.num_rows] != G::ZERO {
+            return Err(anyhow!("permutation accumulator end anchor check failed"));
+        }
 
         let accumulator = Polynomial::<G>::encode2(accumulator);
 
@@ -1149,19 +1228,25 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                         beta,
                     );
                 generator_power *= F::MULTIPLICATIVE_GENERATOR;
-                constraint
+                constraint.multiply(circuit_area_selector.clone())
             })
             .collect();
 
-        let boundary_constraint =
+        let start_anchor_constraint =
             accumulator.clone() * Polynomial::lagrange0_2(self.degree_bound).clone();
-        let recurrence_constraint = accumulator.clone().shift_domain_by(omega.into())
+        let end_anchor_constraint = accumulator.clone()
+            * Polynomial::<G>::lagrange0_2(self.degree_bound)
+                .clone()
+                .shift_domain_by(omega_inv.pow_small(self.num_rows).into());
+        let recurrence_constraint = (accumulator.clone().shift_domain_by(omega.into())
             - accumulator.clone()
-            - helpers.iter().sum::<Polynomial<G>>();
+            - helpers.iter().sum::<Polynomial<G>>())
+        .multiply(circuit_area_selector);
 
         Ok((
             accumulator,
-            boundary_constraint,
+            start_anchor_constraint,
+            end_anchor_constraint,
             helpers,
             helper_constraints,
             recurrence_constraint,
@@ -1325,7 +1410,8 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
         let (
             permutation_accumulator,
-            permutation_boundary_constraint,
+            permutation_start_anchor_constraint,
+            permutation_end_anchor_constraint,
             permutation_helpers,
             permutation_helper_constraints,
             permutation_recurrence_constraint,
@@ -1354,8 +1440,11 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         let alpha = H::challenge(*DST_ALPHA, &[committer.transcript_hash()]);
 
         let quotient = {
-            let mut constraint = gate_constraint + permutation_boundary_constraint * alpha;
-            let mut power = alpha.square();
+            let mut power = alpha;
+            let mut constraint = gate_constraint + permutation_start_anchor_constraint * power;
+            power *= alpha;
+            constraint += permutation_end_anchor_constraint * power;
+            power *= alpha;
             for permutation_helper_constraint in permutation_helper_constraints {
                 constraint += permutation_helper_constraint * power;
                 power *= alpha;
@@ -1694,21 +1783,25 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 .collect()
         };
 
+        let circuit_area_selector = circuit_area_selector(xi, self.num_rows, self.degree_bound);
+
         let (permutation_helper_constraints, permutation_recurrence_constraint) = {
             let mut generator_power = F::ONE;
             let helper_constraints: Vec<G> = (0..self.num_columns)
                 .map(|i| {
-                    let constraints = permutation_helpers[i]
+                    let constraint = (permutation_helpers[i]
                         * (witness_columns[i] + beta * generator_power * xi + gamma)
                         * (witness_columns[i] + beta * sigma[i] + gamma)
-                        + beta * (xi * generator_power - sigma[i]);
+                        + beta * (xi * generator_power - sigma[i]))
+                        * circuit_area_selector;
                     generator_power *= F::MULTIPLICATIVE_GENERATOR;
-                    constraints
+                    constraint
                 })
                 .collect();
-            let recurrence_constraint = shifted_permutation_accumulator
+            let recurrence_constraint = (shifted_permutation_accumulator
                 - permutation_accumulator
-                - permutation_helpers.into_iter().sum::<G>();
+                - permutation_helpers.into_iter().sum::<G>())
+                * circuit_area_selector;
             (helper_constraints, recurrence_constraint)
         };
 
@@ -1729,8 +1822,13 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             &[commitment.transcript_hash(COMMIT_INDEX_PERMUTATION_ARGUMENT + 1)],
         );
 
-        let permutation_boundary_constraint =
+        let permutation_start_anchor_constraint =
             permutation_accumulator * lagrange0(xi, self.degree_bound);
+        let permutation_end_anchor_constraint = permutation_accumulator
+            * lagrange0(
+                xi * omega_inv.pow_small_vartime(self.num_rows),
+                self.degree_bound,
+            );
 
         let public_cell_constraint: G = {
             let psi = public_cell_challenge::<F, G, H>(
@@ -1764,8 +1862,11 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         };
 
         let full_constraint = {
-            let mut result = gate_constraint + alpha * permutation_boundary_constraint;
-            let mut power = alpha.square();
+            let mut power = alpha;
+            let mut result = gate_constraint + power * permutation_start_anchor_constraint;
+            power *= alpha;
+            result += power * permutation_end_anchor_constraint;
+            power *= alpha;
             for constraint in permutation_helper_constraints {
                 result += power * constraint;
                 power *= alpha;
@@ -1845,7 +1946,7 @@ mod tests {
             proof.extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
-        assert_eq!(proof.num_polys(), 16);
+        assert_eq!(proof.num_polys(), 17);
         let circuit = circuit.to_compressed(options);
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
@@ -1998,7 +2099,7 @@ mod tests {
             proof.extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
-        assert_eq!(proof.num_polys(), 19);
+        assert_eq!(proof.num_polys(), 20);
         let circuit = circuit.to_compressed(options);
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
