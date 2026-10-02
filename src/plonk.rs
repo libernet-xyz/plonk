@@ -1068,11 +1068,20 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     }
 
     /// `build_permutation_argument` builds the polynomials used in the LogUp permutation argument.
-    /// The components of the returned tuple are, respectively: the accumulator, the start anchor
-    /// constraint, the end anchor constraint, the helper columns, the helper authentication
-    /// constraints, and the recurrence constraint.
+    /// The components of the returned tuple are, respectively: the accumulator `Z`, the start
+    /// anchor constraint, the end anchor constraint, the helper columns `h_i`, the helper
+    /// authentication constraints, and the recurrence constraint.
     ///
-    /// We use the Fiat-Shamir challenge `gamma` as the LogUp abstract variable. The numerator
+    /// The accumulator and helper columns will be committed in the PCS, while the start/end anchor
+    /// constraints, helper authentication constraints, and the recurrence constraints are only
+    /// included in the grand constraint and the computation of the PLONK quotient. Since `Z` and
+    /// the `h_i`s are committed andwitness-derived, this function blinds them by filling the rows
+    /// corresponding to the padding area with random G values so that they don't leak any
+    /// information about the witness ([`padded_circuit_size`] ensures that the padding area has
+    /// enough capacity to warrant effective blinding given the number of rotations used in the
+    /// circuit and the required FRI queries).
+    ///
+    /// We use the Fiat-Shamir challenge `gamma` as the abstract variable for LogUp. The numerator
     /// factors of the standard PLONK permutation argument are:
     ///
     ///   N_i(X) = W_i(X) + beta * g^i * X + gamma
@@ -1110,20 +1119,13 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     ///
     ///   h_i(X) * N_i(X) * D_i(X) + N_i(X) - D_i(X) = 0 mod H
     ///
-    /// The `h_i` columns are committed like regular witness columns, and as such they must be
-    /// randomized in the padding area to avoid leaking information via the openings of the proof
-    /// (that's critical because the helper columns are derived by combining witness data with
-    /// public information, so reconstructing a full helper column allows an observer to trivially
-    /// derive the corresponding witness column). The padding area has no wiring, so every `N_i` and
-    /// `D_i` pair in that region is always equal and the corresponding cells in `h_i` are always
-    /// zero. Randomizing them causes the above authentication constraint to break in padding area,
-    /// so we gate it with the [circuit area selector](`make_circuit_area_selector`) `V(X)`:
+    /// As mentioned above, the `h_i` columns are blinded in the padding area, so the random values
+    /// stored in that area would break the above constraint. For this reason we gate it with the
+    /// [circuit area selector](`make_circuit_area_selector`) `S(X)`:
     ///
-    ///   V(X) * (h_i(X) * N_i(X) * D_i(X) + N_i(X) - D_i(X)) = 0 mod H
+    ///   S(X) * (h_i(X) * N_i(X) * D_i(X) + N_i(X) - D_i(X)) = 0 mod H
     ///
-    /// The helper columns are authenticated by adding this gated equation to the grand quotient.
-    ///
-    /// The start anchor and recurrence constraints of the log-derived accumulator is:
+    /// The start anchor and recurrence constraints of the log-derived accumulator are:
     ///
     ///   Z(X) * L_0(X) = 0 mod H
     ///   Z(wX) - Z(X) - Sum(h_i(X)) = 0 mod H
@@ -1132,18 +1134,17 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     /// [`lagrange0`]).
     ///
     /// Since the expression of the recurrence constraint contains `h_i` it suffers from the same
-    /// breakage as the `h_i`s themselves, so this too needs to be gated by `V(X)`. Moreover, gating
-    /// the recurrence constraint means it is no longer guaranteed to loop back to 0 at the end of
-    /// the domain (it will be 0 only because `V(X)` vanishes at that location), so we need to add a
-    /// new anchor constraint for the tail end. As previously explained, the original
-    /// (non-randomized) helper columns `h_i` are always zero in the padding area, so Z never
-    /// changes in that area; that means Z must loop back to 0 when the circuit area ends, on the
-    /// first padding location. So we can add the following end anchor constraint:
+    /// breakage in the padding area as the `h_i`s themselves, so this too needs to be gated by
+    /// `S(X)`. Moreover, gating the recurrence constraint means it is no longer guaranteed to loop
+    /// back to 0 at the end of the domain (it will be 0 only because `S(X)` vanishes at that
+    /// location), so we need to add a new anchor constraint for the tail end. The original
+    /// (non-randomized) helper columns `h_i` are always zero in the padding area because that area
+    /// has no wires and all `N_i` / `D_i` pairs are identical, so Z never changes in that area;
+    /// that means Z must loop back to 0 when the circuit area ends, on the first padding location.
+    /// So we add the following end anchor constraint:
     ///
     ///   Z(X) * L_{num_rows}(X) = 0 mod H
     ///
-    /// The start anchor, end anchor, and gated recurrence constraints can all be appended to the
-    /// grand constraint used to generate the PLONK quotient.
     fn build_permutation_argument(
         &self,
         witness: &Witness<F>,
@@ -1186,8 +1187,8 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         G::invert_batch(numerator_table.as_mut_slice());
         G::invert_batch(denominator_table.as_mut_slice());
 
-        let mut accumulator = vec![G::ZERO; self.degree_bound + 1];
-        for i in 0..self.degree_bound {
+        let mut accumulator = vec![G::ZERO; self.degree_bound];
+        for i in 0..self.num_rows {
             accumulator[i + 1] = accumulator[i]
                 + (0..self.num_columns)
                     .map(|j| {
@@ -1196,10 +1197,10 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                     })
                     .sum::<G>();
         }
-
-        if accumulator.pop().unwrap() != G::ZERO {
-            return Err(anyhow!("permutation accumulator wraparound check failed"));
+        for i in (self.num_rows + 1)..self.degree_bound {
+            accumulator[i] = G::random_default();
         }
+
         if accumulator[self.num_rows] != G::ZERO {
             return Err(anyhow!("permutation accumulator end anchor check failed"));
         }
@@ -1210,13 +1211,13 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             .chunks(self.degree_bound)
             .zip(denominator_table.chunks(self.degree_bound))
             .map(|(numerators, denominators)| {
-                Polynomial::encode2(
-                    numerators
-                        .iter()
-                        .zip(denominators.iter())
-                        .map(|(&numerator, &denominator)| numerator - denominator)
-                        .collect(),
-                )
+                let mut values: Vec<G> = numerators[0..self.num_rows]
+                    .iter()
+                    .zip(denominators[0..self.num_rows].iter())
+                    .map(|(&numerator, &denominator)| numerator - denominator)
+                    .collect();
+                values.resize_with(self.degree_bound, G::random_default);
+                Polynomial::encode2(values)
             })
             .collect();
 
