@@ -76,13 +76,13 @@ pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
 /// at no cost.
 ///
 /// The minimum number of blinding rows is computed so that the added randomness absorbs the
-/// information leak caused by opening all `rotations` used in the circuit and adds an extra 256
-/// bits on top of that.
+/// information leak caused by opening all FRI queries and all rotations used in the circuit, and
+/// adds an extra 256 bits on top of that.
 ///
-/// In the implementation we always force the 0 and +1 rotations into the provided set because the
-/// main challenge xi and the shifted challenge xi*omega are always opened (for the final algebraic
-/// check and the permutation argument, respectively) even if the circuit doesn't use those
-/// rotations.
+/// In the implementation we always force the 0 and +1 rotations into the provided rotation set
+/// because the main challenge xi and the shifted challenge xi*omega are always opened (for the
+/// final algebraic check and the permutation argument, respectively) even if the circuit doesn't
+/// use those rotations.
 ///
 /// NOTE: when using the extension field pattern (e.g. F=Goldilocks, G=Goldilocks^4) each opened
 /// rotation `W(xi)`, `W(omega*xi)`, etc. leaks `G::BITS` bits of information about the witness
@@ -90,10 +90,10 @@ pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
 /// `F` subfield) and touches all coefficients of the polynomial upon evaluation, so an evaluation
 /// yields 256 bits of information. For this reason our formula is:
 ///
-///   min_blinding_rows = (num_rotations + 1) * ceil(G::LEN / F::LEN)
+///   min_blinding_rows = (num_rotations + num_queries + 1) * ceil(G::LEN / F::LEN)
 ///
-/// ensuring that every opened rotation is absorbed by 256 bits of blinding and 256 bits of excess
-/// are added on top of that.
+/// ensuring that every opened FRI query and every opened rotation is absorbed by 256 bits of
+/// blinding, and 256 bits of excess are added on top of that.
 pub(crate) fn padded_circuit_size<F: Field, G: Field256<BaseField = F>>(
     num_rows: usize,
     blowup_log2: usize,
