@@ -180,26 +180,15 @@ pub struct CompilationOptions {
     /// proving with negative exponents, so enable this flag only if your circuit is correctly
     /// constrained even when those variables are zero.
     pub canonicalize_constraints: bool,
+
+    /// Log2 of the blowup factor used to compute the low-degree extensions for the underlying PCS.
+    pub blowup_log2: usize,
 }
 
 impl Default for CompilationOptions {
     fn default() -> Self {
         Self {
             canonicalize_constraints: false,
-        }
-    }
-}
-
-/// Circuit compilation & proving options.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProvingOptions {
-    /// Log2 of the blowup factor used to compute the low-degree extensions for the underlying PCS.
-    pub blowup_log2: usize,
-}
-
-impl Default for ProvingOptions {
-    fn default() -> Self {
-        Self {
             blowup_log2: OPTIONS_DEFAULT_BLOWUP_LOG2,
         }
     }
@@ -654,6 +643,7 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
             num_rows: self.num_rows,
             degree_bound,
             num_columns: self.num_columns,
+            blowup_log2: options.blowup_log2,
             selectors,
             gates,
             sigma,
@@ -814,6 +804,9 @@ pub struct Circuit<F: Field, G: Field256<BaseField = F>> {
 
     /// Number of witness columns.
     num_columns: usize,
+
+    /// Log2 of the blowup factor.
+    blowup_log2: usize,
 
     /// Gate selectors.
     ///
@@ -1028,14 +1021,14 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         )
     }
 
-    fn make_committer<H: Hasher<G>>(&self, options: &ProvingOptions) -> pcs::Committer<G, H> {
+    fn make_committer<H: Hasher<G>>(&self) -> pcs::Committer<G, H> {
         let circuit_polynomials = self
             .selectors
             .iter()
             .map(Self::embed_polynomial)
             .chain(self.sigma.iter().map(Self::embed_polynomial))
             .collect();
-        pcs::Committer::<G, H>::new(self.degree_bound, options.blowup_log2, circuit_polynomials)
+        pcs::Committer::<G, H>::new(self.degree_bound, self.blowup_log2, circuit_polynomials)
     }
 
     fn get_variable_substitution(
@@ -1356,11 +1349,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
     /// Proves correctness of the given witness, or returns an error in case of a constraint
     /// violation.
-    pub fn prove<H: Hasher<G>>(
-        &self,
-        mut witness: Witness<F>,
-        options: ProvingOptions,
-    ) -> Result<Proof<F, G, H>> {
+    pub fn prove<H: Hasher<G>>(&self, mut witness: Witness<F>) -> Result<Proof<F, G, H>> {
         witness.blind();
         if witness.num_rows() != self.num_rows {
             return Err(anyhow!(
@@ -1384,7 +1373,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             ));
         }
 
-        let mut committer = self.make_committer::<H>(&options);
+        let mut committer = self.make_committer::<H>();
 
         let columns = witness.clone().encode();
         committer.add_batch(columns.iter().map(Self::embed_polynomial).collect());
@@ -1490,16 +1479,13 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         })
     }
 
-    pub fn to_compressed<H: Hasher<G>>(
-        self,
-        options: ProvingOptions,
-    ) -> CompressedCircuit<F, G, H> {
-        let committer = self.make_committer::<H>(&options);
+    pub fn to_compressed<H: Hasher<G>>(self) -> CompressedCircuit<F, G, H> {
+        let committer = self.make_committer::<H>();
         CompressedCircuit {
             num_rows: self.num_rows,
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
-            options,
+            blowup_log2: self.blowup_log2,
             gates: self
                 .gates
                 .into_iter()
@@ -1511,16 +1497,13 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         }
     }
 
-    pub fn as_compressed<H: Hasher<G>>(
-        &self,
-        options: ProvingOptions,
-    ) -> CompressedCircuit<F, G, H> {
-        let committer = self.make_committer::<H>(&options);
+    pub fn as_compressed<H: Hasher<G>>(&self) -> CompressedCircuit<F, G, H> {
+        let committer = self.make_committer::<H>();
         CompressedCircuit {
             num_rows: self.num_rows,
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
-            options,
+            blowup_log2: self.blowup_log2,
             gates: self
                 .gates
                 .iter()
@@ -1534,12 +1517,8 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         }
     }
 
-    pub fn verify<H: Hasher<G>>(
-        &self,
-        proof: &Proof<F, G, H>,
-        options: ProvingOptions,
-    ) -> Result<BTreeMap<Cell, F>> {
-        self.as_compressed::<H>(options).verify(proof)
+    pub fn verify<H: Hasher<G>>(&self, proof: &Proof<F, G, H>) -> Result<BTreeMap<Cell, F>> {
+        self.as_compressed::<H>().verify(proof)
     }
 }
 
@@ -1561,9 +1540,8 @@ pub struct CompressedCircuit<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>
     /// Number of witness columns.
     num_columns: usize,
 
-    /// Proving options used to commit to this circuit (in [`Circuit::as_compressed`] or
-    /// [`Circuit::to_compressed`]).
-    options: ProvingOptions,
+    /// Log2 of the blowup factor.
+    blowup_log2: usize,
 
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
     /// second component is the set of instances of that gate across the circuit.
@@ -1649,11 +1627,11 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 self.degree_bound
             ));
         }
-        if inner_proof.blowup_log2() != self.options.blowup_log2 {
+        if inner_proof.blowup_log2() != self.blowup_log2 {
             return Err(anyhow!(
                 "blowup factor mismatch (got {}, want {})",
                 1usize << inner_proof.blowup_log2(),
-                1usize << self.options.blowup_log2
+                1usize << self.blowup_log2
             ));
         }
 
@@ -1938,6 +1916,7 @@ mod tests {
         builder.declare_public_cells([cell(2, 0), cell(2, 1)]);
         let circuit = builder.build(CompilationOptions {
             canonicalize_constraints,
+            blowup_log2,
         })?;
         assert_eq!(circuit.num_rows(), 3);
         assert_eq!(circuit.degree_bound(), expected_degree_bound);
@@ -1956,8 +1935,7 @@ mod tests {
         witness.set(cell(2, 0), 3u8.into());
         witness.set(cell(2, 1), 35u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
-        let options = ProvingOptions { blowup_log2 };
-        let proof = circuit.prove::<H>(witness, options.clone())?;
+        let proof = circuit.prove::<H>(witness)?;
         assert_eq!(proof.degree_bound(), expected_degree_bound);
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(
@@ -1965,7 +1943,7 @@ mod tests {
             expected_degree_bound << blowup_log2
         );
         assert_eq!(proof.num_polys(), 17);
-        let circuit = circuit.to_compressed(options);
+        let circuit = circuit.to_compressed();
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
         assert_eq!(public_inputs[&cell(2, 0)], 3u8.into());
@@ -2087,6 +2065,7 @@ mod tests {
         builder.declare_public_cells([x_out, y_out, result_out]);
         let circuit = builder.build(CompilationOptions {
             canonicalize_constraints,
+            blowup_log2,
         })?;
         assert_eq!(circuit.num_rows(), 4);
         assert_eq!(circuit.degree_bound(), expected_degree_bound);
@@ -2110,8 +2089,7 @@ mod tests {
         witness.set(cell(3, 1), 4u8.into());
         witness.set(cell(3, 2), 44u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
-        let options = ProvingOptions { blowup_log2 };
-        let proof = circuit.prove::<H>(witness, options.clone())?;
+        let proof = circuit.prove::<H>(witness)?;
         assert_eq!(proof.degree_bound(), expected_degree_bound);
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(
@@ -2119,7 +2097,7 @@ mod tests {
             expected_degree_bound << blowup_log2
         );
         assert_eq!(proof.num_polys(), 20);
-        let circuit = circuit.to_compressed(options);
+        let circuit = circuit.to_compressed();
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
         assert_eq!(public_inputs[&x_out], 3u8.into());
@@ -2169,6 +2147,7 @@ mod tests {
         builder
             .build(CompilationOptions {
                 canonicalize_constraints: false,
+                blowup_log2: 1,
             })
             .unwrap()
     }
@@ -2255,9 +2234,8 @@ mod tests {
         witness.set(cell(1, 2), from_const(35));
         witness.set(cell(2, 0), from_const(3));
         witness.set(cell(2, 1), from_const(35));
-        let options = ProvingOptions { blowup_log2: 1 };
-        let proof = circuit.prove(witness, options.clone()).unwrap();
-        (circuit.to_compressed(options), proof)
+        let proof = circuit.prove(witness).unwrap();
+        (circuit.to_compressed(), proof)
     }
 
     #[test]
