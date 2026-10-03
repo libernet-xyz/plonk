@@ -1,5 +1,4 @@
 use crate::chip::Chip;
-use crate::utils::padded_circuit_size;
 use anyhow::Result;
 use starkom_ff::Field;
 use starkom_poly::Polynomial;
@@ -415,12 +414,9 @@ pub struct Witness<F: Field> {
 }
 
 impl<F: Field> Witness<F> {
-    pub(crate) fn new<R: IntoIterator<Item = isize>>(
-        num_rows: usize,
-        num_columns: usize,
-        rotations: R,
-    ) -> Self {
-        let degree_bound = padded_circuit_size::<F>(num_rows, rotations);
+    pub(crate) fn new(num_rows: usize, num_columns: usize, degree_bound: usize) -> Self {
+        assert!(degree_bound.is_power_of_two());
+        assert!(degree_bound > num_rows);
         Self {
             num_rows,
             degree_bound,
@@ -781,11 +777,9 @@ mod tests {
         );
     }
 
-    const DEFAULT_ROTATIONS: [isize; 2] = [0, 1];
-
     #[test]
     fn test_empty_witness_1x1() {
-        let witness = Witness::new(1, 1, DEFAULT_ROTATIONS);
+        let witness = Witness::new(1, 1, 4);
         assert_eq!(witness.width(), 1);
         assert_eq!(witness.height(), 4);
         assert_eq!(witness.num_rows(), 1);
@@ -797,7 +791,7 @@ mod tests {
 
     #[test]
     fn test_empty_witness_1x2() {
-        let witness = Witness::new(1, 2, DEFAULT_ROTATIONS);
+        let witness = Witness::new(1, 2, 4);
         assert_eq!(witness.width(), 2);
         assert_eq!(witness.height(), 4);
         assert_eq!(witness.num_rows(), 1);
@@ -811,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_empty_witness_1x3() {
-        let witness = Witness::new(1, 3, DEFAULT_ROTATIONS);
+        let witness = Witness::new(1, 3, 4);
         assert_eq!(witness.width(), 3);
         assert_eq!(witness.height(), 4);
         assert_eq!(witness.num_rows(), 1);
@@ -827,7 +821,7 @@ mod tests {
 
     #[test]
     fn test_empty_witness_2x1() {
-        let witness = Witness::new(2, 1, DEFAULT_ROTATIONS);
+        let witness = Witness::new(2, 1, 8);
         assert_eq!(witness.width(), 1);
         assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 2);
@@ -841,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_empty_witness_2x2() {
-        let witness = Witness::new(2, 2, DEFAULT_ROTATIONS);
+        let witness = Witness::new(2, 2, 8);
         assert_eq!(witness.width(), 2);
         assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 2);
@@ -859,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_empty_witness_3x1() {
-        let witness = Witness::new(3, 1, DEFAULT_ROTATIONS);
+        let witness = Witness::new(3, 1, 8);
         assert_eq!(witness.width(), 1);
         assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 3);
@@ -875,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_empty_witness_3x2() {
-        let witness = Witness::new(3, 2, DEFAULT_ROTATIONS);
+        let witness = Witness::new(3, 2, 8);
         assert_eq!(witness.width(), 2);
         assert_eq!(witness.height(), 8);
         assert_eq!(witness.num_rows(), 3);
@@ -896,58 +890,8 @@ mod tests {
     }
 
     #[test]
-    fn test_witness_four_rows_three_rotations_1() {
-        let witness = Witness::new(4, 3, [-1, 0, 1]);
-        assert_eq!(witness.width(), 3);
-        assert_eq!(witness.height(), 8);
-        assert_eq!(witness.num_rows(), 4);
-        assert_eq!(witness.degree_bound(), 8);
-        assert_eq!(witness.num_columns(), 3);
-    }
-
-    #[test]
-    fn test_witness_four_rows_three_rotations_2() {
-        let witness = Witness::new(4, 3, [0, 1, 2]);
-        assert_eq!(witness.width(), 3);
-        assert_eq!(witness.height(), 8);
-        assert_eq!(witness.num_rows(), 4);
-        assert_eq!(witness.degree_bound(), 8);
-        assert_eq!(witness.num_columns(), 3);
-    }
-
-    #[test]
-    fn test_witness_four_rows_four_rotations_1() {
-        let witness = Witness::new(4, 3, [-1, 0, 1, 2]);
-        assert_eq!(witness.width(), 3);
-        assert_eq!(witness.height(), 16);
-        assert_eq!(witness.num_rows(), 4);
-        assert_eq!(witness.degree_bound(), 16);
-        assert_eq!(witness.num_columns(), 3);
-    }
-
-    #[test]
-    fn test_witness_four_rows_four_rotations_2() {
-        let witness = Witness::new(4, 3, [-2, -1, 0, 1]);
-        assert_eq!(witness.width(), 3);
-        assert_eq!(witness.height(), 16);
-        assert_eq!(witness.num_rows(), 4);
-        assert_eq!(witness.degree_bound(), 16);
-        assert_eq!(witness.num_columns(), 3);
-    }
-
-    #[test]
-    fn test_witness_four_rows_five_rotations() {
-        let witness = Witness::new(4, 3, [-2, -1, 0, 1, 2]);
-        assert_eq!(witness.width(), 3);
-        assert_eq!(witness.height(), 16);
-        assert_eq!(witness.num_rows(), 4);
-        assert_eq!(witness.degree_bound(), 16);
-        assert_eq!(witness.num_columns(), 3);
-    }
-
-    #[test]
     fn test_contains_cell_root_view() {
-        let witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let witness = Witness::new(3, 4, 8);
         assert!(witness.contains_cell(cell(0, 0)));
         assert!(witness.contains_cell(cell(0, 3)));
         assert!(witness.contains_cell(cell(7, 0)));
@@ -959,7 +903,7 @@ mod tests {
 
     #[test]
     fn test_update_witness() {
-        let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(2, 3, 8);
         witness.set(cell(0, 1), from_const(42));
         witness.set(cell(1, 2), from_const(43));
         assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
@@ -978,7 +922,7 @@ mod tests {
 
     #[test]
     fn test_copy_cell() {
-        let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(2, 3, 8);
         witness.set(cell(0, 1), from_const(44));
         assert_eq!(witness.copy(cell(0, 1).into(), cell(1, 2)), from_const(44));
         assert_eq!(witness.get_at(cell(0, 0)), from_const(0));
@@ -997,7 +941,7 @@ mod tests {
 
     #[test]
     fn test_get_unconstrained_value() {
-        let mut witness = Witness::new(1, 1, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(1, 1, 4);
         witness.set(cell(0, 0), from_const(12));
         assert_eq!(witness.get(cell(0, 0).into()), from_const(12));
         assert_eq!(witness.get(from_const(34).into()), from_const(34));
@@ -1006,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_blind() {
-        let mut witness = Witness::new(2, 3, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(2, 3, 8);
         witness.set(cell(0, 1), from_const(44));
         assert_eq!(witness.copy(cell(0, 1).into(), cell(1, 2)), from_const(44));
         witness.blind();
@@ -1030,7 +974,7 @@ mod tests {
 
     #[test]
     fn test_root_view_cells() {
-        let witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let witness = Witness::new(3, 4, 8);
         assert_eq!(witness.cell(0, 0), cell(0, 0));
         assert_eq!(witness.cell(0, 1), cell(0, 1));
         assert_eq!(witness.cell(0, 2), cell(0, 2));
@@ -1044,7 +988,7 @@ mod tests {
 
     #[test]
     fn test_sub_view_1() {
-        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(3, 4, 8);
         witness.set(cell(0, 0), from_const(1));
         witness.set(cell(0, 1), from_const(2));
         witness.set(cell(0, 2), from_const(3));
@@ -1075,7 +1019,7 @@ mod tests {
 
     #[test]
     fn test_sub_view_2() {
-        let mut witness = Witness::new(4, 3, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(4, 3, 8);
         witness.set(cell(0, 0), from_const(1));
         witness.set(cell(0, 1), from_const(2));
         witness.set(cell(0, 2), from_const(3));
@@ -1100,7 +1044,7 @@ mod tests {
 
     #[test]
     fn test_update_sub_view_1() {
-        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(3, 4, 8);
         witness.set(cell(0, 0), from_const(1));
         witness.set(cell(0, 1), from_const(2));
         witness.set(cell(0, 2), from_const(3));
@@ -1132,7 +1076,7 @@ mod tests {
 
     #[test]
     fn test_update_sub_view_2() {
-        let mut witness = Witness::new(4, 3, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(4, 3, 8);
         witness.set(cell(0, 0), from_const(1));
         witness.set(cell(0, 1), from_const(2));
         witness.set(cell(0, 2), from_const(3));
@@ -1158,7 +1102,7 @@ mod tests {
 
     #[test]
     fn test_get_unconstrained_value_from_sub_view() {
-        let mut witness = Witness::new(4, 3, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(4, 3, 8);
         witness.set(cell(0, 0), from_const(1));
         witness.set(cell(0, 1), from_const(2));
         witness.set(cell(0, 2), from_const(3));
@@ -1179,7 +1123,7 @@ mod tests {
 
     #[test]
     fn test_contains_cell_sub_view() {
-        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(3, 4, 8);
         let view = witness.sub(1, 2, 2.into(), 3.into());
         assert!(view.contains_cell(cell(1, 2)));
         assert!(view.contains_cell(cell(1, 3)));
@@ -1193,7 +1137,7 @@ mod tests {
 
     #[test]
     fn test_sub_fn_reads_and_writes() {
-        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(3, 4, 8);
         witness.set(cell(0, 0), from_const(1));
         witness.set(cell(0, 1), from_const(2));
         witness.set(cell(0, 2), from_const(3));
@@ -1221,7 +1165,7 @@ mod tests {
 
     #[test]
     fn test_sub_fn_default_dimensions() {
-        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(3, 4, 8);
         let mut width = 0;
         let mut height = 0;
         witness.sub_fn(1, 1, None, None, |view| {
@@ -1234,7 +1178,7 @@ mod tests {
 
     #[test]
     fn test_sub_fn_chainability() {
-        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(3, 4, 8);
         witness
             .sub_fn(0, 0, 2.into(), 2.into(), |view| {
                 view.set(cell(0, 0), from_const(1));
@@ -1248,7 +1192,7 @@ mod tests {
 
     #[test]
     fn test_sub_fn_or_ok_reads_and_writes() {
-        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(3, 4, 8);
         witness.set(cell(1, 2), from_const(7));
         let mut read_value = from_const(0);
         let result = witness.sub_fn_or(1, 2, 2.into(), 3.into(), |view| {
@@ -1263,7 +1207,7 @@ mod tests {
 
     #[test]
     fn test_sub_fn_or_default_dimensions() {
-        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(3, 4, 8);
         let mut width = 0;
         let mut height = 0;
         let result = witness.sub_fn_or(1, 1, None, None, |view| {
@@ -1278,7 +1222,7 @@ mod tests {
 
     #[test]
     fn test_sub_fn_or_propagates_error() {
-        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(3, 4, 8);
         let result = witness.sub_fn_or(1, 2, 2.into(), 3.into(), |view| {
             view.set(cell(1, 2), from_const(42));
             Err(anyhow!("callback failed"))
@@ -1289,7 +1233,7 @@ mod tests {
 
     #[test]
     fn test_sub_fn_or_chainability() {
-        let mut witness = Witness::new(3, 4, DEFAULT_ROTATIONS);
+        let mut witness = Witness::new(3, 4, 8);
         witness
             .sub_fn_or(0, 0, 2.into(), 2.into(), |view| {
                 view.set(cell(0, 0), from_const(1));

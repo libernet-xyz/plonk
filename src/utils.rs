@@ -2,7 +2,7 @@ use crate::witness::Cell;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
 use sha3::Digest;
-use starkom_ff::Field;
+use starkom_ff::{Field, Field256};
 use std::collections::BTreeSet;
 
 /// Helper function used to derive domain separator tags used in various contexts.
@@ -71,8 +71,8 @@ pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
 /// The returned value is the total number of rows, always a power of two and suitable for use as
 /// the size of the evaluation domain. Callers are expected to blind *all* of the rows past the
 /// `num_rows` witness rows rather than just the minimum: the extra rows are there anyway due to the
-/// power-of-two rounding, and padding them with random values rather than zeros adds margin at no
-/// cost.
+/// power-of-two rounding, and padding them with random values rather than zeros adds safety margin
+/// at no cost.
 ///
 /// The minimum number of blinding rows is computed so that the added randomness absorbs the
 /// information leak caused by opening all `rotations` used in the circuit and adds an extra 256
@@ -89,12 +89,13 @@ pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
 /// `F` subfield) and touches all coefficients of the polynomial upon evaluation, so an evaluation
 /// yields 256 bits of information. For this reason our formula is:
 ///
-///   min_blinding_rows = (num_rotations + 1) * ceil(32 / F::LEN)
+///   min_blinding_rows = (num_rotations + 1) * ceil(G::LEN / F::LEN)
 ///
 /// ensuring that every opened rotation is absorbed by 256 bits of blinding and 256 bits of excess
 /// are added on top of that.
-pub(crate) fn padded_circuit_size<F: Field>(
+pub(crate) fn padded_circuit_size<F: Field, G: Field256<BaseField = F>>(
     num_rows: usize,
+    _blowup_log2: usize,
     rotations: impl IntoIterator<Item = isize>,
 ) -> usize {
     let num_rotations = [0isize, 1isize]
@@ -102,7 +103,7 @@ pub(crate) fn padded_circuit_size<F: Field>(
         .chain(rotations.into_iter())
         .collect::<BTreeSet<isize>>()
         .len();
-    let min_blinding_rows = (num_rotations + 1) * 32usize.div_ceil(F::LEN);
+    let min_blinding_rows = (num_rotations + 1) * G::LEN.div_ceil(F::LEN);
     (num_rows + min_blinding_rows).next_power_of_two()
 }
 
@@ -110,6 +111,7 @@ pub(crate) fn padded_circuit_size<F: Field>(
 mod tests {
     use super::*;
     use starkom_bluesky::{Scalar as BS, from_const};
+    use starkom_goldilocks::{GL, GL4};
 
     #[test]
     fn test_isize_to_scalar() {
@@ -171,5 +173,55 @@ mod tests {
         );
         assert_eq!(scalar_to_isize(min).unwrap(), isize::MIN);
         assert!(scalar_to_isize(min - from_const(1)).is_err());
+    }
+
+    #[test]
+    fn test_padded_circuit_size_bluesky() {
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 1, [0, 1]), 4);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 1, [0, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 1, [0, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(4, 1, [0, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(5, 1, [0, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(6, 1, [0, 1]), 16);
+        assert_eq!(padded_circuit_size::<BS, BS>(7, 1, [0, 1]), 16);
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 1, [-1, 0, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 1, [-1, 0, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 1, [-1, 0, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(4, 1, [-1, 0, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(5, 1, [-1, 0, 1]), 16);
+        assert_eq!(padded_circuit_size::<BS, BS>(6, 1, [-1, 0, 1]), 16);
+        assert_eq!(padded_circuit_size::<BS, BS>(7, 1, [-1, 0, 1]), 16);
+    }
+
+    #[test]
+    fn test_padded_circuit_size_goldilocks() {
+        assert_eq!(padded_circuit_size::<GL, GL4>(1, 1, [0, 1]), 16);
+        assert_eq!(padded_circuit_size::<GL, GL4>(2, 1, [0, 1]), 16);
+        assert_eq!(padded_circuit_size::<GL, GL4>(3, 1, [0, 1]), 16);
+        assert_eq!(padded_circuit_size::<GL, GL4>(4, 1, [0, 1]), 16);
+        assert_eq!(padded_circuit_size::<GL, GL4>(5, 1, [0, 1]), 32);
+        assert_eq!(padded_circuit_size::<GL, GL4>(6, 1, [0, 1]), 32);
+        assert_eq!(padded_circuit_size::<GL, GL4>(19, 1, [0, 1]), 32);
+        assert_eq!(padded_circuit_size::<GL, GL4>(20, 1, [0, 1]), 32);
+        assert_eq!(padded_circuit_size::<GL, GL4>(21, 1, [0, 1]), 64);
+        assert_eq!(padded_circuit_size::<GL, GL4>(22, 1, [0, 1]), 64);
+        assert_eq!(padded_circuit_size::<GL, GL4>(1, 1, [-1, 0, 1]), 32);
+        assert_eq!(padded_circuit_size::<GL, GL4>(2, 1, [-1, 0, 1]), 32);
+        assert_eq!(padded_circuit_size::<GL, GL4>(3, 1, [-1, 0, 1]), 32);
+        assert_eq!(padded_circuit_size::<GL, GL4>(15, 1, [-1, 0, 1]), 32);
+        assert_eq!(padded_circuit_size::<GL, GL4>(16, 1, [-1, 0, 1]), 32);
+        assert_eq!(padded_circuit_size::<GL, GL4>(17, 1, [-1, 0, 1]), 64);
+        assert_eq!(padded_circuit_size::<GL, GL4>(18, 1, [-1, 0, 1]), 64);
+    }
+
+    #[test]
+    fn test_padded_circuit_size_duplicate_rotations() {
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 1, [0, 1, 1]), 4);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 1, [0, 1, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 1, [0, 1, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(4, 1, [0, 1, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(5, 1, [0, 1, 1]), 8);
+        assert_eq!(padded_circuit_size::<BS, BS>(6, 1, [0, 1, 1]), 16);
+        assert_eq!(padded_circuit_size::<BS, BS>(7, 1, [0, 1, 1]), 16);
     }
 }

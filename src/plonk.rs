@@ -592,8 +592,9 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
             }
         }
 
-        let degree_bound = padded_circuit_size::<F>(
+        let degree_bound = padded_circuit_size::<F, G>(
             self.num_rows,
+            options.blowup_log2,
             self.gates.iter().flat_map(|(constraint, _)| {
                 constraint
                     .get_free_variables()
@@ -875,17 +876,15 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
     /// Makes an empty [`Witness`] objects suitable for use with this circuit.
     pub fn make_witness(&self) -> Witness<F> {
-        Witness::new(
-            self.num_rows,
-            self.num_columns,
-            self.gates.iter().flat_map(|(constraint, _)| {
-                constraint
-                    .get_free_variables()
-                    .iter()
-                    .map(Variable::rotation)
-                    .collect::<BTreeSet<isize>>()
-            }),
-        )
+        let rotations = self.gates.iter().flat_map(|(constraint, _)| {
+            constraint
+                .get_free_variables()
+                .iter()
+                .map(Variable::rotation)
+                .collect::<BTreeSet<isize>>()
+        });
+        let degree_bound = padded_circuit_size::<F, G>(self.num_rows, self.blowup_log2, rotations);
+        Witness::new(self.num_rows, self.num_columns, degree_bound)
     }
 
     /// Performs various checks to verify that the provided `witness` is compatible with this
@@ -2155,7 +2154,7 @@ mod tests {
     #[test]
     fn test_check_witness_detects_wrong_number_of_rows() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(4, 3, [0, 1]);
+        let witness = Witness::new(4, 3, circuit.degree_bound());
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("wrong number of rows"));
     }
@@ -2163,7 +2162,7 @@ mod tests {
     #[test]
     fn test_check_witness_detects_wrong_number_of_columns() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(3, 4, [0, 1]);
+        let witness = Witness::new(3, 4, circuit.degree_bound());
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("wrong number of columns"));
     }
@@ -2171,7 +2170,7 @@ mod tests {
     #[test]
     fn test_check_witness_detects_wrong_degree_bound() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(3, 3, [-2, -1, 0, 1, 2]);
+        let witness = Witness::new(3, 3, circuit.degree_bound() * 2);
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("incorrect degree bound"));
     }
