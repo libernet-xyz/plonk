@@ -868,6 +868,14 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         self.num_columns
     }
 
+    pub fn blowup_log2(&self) -> usize {
+        self.blowup_log2
+    }
+
+    pub fn is_blinded(&self) -> bool {
+        self.blinded
+    }
+
     pub fn num_gates(&self) -> usize {
         self.gates
             .iter()
@@ -1594,6 +1602,14 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         self.num_columns
     }
 
+    pub fn blowup_log2(&self) -> usize {
+        self.blowup_log2
+    }
+
+    pub fn is_blinded(&self) -> bool {
+        self.blinded
+    }
+
     pub fn public_cells(&self) -> &BTreeSet<Cell> {
         &self.public_cells
     }
@@ -1948,6 +1964,8 @@ mod tests {
         assert_eq!(circuit.num_rows(), 3);
         assert_eq!(circuit.degree_bound(), expected_degree_bound);
         assert_eq!(circuit.num_columns(), 3);
+        assert_eq!(circuit.blowup_log2(), blowup_log2);
+        assert_eq!(circuit.is_blinded(), blind);
         assert_eq!(circuit.num_gates(), 3);
         assert_eq!(circuit.get_max_gate_degree(), 2);
         let mut witness = circuit.make_witness();
@@ -2195,6 +2213,8 @@ mod tests {
         assert_eq!(circuit.num_rows(), 4);
         assert_eq!(circuit.degree_bound(), expected_degree_bound);
         assert_eq!(circuit.num_columns(), 4);
+        assert_eq!(circuit.blowup_log2(), blowup_log2);
+        assert_eq!(circuit.is_blinded(), blind);
         assert_eq!(circuit.num_gates(), 3);
         assert_eq!(circuit.get_max_gate_degree(), 2);
         let mut witness = circuit.make_witness();
