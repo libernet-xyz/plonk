@@ -76,6 +76,13 @@ pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
 /// power-of-two rounding, and padding them with random values rather than zeros adds safety margin
 /// at no cost.
 ///
+/// The returned value is never less than 2. Every committed polynomial has degree lower than it,
+/// which is what the whole degree accounting of
+/// [`quotient_degree_bound`](`crate::plonk::quotient_degree_bound`) rests on, but the numerator
+/// factors of the permutation argument contain a `beta * g^i * X` term whose degree is 1 no matter
+/// how small the circuit is. A single-row circuit with blinding disabled would otherwise get a
+/// one-element domain, where that term alone overflows a quotient degree bound of `(1 - 1) * E`.
+///
 /// The minimum number of blinding rows is computed so that the added randomness absorbs the
 /// information leak caused by opening all FRI queries and all rotations used in the circuit, and
 /// adds an extra 256 bits on top of that.
@@ -111,7 +118,7 @@ pub(crate) fn padded_circuit_size<F: Field, G: Field256<BaseField = F>>(
     } else {
         0
     };
-    (num_rows + min_blinding_rows).next_power_of_two()
+    std::cmp::max(2, (num_rows + min_blinding_rows).next_power_of_two())
 }
 
 #[cfg(test)]
