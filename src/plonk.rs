@@ -68,7 +68,7 @@ fn get_rotation_set<'a, F: Field>(
 /// several polynomial multiplications, such as the gate selectors multiplied by the gate
 /// constraints combined with the witness columns.
 ///
-/// The algorithm uses the formula `(N - 1) * E`, where `E = max(max_gate_degree, 2)`. The rationale
+/// The algorithm uses the formula `(N - 1) * E`, where `E = max(max_gate_degree, 3)`. The rationale
 /// behind it is:
 ///
 /// * each column has degree less than or equal to `N - 1`;
@@ -77,11 +77,13 @@ fn get_rotation_set<'a, F: Field>(
 ///   with the constraint columns contributes `max_gate_degree` more);
 /// * each helper authentication constraint of the permutation argument is the product of three
 ///   polynomials of degree less than `N` (the helper column, the numerator factor, and the
-///   denominator factor), so it has degree less than or equal to `3 * (N - 1)`, which is where the
-///   floor of 2 on `E` comes from;
-/// * the boundary and public cell constraints have degree less than or equal to `2 * (N - 1)`, and
-///   the recurrence constraint is linear in the committed columns, so none of them exceeds the
-///   above;
+///   denominator factor) times the [circuit area selector](`Circuit::circuit_area_selector`) of
+///   degree `N - num_rows`, for a total of `3 * (N - 1) + N - num_rows`; every circuit has at least
+///   one row, so that never exceeds `4 * (N - 1)`, and covering it with the `(N - 1) * (1 + E)`
+///   bound below requires `1 + E >= 4`, hence `E >= 3`;
+/// * the anchor and public cell constraints have degree less than or equal to `2 * (N - 1)`, and
+///   the recurrence constraint is linear in the committed columns even after being gated, so none
+///   of them exceeds the above;
 /// * the grand PLONK constraint therefore has degree less than or equal to `(N - 1) * (1 + E)`;
 /// * dividing that by the zero polynomial (`x^N - 1`, degree-N) yields a quotient with degree
 ///   `(N - 1) * (1 + E) - N`;
@@ -89,15 +91,66 @@ fn get_rotation_set<'a, F: Field>(
 /// * ... which simplifies to `(N - 1) * E`.
 fn quotient_degree_bound<'a, F: Field>(
     degree_bound: usize,
-    gate_constraints: impl Iterator<Item = &'a Constraint<F>>,
+    gate_constraints: impl IntoIterator<Item = &'a Constraint<F>>,
 ) -> usize {
     let max_gate_degree = gate_constraints
+        .into_iter()
         .map(|constraint| constraint.get_degree())
         .max()
         .unwrap_or(0);
-    (degree_bound - 1) * std::cmp::max(max_gate_degree, 2)
+    (degree_bound - 1) * std::cmp::max(max_gate_degree, 3)
 }
 
+/// Calculates the degree bound of the polynomials used to mask the
+/// [quotient split](`Circuit::split_quotient`).
+fn mask_degree_bound<'a, F: Field>(
+    blowup_log2: usize,
+    gate_constraints: impl IntoIterator<Item = &'a Constraint<F>>,
+) -> usize {
+    get_rotation_set(gate_constraints).len() + pcs::num_queries(blowup_log2) + 1
+}
+
+/// Builds a polynomial vanishes on the padding area. Used to switch the permutation argument off in
+/// the padding area while keeping it active in the circuit area, hence the name.
+///
+/// REQUIRES: `degree_bound` must be strictly greater than `num_rows` (all circuits must have a
+/// padding area to fit blinding rows).
+///
+/// Note that this function computes the vanishing polynomial of the padding area rather than the
+/// Lagrange indicator of the witness rows: the two gate constraints identically, but this one has
+/// degree `N - num_rows` rather than `N - 1`.
+fn make_circuit_area_selector<F: Field>(num_rows: usize, degree_bound: usize) -> Polynomial<F> {
+    let padding_size = degree_bound - num_rows;
+    let omega: F = Polynomial::<F>::domain_element2(1, degree_bound).into();
+    let mut coefficients: Vec<F> = Vec::with_capacity(padding_size);
+    coefficients.push(F::ONE);
+    let mut power = omega.pow_small(num_rows);
+    for i in 0..padding_size {
+        coefficients.push(F::ZERO);
+        for j in (0..=i).rev() {
+            let previous = coefficients[j];
+            coefficients[j + 1] -= power * previous;
+        }
+        power *= omega;
+    }
+    coefficients.reverse();
+    Polynomial::with_coefficients(coefficients)
+}
+
+/// Evaluates [`make_circuit_area_selector`] at a point, without materializing the polynomial.
+fn circuit_area_selector<F: Field>(x: F, num_rows: usize, degree_bound: usize) -> F {
+    let omega: F = Polynomial::<F>::domain_element2(1, degree_bound).into();
+    let mut power = omega.pow_small_vartime(num_rows);
+    let mut result = F::ONE;
+    for _ in num_rows..degree_bound {
+        result *= x - power;
+        power *= omega;
+    }
+    result
+}
+
+/// Evaluates the [Lagrange basis `L_0`](`Polynomial::lagrange0_2`) at a point, without
+/// materializing the polynomial.
 fn lagrange0<F: Field256>(x: F, n: usize) -> F {
     (x.pow_small(n) - F::ONE) * (F::from(n as u64) * (x - F::ONE)).invert_unwrap()
 }
@@ -124,7 +177,7 @@ fn public_cell_challenge<F: Field, G: Field256, H: Hasher<G>>(
 
 /// Circuit compilation & proving options.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompilationOptions {
+pub struct Options {
     /// Converts all constraints to canonical form using [`Constraint::canonicalize`].
     ///
     /// When disabled, proving errors out rather than attempting canonicalization if there are
@@ -137,27 +190,24 @@ pub struct CompilationOptions {
     /// proving with negative exponents, so enable this flag only if your circuit is correctly
     /// constrained even when those variables are zero.
     pub canonicalize_constraints: bool,
+
+    /// Log2 of the blowup factor used to compute the low-degree extensions for the underlying PCS.
+    pub blowup_log2: usize,
+
+    /// Indicates whether or not blinding must be added to the circuit. In other words, this flag
+    /// toggles the zero-knowledge feature of Starkom.
+    ///
+    /// Blinding is disabled by default because it may add an extra cost due to increasing the
+    /// minimum padding area and adding an extra column for FRI randomization.
+    pub blind: bool,
 }
 
-impl Default for CompilationOptions {
+impl Default for Options {
     fn default() -> Self {
         Self {
             canonicalize_constraints: false,
-        }
-    }
-}
-
-/// Circuit compilation & proving options.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProvingOptions {
-    /// Log2 of the blowup factor used to compute the low-degree extensions for the underlying PCS.
-    pub blowup_log2: usize,
-}
-
-impl Default for ProvingOptions {
-    fn default() -> Self {
-        Self {
             blowup_log2: OPTIONS_DEFAULT_BLOWUP_LOG2,
+            blind: false,
         }
     }
 }
@@ -542,7 +592,7 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
     }
 
     /// Compiles the circuit built so far into a [`Circuit`] object.
-    pub fn build(mut self, options: CompilationOptions) -> Result<Circuit<F, G>> {
+    pub fn build(mut self, options: Options) -> Result<Circuit<F, G>> {
         if options.canonicalize_constraints {
             let mut old_gates: BTreeMap<Constraint<F>, Vec<Cell>> = BTreeMap::default();
             std::mem::swap(&mut self.gates, &mut old_gates);
@@ -560,8 +610,10 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
             }
         }
 
-        let degree_bound = padded_circuit_size::<F>(
+        let degree_bound = padded_circuit_size::<F, G>(
             self.num_rows,
+            options.blowup_log2,
+            options.blind,
             self.gates.iter().flat_map(|(constraint, _)| {
                 constraint
                     .get_free_variables()
@@ -611,10 +663,13 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
             num_rows: self.num_rows,
             degree_bound,
             num_columns: self.num_columns,
+            blowup_log2: options.blowup_log2,
+            blinded: options.blind,
             selectors,
             gates,
             sigma,
             sigma_values,
+            circuit_area_selector: make_circuit_area_selector(self.num_rows, degree_bound),
             public_cells: self.public_cells,
             _data: PhantomData,
         })
@@ -741,10 +796,9 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> Proof<F, G, H> {
 
     /// Returns the number of committed polynomials.
     ///
-    /// These include the circuit selectors and sigma polynomials, the witness columns, the
-    /// permutation argument accumulator along with its
-    /// [partial products](`Circuit::build_permutation_argument`), and the chunks of the grand
-    /// quotient.
+    /// These include the circuit selectors, the sigma polynomials, the witness columns, the
+    /// permutation argument accumulator, the LogUp helper columns, the chunks of the grand
+    /// quotient, and the FRI randomizer.
     pub fn num_polys(&self) -> usize {
         self.inner_proof.num_polys()
     }
@@ -772,6 +826,12 @@ pub struct Circuit<F: Field, G: Field256<BaseField = F>> {
     /// Number of witness columns.
     num_columns: usize,
 
+    /// Log2 of the blowup factor.
+    blowup_log2: usize,
+
+    /// Whether or not the circuit is blinded (see [`Options::blind`]).
+    blinded: bool,
+
     /// Gate selectors.
     ///
     /// This is a pool of Lagrange bases that the grand gate constraint uses to selectively activate
@@ -793,6 +853,12 @@ pub struct Circuit<F: Field, G: Field256<BaseField = F>> {
     /// The layout is analogous to [`Self::sigma`] itself: the values are indexed column-first.
     sigma_values: Vec<Vec<F>>,
 
+    /// Selector that switches the permutation argument off in the padding area.
+    ///
+    /// See [`make_circuit_area_selector`]. It's never committed: the verifier evaluates it directly
+    /// with [`circuit_area_selector`].
+    circuit_area_selector: Polynomial<F>,
+
     /// List of witness cells that are revealed in the proofs.
     public_cells: BTreeSet<Cell>,
 
@@ -812,6 +878,14 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         self.num_columns
     }
 
+    pub fn blowup_log2(&self) -> usize {
+        self.blowup_log2
+    }
+
+    pub fn is_blinded(&self) -> bool {
+        self.blinded
+    }
+
     pub fn num_gates(&self) -> usize {
         self.gates
             .iter()
@@ -823,19 +897,26 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         &self.public_cells
     }
 
+    pub fn get_max_gate_degree(&self) -> usize {
+        self.gates
+            .iter()
+            .map(|(constraint, _)| constraint.get_degree())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Makes an empty [`Witness`] objects suitable for use with this circuit.
     pub fn make_witness(&self) -> Witness<F> {
-        Witness::new(
-            self.num_rows,
-            self.num_columns,
-            self.gates.iter().flat_map(|(constraint, _)| {
-                constraint
-                    .get_free_variables()
-                    .iter()
-                    .map(Variable::rotation)
-                    .collect::<BTreeSet<isize>>()
-            }),
-        )
+        let rotations = self.gates.iter().flat_map(|(constraint, _)| {
+            constraint
+                .get_free_variables()
+                .iter()
+                .map(Variable::rotation)
+                .collect::<BTreeSet<isize>>()
+        });
+        let degree_bound =
+            padded_circuit_size::<F, G>(self.num_rows, self.blowup_log2, self.blinded, rotations);
+        Witness::new(self.num_rows, self.num_columns, degree_bound)
     }
 
     /// Performs various checks to verify that the provided `witness` is compatible with this
@@ -971,14 +1052,14 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         )
     }
 
-    fn make_committer<H: Hasher<G>>(&self, options: &ProvingOptions) -> pcs::Committer<G, H> {
+    fn make_committer<H: Hasher<G>>(&self) -> pcs::Committer<G, H> {
         let circuit_polynomials = self
             .selectors
             .iter()
             .map(Self::embed_polynomial)
             .chain(self.sigma.iter().map(Self::embed_polynomial))
             .collect();
-        pcs::Committer::<G, H>::new(self.degree_bound, options.blowup_log2, circuit_polynomials)
+        pcs::Committer::<G, H>::new(self.degree_bound, self.blowup_log2, circuit_polynomials)
     }
 
     fn get_variable_substitution(
@@ -1009,11 +1090,21 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         substitution
     }
 
-    /// Builds the polynomials used in the LogUp permutation argument. The components of the
-    /// returned tuple are, respectively: the accumulator, the boundary constraint, the helper
-    /// columns, the helper authentication constraints, and the recurrence constraint.
+    /// `build_permutation_argument` builds the polynomials used in the LogUp permutation argument.
+    /// The components of the returned tuple are, respectively: the accumulator `Z`, the start
+    /// anchor constraint, the end anchor constraint, the helper columns `h_i`, the helper
+    /// authentication constraints, and the recurrence constraint.
     ///
-    /// We use the Fiat-Shamir challenge `gamma` as the LogUp abstract variable. The numerator
+    /// The accumulator and helper columns will be committed in the PCS, while the start/end anchor
+    /// constraints, helper authentication constraints, and the recurrence constraints are only
+    /// included in the grand constraint and the computation of the PLONK quotient. Since `Z` and
+    /// the `h_i`s are committed and witness-derived, this function blinds them by filling the rows
+    /// corresponding to the padding area with random G values so that they don't leak any
+    /// information about the witness ([`padded_circuit_size`] ensures that the padding area has
+    /// enough capacity to warrant effective blinding given the number of rotations used in the
+    /// circuit and the required FRI queries).
+    ///
+    /// We use the Fiat-Shamir challenge `gamma` as the abstract variable for LogUp. The numerator
     /// factors of the standard PLONK permutation argument are:
     ///
     ///   N_i(X) = W_i(X) + beta * g^i * X + gamma
@@ -1046,22 +1137,37 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     ///
     /// (`FFT^-1` is the inverse Fourier Transform, as implemented in [`Polynomial::encode2`].)
     ///
-    /// Since `1 / N - 1 / D = (D - N) / (N * D)`, the helpers are authenticated by adding the
-    /// following constraint to the grand quotient:
+    /// Since `1 / N - 1 / D = (D - N) / (N * D)`, the helpers are authenticated by the following
+    /// constraint:
     ///
     ///   h_i(X) * N_i(X) * D_i(X) + N_i(X) - D_i(X) = 0 mod H
     ///
-    /// which pins `h_i` to the intended value at every row where `N_i * D_i` doesn't vanish; the
-    /// probability of `N_i` or `D_i` vanishing at some row is negligible over the choice of
-    /// `gamma`.
+    /// As mentioned above, the `h_i` columns are blinded in the padding area, so the random values
+    /// stored in that area would break the above constraint. For this reason we gate it with the
+    /// [circuit area selector](`make_circuit_area_selector`) `S(X)`:
     ///
-    /// The boundary and recurrence constraints of the log-derived accumulator are:
+    ///   S(X) * (h_i(X) * N_i(X) * D_i(X) + N_i(X) - D_i(X)) = 0 mod H
+    ///
+    /// The start anchor and recurrence constraints of the log-derived accumulator are:
     ///
     ///   Z(X) * L_0(X) = 0 mod H
     ///   Z(wX) - Z(X) - Sum(h_i(X)) = 0 mod H
     ///
-    /// where [`L_0`](`lagrange0`) is the Lagrange basis that activates at w^0 = 1 and vanishes
-    /// everywhere else.
+    /// where `L_0` is the Lagrange basis that activates at `w^0` and vanishes everywhere else (see
+    /// [`lagrange0`]).
+    ///
+    /// Since the expression of the recurrence constraint contains `h_i` it suffers from the same
+    /// breakage in the padding area as the `h_i`s themselves, so this too needs to be gated by
+    /// `S(X)`. Moreover, gating the recurrence constraint means it is no longer guaranteed to loop
+    /// back to 0 at the end of the domain (it will be 0 only because `S(X)` vanishes at that
+    /// location), so we need to add a new anchor constraint for the tail end. The original
+    /// (non-randomized) helper columns `h_i` are always zero in the padding area because that area
+    /// has no wires and all `N_i` / `D_i` pairs are identical, so Z never changes in that area;
+    /// that means Z must loop back to 0 when the circuit area ends, on the first padding location.
+    /// So we add the following end anchor constraint:
+    ///
+    ///   Z(X) * L_{num_rows}(X) = 0 mod H
+    ///
     fn build_permutation_argument(
         &self,
         witness: &Witness<F>,
@@ -1070,12 +1176,15 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         gamma: G,
     ) -> Result<(
         Polynomial<G>,      // accumulator
-        Polynomial<G>,      // boundary constraint
+        Polynomial<G>,      // start anchor constraint
+        Polynomial<G>,      // end anchor constraint
         Vec<Polynomial<G>>, // helper columns
         Vec<Polynomial<G>>, // helper constraints
         Polynomial<G>,      // recurrence constraint
     )> {
         let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
+        let omega_inv = omega.invert_vartime().unwrap();
+        let circuit_area_selector = Self::embed_polynomial(&self.circuit_area_selector);
 
         // Helper columns are initially stored in these two flat arrays, expressed in the value
         // domain and laid out in column-major order. Later on they're converted to individual
@@ -1101,9 +1210,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         G::invert_batch(numerator_table.as_mut_slice());
         G::invert_batch(denominator_table.as_mut_slice());
 
-        let mut accumulator = vec![G::ZERO; self.degree_bound + 1];
-        for i in 0..self.degree_bound {
-            accumulator[i + 1] = accumulator[i]
+        let mut accumulator = vec![G::ZERO; self.degree_bound];
+        for i in 0..self.num_rows {
+            accumulator[(i + 1) % self.degree_bound] = accumulator[i]
                 + (0..self.num_columns)
                     .map(|j| {
                         numerator_table[j * self.degree_bound + i]
@@ -1111,9 +1220,11 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                     })
                     .sum::<G>();
         }
-
-        if accumulator.pop().unwrap() != G::ZERO {
-            return Err(anyhow!("permutation accumulator wraparound check failed"));
+        for i in (self.num_rows + 1)..self.degree_bound {
+            accumulator[i] = G::random_default();
+        }
+        if accumulator[self.num_rows % self.degree_bound] != G::ZERO {
+            return Err(anyhow!("permutation accumulator end anchor check failed"));
         }
 
         let accumulator = Polynomial::<G>::encode2(accumulator);
@@ -1122,13 +1233,13 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             .chunks(self.degree_bound)
             .zip(denominator_table.chunks(self.degree_bound))
             .map(|(numerators, denominators)| {
-                Polynomial::encode2(
-                    numerators
-                        .iter()
-                        .zip(denominators.iter())
-                        .map(|(&numerator, &denominator)| numerator - denominator)
-                        .collect(),
-                )
+                let mut values: Vec<G> = numerators[0..self.num_rows]
+                    .iter()
+                    .zip(denominators[0..self.num_rows].iter())
+                    .map(|(&numerator, &denominator)| numerator - denominator)
+                    .collect();
+                values.resize_with(self.degree_bound, G::random_default);
+                Polynomial::encode2(values)
             })
             .collect();
 
@@ -1149,19 +1260,25 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                         beta,
                     );
                 generator_power *= F::MULTIPLICATIVE_GENERATOR;
-                constraint
+                constraint.multiply(circuit_area_selector.clone())
             })
             .collect();
 
-        let boundary_constraint =
+        let start_anchor_constraint =
             accumulator.clone() * Polynomial::lagrange0_2(self.degree_bound).clone();
-        let recurrence_constraint = accumulator.clone().shift_domain_by(omega.into())
+        let end_anchor_constraint = accumulator.clone()
+            * Polynomial::<G>::lagrange0_2(self.degree_bound)
+                .clone()
+                .shift_domain_by(omega_inv.pow_small(self.num_rows).into());
+        let recurrence_constraint = (accumulator.clone().shift_domain_by(omega.into())
             - accumulator.clone()
-            - helpers.iter().sum::<Polynomial<G>>();
+            - helpers.iter().sum::<Polynomial<G>>())
+        .multiply(circuit_area_selector);
 
         Ok((
             accumulator,
-            boundary_constraint,
+            start_anchor_constraint,
+            end_anchor_constraint,
             helpers,
             helper_constraints,
             recurrence_constraint,
@@ -1224,17 +1341,79 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
     /// Splits the quotient polynomial in chunks so that it can be batch-committed even though its
     /// degree is much higher than the bound configured in the underlying PCS.
+    ///
+    /// Writing `T` for the quotient and `M` for the quotient stride (ie. the degree bound of each
+    /// chunk), the chunks satisfy:
+    ///
+    ///   T(X) = Sum(T_c(X) * X^(c * M))
+    ///
+    /// The verifier only ever needs `T(xi)`, but a proof reveals every committed polynomial at
+    /// `s = num_rotations + num_queries` points; for the grand quotient that means `C * s` points
+    /// are actually revealed, where `C` is the number of chunks. In other words, chunking increases
+    /// the number of reveals by a factor of `C`. Since the quotient is a function of the witness,
+    /// this is an information leak that must be compensated by the blinding system.
+    ///
+    /// Unlike every other committed polynomial the quotient can't simply be blinded in the padding
+    /// area, because it has no "rows" of its own: the algebraic check pins it completely, and any
+    /// mask committed alongside it would be revealed at the same points and cancel out. Therefore
+    /// PLONK uses a telescoping mask technique: a pair of random polynomials are added to each
+    /// chunk in such a way that the first one cancels with the second one of the previous chunk and
+    /// the second one cancels with the first one of the next chunk.
+    ///
+    /// Let `C` be the number of chunks and `R_i` the i-th random mask, with `0 <= i <= C` and
+    /// `R_0(X) = R_C(X) = 0`. Rather than committing the `T_c` chunks directly we commit:
+    ///
+    ///   T'_c(X) = T_c(X) + R_{c+1}(X) * X^M - R_c(X)
+    ///
+    /// The internal masks `R_1` through `R_{C-1}` telescope away in the recombination while the
+    /// external masks `R_0` and `R_C` are zero, so `T(X) = Sum(T'_c(X) * X^(c * M))` still holds.
+    ///
+    /// The `R_i` masks must compensate `s = num_rotations + num_queries` reveals, so their degree
+    /// bound must be `s + 1` (as computed by [`mask_degree_bound`]). That means the degree bound of
+    /// each chunk will be `M = N - s - 1` rather than `N` itself, and that's always okay because
+    /// [`padded_circuit_size`] rounds `num_rows + [G:F] * (s + 1)` up to the next power of two, so
+    /// `N` is guaranteed to exceed `s + 1` by at least `num_rows`.
     fn split_quotient(&self, quotient: Polynomial<G>) -> Vec<Polynomial<G>> {
-        let degree_bound = quotient_degree_bound(
+        let quotient_degree_bound = quotient_degree_bound(
             self.degree_bound,
             self.gates.iter().map(|(constraint, _)| constraint),
         );
+
+        let mask_degree_bound = if self.blinded {
+            mask_degree_bound(
+                self.blowup_log2,
+                self.gates.iter().map(|(constraint, _)| constraint),
+            )
+        } else {
+            0
+        };
+        assert!(mask_degree_bound < self.degree_bound);
+        let stride = self.degree_bound - mask_degree_bound;
+
         let mut coefficients = quotient.take();
-        assert!(coefficients.len() <= degree_bound);
-        coefficients.resize(degree_bound, G::ZERO);
-        coefficients
-            .chunks(self.degree_bound)
-            .map(|coefficients| Polynomial::with_coefficients(coefficients.to_vec()))
+        assert!(coefficients.len() <= quotient_degree_bound);
+        coefficients.resize(quotient_degree_bound, G::ZERO);
+
+        let num_chunks = quotient_degree_bound.div_ceil(stride);
+
+        let mut chunks = vec![vec![G::ZERO; stride + mask_degree_bound]; num_chunks];
+        for (c, chunk) in chunks.iter_mut().enumerate() {
+            let start = c * stride;
+            let end = std::cmp::min(start + stride, quotient_degree_bound);
+            chunk[..(end - start)].copy_from_slice(&coefficients[start..end]);
+        }
+
+        for c in 1..num_chunks {
+            for j in 0..mask_degree_bound {
+                let mask = G::random_default();
+                chunks[c - 1][stride + j] += mask;
+                chunks[c][j] -= mask;
+            }
+        }
+
+        chunks
+            .into_iter()
+            .map(Polynomial::with_coefficients)
             .collect()
     }
 
@@ -1252,6 +1431,11 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     /// The randomizer takes part in no constraint and the verifier ignores its openings; it only
     /// needs to be in the batch. Note that it has to be uniform over `G`, not `F`: it masks
     /// `G`-linear functionals of a polynomial over `G`.
+    ///
+    /// Since it serves no purpose other than zero-knowledge it's committed only when the circuit is
+    /// [blinded](`Options::blind`), saving one low-degree extension, one Merkle column, one value
+    /// in every query leaf and one evaluation at every opened point. It's the last polynomial of
+    /// the quotient batch, so leaving it out shifts no other index.
     fn make_fri_randomizer(&self) -> Polynomial<G> {
         Polynomial::with_coefficients(
             (0..self.degree_bound)
@@ -1262,12 +1446,11 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
     /// Proves correctness of the given witness, or returns an error in case of a constraint
     /// violation.
-    pub fn prove<H: Hasher<G>>(
-        &self,
-        mut witness: Witness<F>,
-        options: ProvingOptions,
-    ) -> Result<Proof<F, G, H>> {
-        witness.blind();
+    pub fn prove<H: Hasher<G>>(&self, mut witness: Witness<F>) -> Result<Proof<F, G, H>> {
+        if self.blinded {
+            witness.blind();
+        }
+
         if witness.num_rows() != self.num_rows {
             return Err(anyhow!(
                 "incorrect witness size (got {} rows, want {})",
@@ -1290,7 +1473,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             ));
         }
 
-        let mut committer = self.make_committer::<H>(&options);
+        let mut committer = self.make_committer::<H>();
 
         let columns = witness.clone().encode();
         committer.add_batch(columns.iter().map(Self::embed_polynomial).collect());
@@ -1325,7 +1508,8 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
         let (
             permutation_accumulator,
-            permutation_boundary_constraint,
+            permutation_start_anchor_constraint,
+            permutation_end_anchor_constraint,
             permutation_helpers,
             permutation_helper_constraints,
             permutation_recurrence_constraint,
@@ -1354,8 +1538,11 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         let alpha = H::challenge(*DST_ALPHA, &[committer.transcript_hash()]);
 
         let quotient = {
-            let mut constraint = gate_constraint + permutation_boundary_constraint * alpha;
-            let mut power = alpha.square();
+            let mut power = alpha;
+            let mut constraint = gate_constraint + permutation_start_anchor_constraint * power;
+            power *= alpha;
+            constraint += permutation_end_anchor_constraint * power;
+            power *= alpha;
             for permutation_helper_constraint in permutation_helper_constraints {
                 constraint += permutation_helper_constraint * power;
                 power *= alpha;
@@ -1368,7 +1555,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         committer.add_batch(
             self.split_quotient(quotient)
                 .into_iter()
-                .chain(std::iter::once(self.make_fri_randomizer()))
+                .chain(self.blinded.then(|| self.make_fri_randomizer()))
                 .collect(),
         );
 
@@ -1392,16 +1579,14 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         })
     }
 
-    pub fn to_compressed<H: Hasher<G>>(
-        self,
-        options: ProvingOptions,
-    ) -> CompressedCircuit<F, G, H> {
-        let committer = self.make_committer::<H>(&options);
+    pub fn to_compressed<H: Hasher<G>>(self) -> CompressedCircuit<F, G, H> {
+        let committer = self.make_committer::<H>();
         CompressedCircuit {
             num_rows: self.num_rows,
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
-            options,
+            blowup_log2: self.blowup_log2,
+            blinded: self.blinded,
             gates: self
                 .gates
                 .into_iter()
@@ -1413,16 +1598,14 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         }
     }
 
-    pub fn as_compressed<H: Hasher<G>>(
-        &self,
-        options: ProvingOptions,
-    ) -> CompressedCircuit<F, G, H> {
-        let committer = self.make_committer::<H>(&options);
+    pub fn as_compressed<H: Hasher<G>>(&self) -> CompressedCircuit<F, G, H> {
+        let committer = self.make_committer::<H>();
         CompressedCircuit {
             num_rows: self.num_rows,
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
-            options,
+            blowup_log2: self.blowup_log2,
+            blinded: self.blinded,
             gates: self
                 .gates
                 .iter()
@@ -1436,12 +1619,8 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         }
     }
 
-    pub fn verify<H: Hasher<G>>(
-        &self,
-        proof: &Proof<F, G, H>,
-        options: ProvingOptions,
-    ) -> Result<BTreeMap<Cell, F>> {
-        self.as_compressed::<H>(options).verify(proof)
+    pub fn verify<H: Hasher<G>>(&self, proof: &Proof<F, G, H>) -> Result<BTreeMap<Cell, F>> {
+        self.as_compressed::<H>().verify(proof)
     }
 }
 
@@ -1463,9 +1642,11 @@ pub struct CompressedCircuit<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>
     /// Number of witness columns.
     num_columns: usize,
 
-    /// Proving options used to commit to this circuit (in [`Circuit::as_compressed`] or
-    /// [`Circuit::to_compressed`]).
-    options: ProvingOptions,
+    /// Log2 of the blowup factor.
+    blowup_log2: usize,
+
+    /// Whether or not the circuit is blinded (see [`Options::blind`]).
+    blinded: bool,
 
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
     /// second component is the set of instances of that gate across the circuit.
@@ -1493,12 +1674,44 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         self.num_columns
     }
 
+    pub fn blowup_log2(&self) -> usize {
+        self.blowup_log2
+    }
+
+    pub fn is_blinded(&self) -> bool {
+        self.blinded
+    }
+
     pub fn public_cells(&self) -> &BTreeSet<Cell> {
         &self.public_cells
     }
 
+    pub fn get_max_gate_degree(&self) -> usize {
+        self.gates
+            .iter()
+            .map(|(constraint, _)| constraint.get_degree())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn commitment(&self) -> H256 {
         self.circuit_commitment
+    }
+
+    /// Calculates the stride of this circuit's quotient split.
+    ///
+    /// See [`Circuit::split_quotient`] for details.
+    fn get_quotient_stride(&self) -> usize {
+        let mask_degree_bound = if self.blinded {
+            mask_degree_bound(
+                self.blowup_log2,
+                self.gates.iter().map(|(constraint, _)| constraint),
+            )
+        } else {
+            0
+        };
+        assert!(mask_degree_bound < self.degree_bound);
+        self.degree_bound - mask_degree_bound
     }
 
     /// Calculates the number of chunks the quotient was split into.
@@ -1509,7 +1722,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             self.degree_bound,
             self.gates.iter().map(|(constraint, _)| constraint),
         )
-        .div_ceil(self.degree_bound)
+        .div_ceil(self.get_quotient_stride())
     }
 
     /// Verifies a [`Proof`], returning the map of proven public inputs if successful or an error
@@ -1543,11 +1756,11 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 self.degree_bound
             ));
         }
-        if inner_proof.blowup_log2() != self.options.blowup_log2 {
+        if inner_proof.blowup_log2() != self.blowup_log2 {
             return Err(anyhow!(
                 "blowup factor mismatch (got {}, want {})",
                 1usize << inner_proof.blowup_log2(),
-                1usize << self.options.blowup_log2
+                1usize << self.blowup_log2
             ));
         }
 
@@ -1567,7 +1780,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         let num_permutation_accumulators = 1;
         let num_permutation_helpers = self.num_columns;
         let num_quotient_chunks = self.get_num_quotient_chunks();
-        let num_fri_randomizers = 1;
+        let num_fri_randomizers = if self.blinded { 1 } else { 0 };
         let expected_polynomials = num_gate_selectors
             + num_sigma_polynomials
             + num_witness_columns
@@ -1694,21 +1907,25 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 .collect()
         };
 
+        let circuit_area_selector = circuit_area_selector(xi, self.num_rows, self.degree_bound);
+
         let (permutation_helper_constraints, permutation_recurrence_constraint) = {
             let mut generator_power = F::ONE;
             let helper_constraints: Vec<G> = (0..self.num_columns)
                 .map(|i| {
-                    let constraints = permutation_helpers[i]
+                    let constraint = (permutation_helpers[i]
                         * (witness_columns[i] + beta * generator_power * xi + gamma)
                         * (witness_columns[i] + beta * sigma[i] + gamma)
-                        + beta * (xi * generator_power - sigma[i]);
+                        + beta * (xi * generator_power - sigma[i]))
+                        * circuit_area_selector;
                     generator_power *= F::MULTIPLICATIVE_GENERATOR;
-                    constraints
+                    constraint
                 })
                 .collect();
-            let recurrence_constraint = shifted_permutation_accumulator
+            let recurrence_constraint = (shifted_permutation_accumulator
                 - permutation_accumulator
-                - permutation_helpers.into_iter().sum::<G>();
+                - permutation_helpers.into_iter().sum::<G>())
+                * circuit_area_selector;
             (helper_constraints, recurrence_constraint)
         };
 
@@ -1718,8 +1935,9 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 + num_witness_columns
                 + num_permutation_accumulators
                 + num_permutation_helpers;
+            let stride = self.get_quotient_stride();
             (0..num_quotient_chunks)
-                .map(|i| points[&xi][offset + i] * xi.pow_small(i * self.degree_bound))
+                .map(|i| points[&xi][offset + i] * xi.pow_small(i * stride))
                 .sum()
         };
         let zero = xi.pow_small(self.degree_bound) - G::ONE;
@@ -1729,8 +1947,13 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             &[commitment.transcript_hash(COMMIT_INDEX_PERMUTATION_ARGUMENT + 1)],
         );
 
-        let permutation_boundary_constraint =
+        let permutation_start_anchor_constraint =
             permutation_accumulator * lagrange0(xi, self.degree_bound);
+        let permutation_end_anchor_constraint = permutation_accumulator
+            * lagrange0(
+                xi * omega_inv.pow_small_vartime(self.num_rows),
+                self.degree_bound,
+            );
 
         let public_cell_constraint: G = {
             let psi = public_cell_challenge::<F, G, H>(
@@ -1764,8 +1987,11 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         };
 
         let full_constraint = {
-            let mut result = gate_constraint + alpha * permutation_boundary_constraint;
-            let mut power = alpha.square();
+            let mut power = alpha;
+            let mut result = gate_constraint + power * permutation_start_anchor_constraint;
+            power *= alpha;
+            result += power * permutation_end_anchor_constraint;
+            power *= alpha;
             for constraint in permutation_helper_constraints {
                 result += power * constraint;
                 power *= alpha;
@@ -1806,7 +2032,9 @@ mod tests {
     fn test_vitalik_circuit_impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
+        blind: bool,
         expected_degree_bound: usize,
+        expected_num_polys: usize,
         commitment: H256,
     ) -> Result<()> {
         let mut builder = CircuitBuilder::<F, G>::default();
@@ -1818,13 +2046,18 @@ mod tests {
         builder.connect(cell(1, 2).into(), cell(2, 1).into());
         builder.add_gate(2, Constraint::nop());
         builder.declare_public_cells([cell(2, 0), cell(2, 1)]);
-        let circuit = builder.build(CompilationOptions {
+        let circuit = builder.build(Options {
             canonicalize_constraints,
+            blowup_log2,
+            blind,
         })?;
         assert_eq!(circuit.num_rows(), 3);
         assert_eq!(circuit.degree_bound(), expected_degree_bound);
         assert_eq!(circuit.num_columns(), 3);
+        assert_eq!(circuit.blowup_log2(), blowup_log2);
+        assert_eq!(circuit.is_blinded(), blind);
         assert_eq!(circuit.num_gates(), 3);
+        assert_eq!(circuit.get_max_gate_degree(), 2);
         let mut witness = circuit.make_witness();
         assert_eq!(witness.num_rows(), 3);
         assert_eq!(witness.degree_bound(), expected_degree_bound);
@@ -1837,16 +2070,15 @@ mod tests {
         witness.set(cell(2, 0), 3u8.into());
         witness.set(cell(2, 1), 35u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
-        let options = ProvingOptions { blowup_log2 };
-        let proof = circuit.prove::<H>(witness, options.clone())?;
+        let proof = circuit.prove::<H>(witness)?;
         assert_eq!(proof.degree_bound(), expected_degree_bound);
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(
             proof.extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
-        assert_eq!(proof.num_polys(), 16);
-        let circuit = circuit.to_compressed(options);
+        assert_eq!(proof.num_polys(), expected_num_polys);
+        let circuit = circuit.to_compressed();
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
         assert_eq!(public_inputs[&cell(2, 0)], 3u8.into());
@@ -1856,86 +2088,243 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_bluesky_sha2_blowup_2() {
-        let c = parse_hash("0x2732a0cce5e03109e372c39515b4e3cc7aae87adfde949418c7f5918e4cea1f9");
-        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 1, 8, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 1, 8, c).is_ok());
+        let c = parse_hash("0x9fe5967ca1e32fad3c75276d0fd4c1443efc98629e32f238e20a680ad787a7fb");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 1, false, 4, 16, c).is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 1, false, 4, 16, c).is_ok()
+        );
+        let c = parse_hash("0x6253b7f92e3c65eb7b4bd7fc31d1e6d5b118208bac71f9805038bd16a5b848a1");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 1, true, 256, 21, c).is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 1, true, 256, 21, c).is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_2() {
-        let c = parse_hash("0x2648e724ff1887b29137a0847bb2913ac68974e0c2809be300c6d726a3fedc20");
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, 16, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, 16, c).is_ok());
+        let c = parse_hash("0x14b96cbe7e06d202c793fc8fdf2d4d3ef085df211a3265200cb8846f16ba7266");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, false, 4, 16, c).is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, false, 4, 16, c).is_ok()
+        );
+        let c = parse_hash("0x3a71be08d409155fae05fe1f0c8e66a55c7b6def7ffb0db4117c716c41d138a0");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, true, 1024, 18, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, true, 1024, 18, c).is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_keccak256_blowup_2() {
-        let c = parse_hash("0xa4e2f7c1507afba18f2996fd89dd570f1bd466fdf14c8bc0d65a015c88aa8e20");
-        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 1, 8, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 1, 8, c).is_ok());
+        let c = parse_hash("0x5dfdd31c35c3d5b60da9efe6774981369bf16a8d904ed329a5e023dab4954c05");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 1, false, 4, 16, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 1, false, 4, 16, c)
+                .is_ok()
+        );
+        let c = parse_hash("0x4bdfd1797abe4eeddd46ac8dc1caf3c6e2d3dcb0ae9b53bd4de1435287819902");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 1, true, 256, 21, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 1, true, 256, 21, c)
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_2() {
-        let c = parse_hash("0x8ce1153809dd7983b2a77080905e8738d08b8f8b265f9953334a5df9d957a032");
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, 16, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, 16, c).is_ok());
+        let c = parse_hash("0x325a67efff006d084e3d7768ec3f2c299c6ceb148409ae0544c5c943ff94dcdc");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, false, 4, 16, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, false, 4, 16, c)
+                .is_ok()
+        );
+        let c = parse_hash("0xeeed7b937aa91afe977399ce8fab86f8c7e1afedccb5540f29eff2b7141aeeea");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, true, 1024, 18, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, true, 1024, 18, c)
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_sha2_blowup_4() {
-        let c = parse_hash("0xd81086a421590d6b5517c86495fcc3f52c983ff49e9d7e9cbc034fdb7cb77782");
-        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 2, 8, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 2, 8, c).is_ok());
+        let c = parse_hash("0x536cb14c6e41110506fed17d45f6e2f1584125ff1a9f6dd0fc33d646ac3a310e");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 2, false, 4, 16, c).is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 2, false, 4, 16, c).is_ok()
+        );
+        let c = parse_hash("0x8cda4e201d43d403100d80d46f77676d5c4cf3d4000c2194690dbc50491b2068");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 2, true, 128, 21, c).is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 2, true, 128, 21, c).is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_4() {
-        let c = parse_hash("0xa869c1a1afe38b4bfffdaf0635405cff247ffa6c1f979d31fad29b2b0165070f");
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, 16, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, 16, c).is_ok());
+        let c = parse_hash("0x83ff09b4b78c402df87a0fbf00a852aade55c8c1e4623b889940b1f4e303f2f3");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, false, 4, 16, c).is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, false, 4, 16, c).is_ok()
+        );
+        let c = parse_hash("0x9944cd4ed248633167ce2c1f76eadcd7ee5122f5da4a68f8652573cc1a85ebe9");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, true, 512, 18, c).is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, true, 512, 18, c).is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_keccak256_blowup_4() {
-        let c = parse_hash("0x44197f3984298e3c6d20bc0a5be4ff0dca39b54f0c601f67367c3f72cfb1bb93");
-        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 2, 8, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 2, 8, c).is_ok());
+        let c = parse_hash("0x73ccb7fcea42181284a458d909ae7263ffebb44c9b3d691924b04bb681c46388");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 2, false, 4, 16, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 2, false, 4, 16, c)
+                .is_ok()
+        );
+        let c = parse_hash("0x6ce4465f607fac189f64609eeca2945ccb465e89dadae220cdec86dee788996e");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 2, true, 128, 21, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 2, true, 128, 21, c)
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_4() {
-        let c = parse_hash("0xeb4a39af87c7cf2f5f5393a28fa5a9dcf548273fe48138a62b9511c990ee3d4d");
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, 16, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, 16, c).is_ok());
+        let c = parse_hash("0x3df1ac083cd51d3187609f02bcabc4ea139bbd45fd66a3ea32074bad698c8234");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, false, 4, 16, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, false, 4, 16, c)
+                .is_ok()
+        );
+        let c = parse_hash("0xa9fadc7958f662393e128326728f743ad105e630a9c935ec1a67c3c56acbcb2f");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, true, 512, 18, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, true, 512, 18, c)
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_sha2_blowup_8() {
-        let c = parse_hash("0xdb14b315aa52e49402a85544104520629b245a2fcecf33b15eebb39e0c711aa5");
-        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 3, 8, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 3, 8, c).is_ok());
+        let c = parse_hash("0x0f30383f1e7ff1cad46edd74493bf78a2222c6e95fd623fe8e145464e50a0c47");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 3, false, 4, 16, c).is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 3, false, 4, 16, c).is_ok()
+        );
+        let c = parse_hash("0xfaa758d5b451e78a3549acc3324c4b9fd66645c16d16d5ff1fb1c0c8092cf10b");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 3, true, 64, 25, c).is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 3, true, 64, 25, c).is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_8() {
-        let c = parse_hash("0xce2c6c998081e4b694ba1ad53c9e02175c8750acffdca25ae4a3e2329b06a439");
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, 16, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, 16, c).is_ok());
+        let c = parse_hash("0x4e2c0e3dbc709c9c6f1a867907562202615f279bdb12526e662e65a46235d9b3");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, false, 4, 16, c).is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, false, 4, 16, c).is_ok()
+        );
+        let c = parse_hash("0xebeea16a013a7d98f508c7c9ef1ea0f0f65aa4fe1b071d5d2e9bb6638922c578");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, true, 256, 18, c).is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, true, 256, 18, c).is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_keccak256_blowup_8() {
-        let c = parse_hash("0x4fa1ea6a1b435bb0309c7432be6087bd326962a13709669be5695ddf6049fc22");
-        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 3, 8, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 3, 8, c).is_ok());
+        let c = parse_hash("0x756ff74bc1bb347948bb13c8bf4b8ba9aa8efda7c7ac3eb76a3c95622f7e19fb");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 3, false, 4, 16, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 3, false, 4, 16, c)
+                .is_ok()
+        );
+        let c = parse_hash("0x7b6876688e4303ba818c51b7ffefe5fd8d176301601d5448e16f92f4393d2f08");
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 3, true, 64, 25, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 3, true, 64, 25, c)
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_8() {
-        let c = parse_hash("0x1c2437168d195f14bc40abe17e255ca5ff80880a4af50331cda9ce0cae74fd18");
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, 16, c).is_ok());
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, 16, c).is_ok());
+        let c = parse_hash("0xb79939622fc0db414ca6cf1d639adac4fc132e44a0d57d6cfb2ff9bc57352d83");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, false, 4, 16, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, false, 4, 16, c)
+                .is_ok()
+        );
+        let c = parse_hash("0x04d5ce07d65d6254bb06402f392b73dac9d3a55a568ff72be3c48ececdf5037d");
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, true, 256, 18, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, true, 256, 18, c)
+                .is_ok()
+        );
     }
 
     /// A slight variation of Vitalik's circuit. This one proves knowledge of three numbers x, y,
@@ -1943,7 +2332,9 @@ mod tests {
     fn test_vitalik_circuit_variation<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>(
         canonicalize_constraints: bool,
         blowup_log2: usize,
+        blind: bool,
         expected_degree_bound: usize,
+        expected_num_polys: usize,
         commitment: H256,
     ) -> Result<()> {
         let mut builder = CircuitBuilder::<F, G>::default();
@@ -1966,13 +2357,18 @@ mod tests {
         let result_out = cell(3, 2);
         builder.connect(result.into(), result_out.into());
         builder.declare_public_cells([x_out, y_out, result_out]);
-        let circuit = builder.build(CompilationOptions {
+        let circuit = builder.build(Options {
             canonicalize_constraints,
+            blowup_log2,
+            blind,
         })?;
         assert_eq!(circuit.num_rows(), 4);
         assert_eq!(circuit.degree_bound(), expected_degree_bound);
         assert_eq!(circuit.num_columns(), 4);
+        assert_eq!(circuit.blowup_log2(), blowup_log2);
+        assert_eq!(circuit.is_blinded(), blind);
         assert_eq!(circuit.num_gates(), 3);
+        assert_eq!(circuit.get_max_gate_degree(), 2);
         let mut witness = circuit.make_witness();
         assert_eq!(witness.num_rows(), 4);
         assert_eq!(witness.degree_bound(), expected_degree_bound);
@@ -1990,16 +2386,15 @@ mod tests {
         witness.set(cell(3, 1), 4u8.into());
         witness.set(cell(3, 2), 44u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
-        let options = ProvingOptions { blowup_log2 };
-        let proof = circuit.prove::<H>(witness, options.clone())?;
+        let proof = circuit.prove::<H>(witness)?;
         assert_eq!(proof.degree_bound(), expected_degree_bound);
         assert_eq!(proof.blowup_log2(), blowup_log2);
         assert_eq!(
             proof.extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
-        assert_eq!(proof.num_polys(), 19);
-        let circuit = circuit.to_compressed(options);
+        assert_eq!(proof.num_polys(), expected_num_polys);
+        let circuit = circuit.to_compressed();
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
         assert_eq!(public_inputs[&x_out], 3u8.into());
@@ -2010,30 +2405,90 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_variation_bluesky_blowup_2() {
-        let c = parse_hash("0x6f793d1bfd1349adb0981b299dae730991836d950d53d4f2df08b649db552d29");
-        assert!(test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 1, 8, c).is_ok());
-        assert!(test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 1, 8, c).is_ok());
+        let c = parse_hash("0xdc0b49948fab58111a5e3e0855fb77c590b8ea5678c713406a67aed8287e9e15");
+        assert!(
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 1, false, 4, 19, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 1, false, 4, 19, c)
+                .is_ok()
+        );
+        let c = parse_hash("0xbaac964525732eec62f1a284a50f304c05c8c3eff104fb2cce6549b2b8a216de");
+        assert!(
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 1, true, 256, 24, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 1, true, 256, 24, c)
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_variation_goldilocks_blowup_2() {
-        let c = parse_hash("0xcc0b73bb6e9ff66346461a0386a8fa4d13c147d1bd57f5efc1b6eb35904b4da7");
-        assert!(test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, 16, c).is_ok());
-        assert!(test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, 16, c).is_ok());
+        let c = parse_hash("0x0bc1a60f5c63832d1149de23b1021cf7788ba434a192cf7cf9432d53dac9b059");
+        assert!(
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, false, 4, 19, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, false, 4, 19, c)
+                .is_ok()
+        );
+        let c = parse_hash("0xa6c2c3af5c9ac76e6b7716b5f51903577455d45430d01bed3b7459594e872b90");
+        assert!(
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, true, 1024, 21, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, true, 1024, 21, c)
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_variation_bluesky_blowup_4() {
-        let c = parse_hash("0xb50cc61c1a3f557f97d42bb6233ba4d133338bf86577615e4cbae10bbb90ccb6");
-        assert!(test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 2, 8, c).is_ok());
-        assert!(test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 2, 8, c).is_ok());
+        let c = parse_hash("0xdfb66ceab0f6f70927eb5c41f7765f49182489333bc94044c2c6080537631a9f");
+        assert!(
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 2, false, 4, 19, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 2, false, 4, 19, c)
+                .is_ok()
+        );
+        let c = parse_hash("0xafed26a83cc6cd3a0ae9c15ee144368d6b6288cad0027c0fb13144045647b927");
+        assert!(
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 2, true, 128, 24, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 2, true, 128, 24, c)
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_vitalik_circuit_variation_goldilocks_blowup_4() {
-        let c = parse_hash("0xdcf67905aa53204c32ae74523f5e726b2135f068a0dd792aef5837de4d9c62ae");
-        assert!(test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 2, 16, c).is_ok());
-        assert!(test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 2, 16, c).is_ok());
+        let c = parse_hash("0xdae21cbae059796cb6f9d0217c4aaaed45a8eac772cf5fc971c6fabf5aa24fab");
+        assert!(
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 2, false, 4, 19, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 2, false, 4, 19, c)
+                .is_ok()
+        );
+        let c = parse_hash("0xae9764d8512bba669c42fbebdc70ba8f02041da44f4947fc6b28084f1999aba0");
+        assert!(
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 2, true, 512, 21, c)
+                .is_ok()
+        );
+        assert!(
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 2, true, 512, 21, c)
+                .is_ok()
+        );
     }
 
     fn build_vitalik_circuit() -> Circuit<BS, BS> {
@@ -2047,8 +2502,10 @@ mod tests {
         builder.add_gate(2, Constraint::nop());
         builder.declare_public_cells([cell(2, 0), cell(2, 1)]);
         builder
-            .build(CompilationOptions {
+            .build(Options {
                 canonicalize_constraints: false,
+                blowup_log2: 1,
+                blind: false,
             })
             .unwrap()
     }
@@ -2056,7 +2513,7 @@ mod tests {
     #[test]
     fn test_check_witness_detects_wrong_number_of_rows() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(4, 3, [0, 1]);
+        let witness = Witness::new(4, 3, circuit.degree_bound());
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("wrong number of rows"));
     }
@@ -2064,7 +2521,7 @@ mod tests {
     #[test]
     fn test_check_witness_detects_wrong_number_of_columns() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(3, 4, [0, 1]);
+        let witness = Witness::new(3, 4, circuit.degree_bound());
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("wrong number of columns"));
     }
@@ -2072,7 +2529,7 @@ mod tests {
     #[test]
     fn test_check_witness_detects_wrong_degree_bound() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(3, 3, [-2, -1, 0, 1, 2]);
+        let witness = Witness::new(3, 3, circuit.degree_bound() * 2);
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("incorrect degree bound"));
     }
@@ -2135,9 +2592,8 @@ mod tests {
         witness.set(cell(1, 2), from_const(35));
         witness.set(cell(2, 0), from_const(3));
         witness.set(cell(2, 1), from_const(35));
-        let options = ProvingOptions { blowup_log2: 1 };
-        let proof = circuit.prove(witness, options.clone()).unwrap();
-        (circuit.to_compressed(options), proof)
+        let proof = circuit.prove(witness).unwrap();
+        (circuit.to_compressed(), proof)
     }
 
     #[test]

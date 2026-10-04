@@ -2,7 +2,8 @@ use crate::witness::Cell;
 use anyhow::{Result, anyhow};
 use primitive_types::{H256, U256};
 use sha3::Digest;
-use starkom_ff::Field;
+use starkom_ff::{Field, Field256};
+use starkom_pcs as pcs;
 use std::collections::BTreeSet;
 
 /// Helper function used to derive domain separator tags used in various contexts.
@@ -66,22 +67,30 @@ pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
 }
 
 /// Calculates the final circuit size (number of rows) by adding the minimum number of blinding rows
-/// and rounding up to the next power of two.
+/// and rounding up to the next power of two. No blinding rows are added if the `blind` flag is
+/// false.
 ///
 /// The returned value is the total number of rows, always a power of two and suitable for use as
 /// the size of the evaluation domain. Callers are expected to blind *all* of the rows past the
 /// `num_rows` witness rows rather than just the minimum: the extra rows are there anyway due to the
-/// power-of-two rounding, and padding them with random values rather than zeros adds margin at no
-/// cost.
+/// power-of-two rounding, and padding them with random values rather than zeros adds safety margin
+/// at no cost.
+///
+/// The returned value is never less than 2. Every committed polynomial has degree lower than it,
+/// which is what the whole degree accounting of
+/// [`quotient_degree_bound`](`crate::plonk::quotient_degree_bound`) rests on, but the numerator
+/// factors of the permutation argument contain a `beta * g^i * X` term whose degree is 1 no matter
+/// how small the circuit is. A single-row circuit with blinding disabled would otherwise get a
+/// one-element domain, where that term alone overflows a quotient degree bound of `(1 - 1) * E`.
 ///
 /// The minimum number of blinding rows is computed so that the added randomness absorbs the
-/// information leak caused by opening all `rotations` used in the circuit and adds an extra 256
-/// bits on top of that.
+/// information leak caused by opening all FRI queries and all rotations used in the circuit, and
+/// adds an extra 256 bits on top of that.
 ///
-/// In the implementation we always force the 0 and +1 rotations into the provided set because the
-/// main challenge xi and the shifted challenge xi*omega are always opened (for the final algebraic
-/// check and the permutation argument, respectively) even if the circuit doesn't use those
-/// rotations.
+/// In the implementation we always force the 0 and +1 rotations into the provided rotation set
+/// because the main challenge xi and the shifted challenge xi*omega are always opened (for the
+/// final algebraic check and the permutation argument, respectively) even if the circuit doesn't
+/// use those rotations.
 ///
 /// NOTE: when using the extension field pattern (e.g. F=Goldilocks, G=Goldilocks^4) each opened
 /// rotation `W(xi)`, `W(omega*xi)`, etc. leaks `G::BITS` bits of information about the witness
@@ -89,27 +98,34 @@ pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
 /// `F` subfield) and touches all coefficients of the polynomial upon evaluation, so an evaluation
 /// yields 256 bits of information. For this reason our formula is:
 ///
-///   min_blinding_rows = (num_rotations + 1) * ceil(32 / F::LEN)
+///   min_blinding_rows = (num_rotations + num_queries + 1) * ceil(G::LEN / F::LEN)
 ///
-/// ensuring that every opened rotation is absorbed by 256 bits of blinding and 256 bits of excess
-/// are added on top of that.
-pub(crate) fn padded_circuit_size<F: Field>(
+/// ensuring that every opened FRI query and every opened rotation is absorbed by 256 bits of
+/// blinding, and 256 bits of excess are added on top of that.
+pub(crate) fn padded_circuit_size<F: Field, G: Field256<BaseField = F>>(
     num_rows: usize,
+    blowup_log2: usize,
+    blind: bool,
     rotations: impl IntoIterator<Item = isize>,
 ) -> usize {
-    let num_rotations = [0isize, 1isize]
-        .into_iter()
-        .chain(rotations.into_iter())
-        .collect::<BTreeSet<isize>>()
-        .len();
-    let min_blinding_rows = (num_rotations + 1) * 32usize.div_ceil(F::LEN);
-    (num_rows + min_blinding_rows).next_power_of_two()
+    let min_blinding_rows = if blind {
+        let num_rotations = [0isize, 1isize]
+            .into_iter()
+            .chain(rotations.into_iter())
+            .collect::<BTreeSet<isize>>()
+            .len();
+        (num_rotations + pcs::num_queries(blowup_log2) + 1) * G::LEN.div_ceil(F::LEN)
+    } else {
+        0
+    };
+    std::cmp::max(2, (num_rows + min_blinding_rows).next_power_of_two())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use starkom_bluesky::{Scalar as BS, from_const};
+    use starkom_goldilocks::{GL, GL4};
 
     #[test]
     fn test_isize_to_scalar() {
@@ -171,5 +187,266 @@ mod tests {
         );
         assert_eq!(scalar_to_isize(min).unwrap(), isize::MIN);
         assert!(scalar_to_isize(min - from_const(1)).is_err());
+    }
+
+    #[test]
+    fn test_padded_circuit_size_bluesky() {
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 1, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 1, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 1, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(124, 1, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(125, 1, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(126, 1, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(127, 1, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(380, 1, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(381, 1, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(382, 1, true, [0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<BS, BS>(383, 1, true, [0, 1]), 1024);
+
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 2, true, [0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 2, true, [0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 2, true, [0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(60, 2, true, [0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(61, 2, true, [0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(62, 2, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(63, 2, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(188, 2, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(189, 2, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(190, 2, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(191, 2, true, [0, 1]), 512);
+
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 3, true, [0, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 3, true, [0, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 3, true, [0, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(17, 3, true, [0, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(18, 3, true, [0, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(19, 3, true, [0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(20, 3, true, [0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(81, 3, true, [0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(82, 3, true, [0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(83, 3, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(84, 3, true, [0, 1]), 256);
+    }
+
+    #[test]
+    fn test_padded_circuit_size_bluesky_three_rotations() {
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 1, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 1, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 1, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(123, 1, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(124, 1, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(125, 1, true, [-1, 0, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(126, 1, true, [-1, 0, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(379, 1, true, [-1, 0, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(380, 1, true, [-1, 0, 1]), 512);
+        assert_eq!(
+            padded_circuit_size::<BS, BS>(381, 1, true, [-1, 0, 1]),
+            1024
+        );
+        assert_eq!(
+            padded_circuit_size::<BS, BS>(382, 1, true, [-1, 0, 1]),
+            1024
+        );
+
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 2, true, [-1, 0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 2, true, [-1, 0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 2, true, [-1, 0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(59, 2, true, [-1, 0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(60, 2, true, [-1, 0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(61, 2, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(62, 2, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(187, 2, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(188, 2, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(189, 2, true, [-1, 0, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(190, 2, true, [-1, 0, 1]), 512);
+
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 3, true, [-1, 0, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 3, true, [-1, 0, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 3, true, [-1, 0, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(16, 3, true, [-1, 0, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(17, 3, true, [-1, 0, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(18, 3, true, [-1, 0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(19, 3, true, [-1, 0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(80, 3, true, [-1, 0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(81, 3, true, [-1, 0, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(82, 3, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(83, 3, true, [-1, 0, 1]), 256);
+    }
+
+    #[test]
+    fn test_padded_circuit_size_goldilocks() {
+        assert_eq!(padded_circuit_size::<GL, GL4>(1, 1, true, [0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(2, 1, true, [0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(3, 1, true, [0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(499, 1, true, [0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(500, 1, true, [0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(501, 1, true, [0, 1]), 2048);
+        assert_eq!(padded_circuit_size::<GL, GL4>(502, 1, true, [0, 1]), 2048);
+        assert_eq!(padded_circuit_size::<GL, GL4>(1523, 1, true, [0, 1]), 2048);
+        assert_eq!(padded_circuit_size::<GL, GL4>(1524, 1, true, [0, 1]), 2048);
+        assert_eq!(padded_circuit_size::<GL, GL4>(1525, 1, true, [0, 1]), 4096);
+        assert_eq!(padded_circuit_size::<GL, GL4>(1526, 1, true, [0, 1]), 4096);
+
+        assert_eq!(padded_circuit_size::<GL, GL4>(1, 2, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(2, 2, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(3, 2, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(243, 2, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(244, 2, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(245, 2, true, [0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(246, 2, true, [0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(755, 2, true, [0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(756, 2, true, [0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(757, 2, true, [0, 1]), 2048);
+        assert_eq!(padded_circuit_size::<GL, GL4>(758, 2, true, [0, 1]), 2048);
+
+        assert_eq!(padded_circuit_size::<GL, GL4>(1, 3, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<GL, GL4>(2, 3, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<GL, GL4>(3, 3, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<GL, GL4>(71, 3, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<GL, GL4>(72, 3, true, [0, 1]), 256);
+        assert_eq!(padded_circuit_size::<GL, GL4>(73, 3, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(74, 3, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(327, 3, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(328, 3, true, [0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(329, 3, true, [0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(330, 3, true, [0, 1]), 1024);
+    }
+
+    #[test]
+    fn test_padded_circuit_size_goldilocks_three_rotations() {
+        assert_eq!(padded_circuit_size::<GL, GL4>(1, 1, true, [-1, 0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(2, 1, true, [-1, 0, 1]), 1024);
+        assert_eq!(padded_circuit_size::<GL, GL4>(3, 1, true, [-1, 0, 1]), 1024);
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(495, 1, true, [-1, 0, 1]),
+            1024
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(496, 1, true, [-1, 0, 1]),
+            1024
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(497, 1, true, [-1, 0, 1]),
+            2048
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(498, 1, true, [-1, 0, 1]),
+            2048
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(1519, 1, true, [-1, 0, 1]),
+            2048
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(1520, 1, true, [-1, 0, 1]),
+            2048
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(1521, 1, true, [-1, 0, 1]),
+            4096
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(1522, 1, true, [-1, 0, 1]),
+            4096
+        );
+
+        assert_eq!(padded_circuit_size::<GL, GL4>(1, 2, true, [-1, 0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(2, 2, true, [-1, 0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(3, 2, true, [-1, 0, 1]), 512);
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(239, 2, true, [-1, 0, 1]),
+            512
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(240, 2, true, [-1, 0, 1]),
+            512
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(241, 2, true, [-1, 0, 1]),
+            1024
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(242, 2, true, [-1, 0, 1]),
+            1024
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(751, 2, true, [-1, 0, 1]),
+            1024
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(752, 2, true, [-1, 0, 1]),
+            1024
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(753, 2, true, [-1, 0, 1]),
+            2048
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(754, 2, true, [-1, 0, 1]),
+            2048
+        );
+
+        assert_eq!(padded_circuit_size::<GL, GL4>(1, 3, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<GL, GL4>(2, 3, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<GL, GL4>(3, 3, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<GL, GL4>(67, 3, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<GL, GL4>(68, 3, true, [-1, 0, 1]), 256);
+        assert_eq!(padded_circuit_size::<GL, GL4>(69, 3, true, [-1, 0, 1]), 512);
+        assert_eq!(padded_circuit_size::<GL, GL4>(70, 3, true, [-1, 0, 1]), 512);
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(323, 3, true, [-1, 0, 1]),
+            512
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(324, 3, true, [-1, 0, 1]),
+            512
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(325, 3, true, [-1, 0, 1]),
+            1024
+        );
+        assert_eq!(
+            padded_circuit_size::<GL, GL4>(326, 3, true, [-1, 0, 1]),
+            1024
+        );
+    }
+
+    #[test]
+    fn test_padded_circuit_size_duplicate_rotations() {
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 1, true, [0, 1, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 1, true, [0, 1, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 1, true, [0, 1, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(124, 1, true, [0, 1, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(125, 1, true, [0, 1, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(126, 1, true, [0, 1, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(127, 1, true, [0, 1, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(380, 1, true, [0, 1, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(381, 1, true, [0, 1, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(382, 1, true, [0, 1, 1]), 1024);
+        assert_eq!(padded_circuit_size::<BS, BS>(383, 1, true, [0, 1, 1]), 1024);
+
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 2, true, [0, 1, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 2, true, [0, 1, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 2, true, [0, 1, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(60, 2, true, [0, 1, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(61, 2, true, [0, 1, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(62, 2, true, [0, 1, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(63, 2, true, [0, 1, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(188, 2, true, [0, 1, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(189, 2, true, [0, 1, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(190, 2, true, [0, 1, 1]), 512);
+        assert_eq!(padded_circuit_size::<BS, BS>(191, 2, true, [0, 1, 1]), 512);
+
+        assert_eq!(padded_circuit_size::<BS, BS>(1, 3, true, [0, 1, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(2, 3, true, [0, 1, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(3, 3, true, [0, 1, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(17, 3, true, [0, 1, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(18, 3, true, [0, 1, 1]), 64);
+        assert_eq!(padded_circuit_size::<BS, BS>(19, 3, true, [0, 1, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(20, 3, true, [0, 1, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(81, 3, true, [0, 1, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(82, 3, true, [0, 1, 1]), 128);
+        assert_eq!(padded_circuit_size::<BS, BS>(83, 3, true, [0, 1, 1]), 256);
+        assert_eq!(padded_circuit_size::<BS, BS>(84, 3, true, [0, 1, 1]), 256);
     }
 }
