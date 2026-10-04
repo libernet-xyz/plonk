@@ -1351,6 +1351,11 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     /// The randomizer takes part in no constraint and the verifier ignores its openings; it only
     /// needs to be in the batch. Note that it has to be uniform over `G`, not `F`: it masks
     /// `G`-linear functionals of a polynomial over `G`.
+    ///
+    /// Since it serves no purpose other than zero-knowledge it's committed only when the circuit is
+    /// [blinded](`Options::blind`), saving one low-degree extension, one Merkle column, one value
+    /// in every query leaf and one evaluation at every opened point. It's the last polynomial of
+    /// the quotient batch, so leaving it out shifts no other index.
     fn make_fri_randomizer(&self) -> Polynomial<G> {
         Polynomial::with_coefficients(
             (0..self.degree_bound)
@@ -1470,7 +1475,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         committer.add_batch(
             self.split_quotient(quotient)
                 .into_iter()
-                .chain(std::iter::once(self.make_fri_randomizer()))
+                .chain(self.blinded.then(|| self.make_fri_randomizer()))
                 .collect(),
         );
 
@@ -1501,6 +1506,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
             blowup_log2: self.blowup_log2,
+            blinded: self.blinded,
             gates: self
                 .gates
                 .into_iter()
@@ -1519,6 +1525,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             degree_bound: self.degree_bound,
             num_columns: self.num_columns,
             blowup_log2: self.blowup_log2,
+            blinded: self.blinded,
             gates: self
                 .gates
                 .iter()
@@ -1557,6 +1564,9 @@ pub struct CompressedCircuit<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>
 
     /// Log2 of the blowup factor.
     blowup_log2: usize,
+
+    /// Whether or not the circuit is blinded (see [`Options::blind`]).
+    blinded: bool,
 
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
     /// second component is the set of instances of that gate across the circuit.
@@ -1666,7 +1676,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         let num_permutation_accumulators = 1;
         let num_permutation_helpers = self.num_columns;
         let num_quotient_chunks = self.get_num_quotient_chunks();
-        let num_fri_randomizers = 1;
+        let num_fri_randomizers = if self.blinded { 1 } else { 0 };
         let expected_polynomials = num_gate_selectors
             + num_sigma_polynomials
             + num_witness_columns
@@ -1959,7 +1969,7 @@ mod tests {
             proof.extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
-        assert_eq!(proof.num_polys(), 17);
+        assert_eq!(proof.num_polys(), if blind { 17 } else { 16 });
         let circuit = circuit.to_compressed();
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
@@ -2211,7 +2221,7 @@ mod tests {
             proof.extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
-        assert_eq!(proof.num_polys(), 20);
+        assert_eq!(proof.num_polys(), if blind { 20 } else { 19 });
         let circuit = circuit.to_compressed();
         assert_eq!(circuit.commitment(), commitment);
         let public_inputs = circuit.verify(&proof)?;
