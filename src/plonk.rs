@@ -1348,9 +1348,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     ///   T(X) = Sum(T_c(X) * X^(c * M))
     ///
     /// The verifier only ever needs `T(xi)`, but a proof reveals every committed polynomial at
-    /// `s = num_rotations + num_queries` points; for the grand quotient that means `E * s` points
-    /// are actually revealed, where `E` is the number of chunks. In other words, chunking increases
-    /// the number of reveals by a factor of `E`. Since the quotient is a function of the witness,
+    /// `s = num_rotations + num_queries` points; for the grand quotient that means `C * s` points
+    /// are actually revealed, where `C` is the number of chunks. In other words, chunking increases
+    /// the number of reveals by a factor of `C`. Since the quotient is a function of the witness,
     /// this is an information leak that must be compensated by the blinding system.
     ///
     /// Unlike every other committed polynomial the quotient can't simply be blinded in the padding
@@ -1360,19 +1360,19 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     /// chunk in such a way that the first one cancels with the second one of the previous chunk and
     /// the second one cancels with the first one of the next chunk.
     ///
-    /// Let `E` be the number of chunks and `R_i` the i-th random mask, with `0 <= i <= E` and
-    /// `R_0(X) = R_E(X) = 0`. Rather than committing the `T_c` chunks directly we commit:
+    /// Let `C` be the number of chunks and `R_i` the i-th random mask, with `0 <= i <= C` and
+    /// `R_0(X) = R_C(X) = 0`. Rather than committing the `T_c` chunks directly we commit:
     ///
     ///   T'_c(X) = T_c(X) + R_{c+1}(X) * X^M - R_c(X)
     ///
-    /// The internal masks `R_1` through `R_{E-1}` telescope away in the recombination while the
-    /// external masks `R_0` and `R_E` are zero, so `T(X) = Sum(T'_c(X) * X^(c * M))` still holds.
+    /// The internal masks `R_1` through `R_{C-1}` telescope away in the recombination while the
+    /// external masks `R_0` and `R_C` are zero, so `T(X) = Sum(T'_c(X) * X^(c * M))` still holds.
     ///
     /// The `R_i` masks must compensate `s = num_rotations + num_queries` reveals, so their degree
     /// bound must be `s + 1` (as computed by [`mask_degree_bound`]). That means the degree bound of
     /// each chunk will be `M = N - s - 1` rather than `N` itself, and that's always okay because
-    /// `N` is computed by [`padded_circuit_size`] as `num_rows + [G:F] * s + 1` so it's guaranteed
-    /// to be greater than `s + 1`.
+    /// [`padded_circuit_size`] rounds `num_rows + [G:F] * (s + 1)` up to the next power of two, so
+    /// `N` is guaranteed to exceed `s + 1` by at least `num_rows`.
     fn split_quotient(&self, quotient: Polynomial<G>) -> Vec<Polynomial<G>> {
         let quotient_degree_bound = quotient_degree_bound(
             self.degree_bound,
