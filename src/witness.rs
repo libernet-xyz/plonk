@@ -416,7 +416,7 @@ pub struct Witness<F: Field> {
 impl<F: Field> Witness<F> {
     pub(crate) fn new(num_rows: usize, num_columns: usize, degree_bound: usize) -> Self {
         assert!(degree_bound.is_power_of_two());
-        assert!(degree_bound > num_rows);
+        assert!(degree_bound >= num_rows);
         Self {
             num_rows,
             degree_bound,
