@@ -167,7 +167,7 @@ fn public_cell_challenge<F: Field, G: Field256, H: Hasher<G>>(
 
 /// Circuit compilation & proving options.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompilationOptions {
+pub struct Options {
     /// Converts all constraints to canonical form using [`Constraint::canonicalize`].
     ///
     /// When disabled, proving errors out rather than attempting canonicalization if there are
@@ -185,7 +185,7 @@ pub struct CompilationOptions {
     pub blowup_log2: usize,
 }
 
-impl Default for CompilationOptions {
+impl Default for Options {
     fn default() -> Self {
         Self {
             canonicalize_constraints: false,
@@ -574,7 +574,7 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
     }
 
     /// Compiles the circuit built so far into a [`Circuit`] object.
-    pub fn build(mut self, options: CompilationOptions) -> Result<Circuit<F, G>> {
+    pub fn build(mut self, options: Options) -> Result<Circuit<F, G>> {
         if options.canonicalize_constraints {
             let mut old_gates: BTreeMap<Constraint<F>, Vec<Cell>> = BTreeMap::default();
             std::mem::swap(&mut self.gates, &mut old_gates);
@@ -1913,7 +1913,7 @@ mod tests {
         builder.connect(cell(1, 2).into(), cell(2, 1).into());
         builder.add_gate(2, Constraint::nop());
         builder.declare_public_cells([cell(2, 0), cell(2, 1)]);
-        let circuit = builder.build(CompilationOptions {
+        let circuit = builder.build(Options {
             canonicalize_constraints,
             blowup_log2,
         })?;
@@ -1974,7 +1974,9 @@ mod tests {
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_2() {
         let c = parse_hash("0xeeed7b937aa91afe977399ce8fab86f8c7e1afedccb5540f29eff2b7141aeeea");
-        assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, 1024, c).is_ok());
+        assert!(
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, 1024, c).is_ok()
+        );
         assert!(test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, 1024, c).is_ok());
     }
 
@@ -2062,7 +2064,7 @@ mod tests {
         let result_out = cell(3, 2);
         builder.connect(result.into(), result_out.into());
         builder.declare_public_cells([x_out, y_out, result_out]);
-        let circuit = builder.build(CompilationOptions {
+        let circuit = builder.build(Options {
             canonicalize_constraints,
             blowup_log2,
         })?;
@@ -2115,7 +2117,9 @@ mod tests {
     #[test]
     fn test_vitalik_circuit_variation_goldilocks_blowup_2() {
         let c = parse_hash("0xa6c2c3af5c9ac76e6b7716b5f51903577455d45430d01bed3b7459594e872b90");
-        assert!(test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, 1024, c).is_ok());
+        assert!(
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, 1024, c).is_ok()
+        );
         assert!(test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, 1024, c).is_ok());
     }
 
@@ -2144,7 +2148,7 @@ mod tests {
         builder.add_gate(2, Constraint::nop());
         builder.declare_public_cells([cell(2, 0), cell(2, 1)]);
         builder
-            .build(CompilationOptions {
+            .build(Options {
                 canonicalize_constraints: false,
                 blowup_log2: 1,
             })
