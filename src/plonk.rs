@@ -1675,8 +1675,136 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     }
 
     pub fn from_proto(proto: &proto::Circuit) -> Result<Self> {
-        // TODO
-        todo!()
+        let num_rows = proto.num_rows as usize;
+
+        let degree_bound = proto.degree_bound as usize;
+        if !degree_bound.is_power_of_two() {
+            return Err(anyhow!(
+                "invalid degree bound {} (not a power of 2)",
+                degree_bound
+            ));
+        }
+        if degree_bound < num_rows {
+            return Err(anyhow!(
+                "the degree bound {} is lower than the number of rows {}",
+                degree_bound,
+                num_rows
+            ));
+        }
+
+        let num_columns = proto.num_columns as usize;
+
+        let blowup_log2 = proto.blowup_log2 as usize;
+        if blowup_log2 == 0 {
+            return Err(anyhow!("invalid blowup factor 2^0"));
+        }
+        let degree_bound_log2 = degree_bound.trailing_zeros() as usize;
+        if degree_bound_log2 + blowup_log2 > F::BaseField::S {
+            return Err(anyhow!(
+                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
+                degree_bound_log2,
+                blowup_log2,
+                F::BaseField::S
+            ));
+        }
+
+        let selectors: Vec<Polynomial<F>> = proto
+            .selectors
+            .iter()
+            .map(|selector| {
+                Ok(Polynomial::with_coefficients(
+                    selector
+                        .coefficients
+                        .iter()
+                        .map(|coefficient| utils::load_scalar(coefficient.as_slice()))
+                        .collect::<Result<_>>()?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        let gates: BTreeMap<Constraint<F>, BTreeSet<GateInstance>> = proto
+            .gates
+            .iter()
+            .map(|gate| {
+                Ok((
+                    match &gate.constraint {
+                        Some(constraint) => Constraint::from_proto(constraint),
+                        None => Err(anyhow!("missing gate constraint")),
+                    }?,
+                    gate.instances
+                        .iter()
+                        .map(|instance| {
+                            let column_index = instance.column_index as usize;
+                            if column_index >= num_columns {
+                                return Err(anyhow!(
+                                    "invalid column index {} in gate instance",
+                                    column_index
+                                ));
+                            }
+                            let selector_index = instance.selector_index as usize;
+                            if selector_index >= selectors.len() {
+                                return Err(anyhow!(
+                                    "invalid selector index {} in gate instance",
+                                    selector_index
+                                ));
+                            }
+                            Ok(GateInstance {
+                                column_index,
+                                selector_index,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        let sigma_values: Vec<Vec<F>> = proto
+            .sigma_table
+            .chunks(degree_bound)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|value| utils::load_scalar(value.as_slice()))
+                    .collect::<Result<_>>()
+            })
+            .collect::<Result<_>>()?;
+        let sigma: Vec<Polynomial<F>> = sigma_values
+            .iter()
+            .map(|column| Polynomial::encode2(column.clone()))
+            .collect();
+
+        let public_cells: BTreeSet<Cell> = proto
+            .public_cells
+            .iter()
+            .map(|cell| {
+                let row_index = cell.row_index as usize;
+                let column_index = cell.column_index as usize;
+                if row_index < num_rows && column_index < num_columns {
+                    Ok(Cell::new(row_index, column_index))
+                } else {
+                    Err(anyhow!(
+                        "invalid public cell ({}, {})",
+                        row_index,
+                        column_index
+                    ))
+                }
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(Self {
+            num_rows,
+            degree_bound,
+            num_columns,
+            blowup_log2,
+            blinded: proto.blinded,
+            selectors,
+            gates,
+            sigma,
+            sigma_values,
+            circuit_area_selector: make_circuit_area_selector(num_rows, degree_bound),
+            public_cells,
+            _data: PhantomData,
+        })
     }
 }
 
