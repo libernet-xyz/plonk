@@ -1,5 +1,6 @@
 use crate::chip::Chip;
 use crate::expr::{Constraint, Variable};
+use crate::starkom::proto::plonk::v8 as proto;
 use crate::utils::{self, encode_cell, encode_usize, padded_circuit_size};
 use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
 use anyhow::{Result, anyhow};
@@ -1621,6 +1622,61 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
     pub fn verify<H: Hasher<G>>(&self, proof: &Proof<F, G, H>) -> Result<BTreeMap<Cell, F>> {
         self.as_compressed::<H>().verify(proof)
+    }
+
+    pub fn to_proto(&self) -> proto::Circuit {
+        proto::Circuit {
+            num_rows: self.num_rows as u64,
+            degree_bound: self.degree_bound as u64,
+            num_columns: self.num_columns as u64,
+            blowup_log2: self.blowup_log2 as u32,
+            blinded: self.blinded,
+            selectors: self
+                .selectors
+                .iter()
+                .map(|selector| proto::RowSelector {
+                    coefficients: selector
+                        .coefficients()
+                        .iter()
+                        .copied()
+                        .map(utils::store_scalar)
+                        .collect(),
+                })
+                .collect(),
+            gates: self
+                .gates
+                .iter()
+                .map(|(constraint, instances)| proto::Gate {
+                    constraint: Some(constraint.to_proto()),
+                    instances: instances
+                        .iter()
+                        .map(|instance| proto::GateInstance {
+                            column_index: instance.column_index as u64,
+                            selector_index: instance.selector_index as u64,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            sigma_table: self
+                .sigma_values
+                .iter()
+                .map(|values| values.iter().copied().map(utils::store_scalar))
+                .flatten()
+                .collect(),
+            public_cells: self
+                .public_cells
+                .iter()
+                .map(|cell| proto::PublicCell {
+                    row_index: cell.row() as u64,
+                    column_index: cell.column() as u64,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn from_proto(proto: &proto::Circuit) -> Result<Self> {
+        // TODO
+        todo!()
     }
 }
 

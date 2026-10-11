@@ -43,10 +43,17 @@ message GateConstraint {
   repeated Monomial monomials = 1;
 }
 
-// A list of row indices indicating the rows where a given constraint activates.
+// A sum of Lagrange bases indicating the rows where a given constraint activates.
 //
 // Currently only used for gate activation.
-message RowSelector { repeated uint64 row_index = 1; }
+message RowSelector {
+  // Coefficients of the polynomial from lowest degree to highest degree: the first coefficient is
+  // the constant term, the second coefficient is that of degree 1, and so on.
+  //
+  // Each coefficient is stored as a byte array representing the integer value in canonical
+  // (non-Montgomery) form, in little-endian order.
+  repeated bytes coefficients = 1;
+}
 
 // Describes an instance of a `Gate`.
 message GateInstance {
@@ -55,8 +62,8 @@ message GateInstance {
   // All variables in the gate constraint are shifted by this offset.
   uint64 column_index = 1;
 
-  // Zero-based index into the `Circuit.selectors` array. The corresponding `RowSelector` indicates
-  // the rows where the gate activates.
+  // Zero-based index into the `Circuit.selectors` array. The corresponding `RowSelector` activates
+  // the gate on the intended rows.
   uint64 selector_index = 2;
 }
 
@@ -101,7 +108,10 @@ message Circuit {
   // algorithm, and the shape of all proofs.
   bool blinded = 5;
 
-  // Gate selectors expressed as lists of row indices indicating the rows where each gate activates.
+  // Gate selectors used in the circuit.
+  //
+  // `Gate` instances refer to selectors in this pool to determine which rows each instance
+  // activates on.
   repeated RowSelector selectors = 6;
 
   // Gates used in the circuit.
