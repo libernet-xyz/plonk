@@ -1789,4 +1789,22 @@ mod tests {
         );
         assert_eq!(constraint.to_string(), "var(0) * var(1) * var(2)");
     }
+
+    fn test_serialization_impl(constraint: Constraint<Scalar>) {
+        let proto = constraint.to_proto();
+        let decoded = Constraint::from_proto(&proto).unwrap();
+        assert_eq!(decoded, constraint);
+    }
+
+    #[test]
+    fn test_serialization() {
+        test_serialization_impl(Constraint::default());
+        test_serialization_impl(rvar(0, 0));
+        test_serialization_impl(rvar(0, 1));
+        test_serialization_impl(rvar(0, -1));
+        test_serialization_impl(rvar(1, 0));
+        test_serialization_impl(rvar(1, 1));
+        test_serialization_impl(rvar(1, -1));
+        test_serialization_impl(var(2) * make_const(from_const(16)) + rvar(4, -1) - var(4));
+    }
 }

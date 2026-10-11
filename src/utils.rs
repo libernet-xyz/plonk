@@ -480,4 +480,72 @@ mod tests {
         assert_eq!(padded_circuit_size::<BS, BS>(83, 3, true, [0, 1, 1]), 256);
         assert_eq!(padded_circuit_size::<BS, BS>(84, 3, true, [0, 1, 1]), 256);
     }
+
+    #[test]
+    fn test_load_scalar() {
+        let value1: BS = "0x1fcc49bb3722a3a6ac41aa0aac6ed68f218a7240ca2a9befd4e3243251f7ecaf"
+            .parse()
+            .unwrap();
+        let value2: BS = "0x39b3bad9cc2a94bf8f5f3c5277885fa778893898702be5ec79eaf59e08053a23"
+            .parse()
+            .unwrap();
+        assert_eq!(load_scalar::<BS>(&value1.to_le_bytes()).unwrap(), value1);
+        assert_eq!(load_scalar::<BS>(&value2.to_le_bytes()).unwrap(), value2);
+    }
+
+    fn test_load_truncated_scalar_impl(value: BS) {
+        let bytes = value.to_le_bytes();
+        let length = bytes
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .map_or(0, |index| index + 1);
+        assert_eq!(load_scalar::<BS>(&bytes[0..length]).unwrap(), value);
+    }
+
+    #[test]
+    fn test_load_truncated_scalar() {
+        test_load_truncated_scalar_impl(
+            "0x00cc49bb3722a3a6ac41aa0aac6ed68f218a7240ca2a9befd4e3243251f7ecaf"
+                .parse()
+                .unwrap(),
+        );
+        test_load_truncated_scalar_impl(
+            "0x000049bb3722a3a6ac41aa0aac6ed68f218a7240ca2a9befd4e3243251f7ecaf"
+                .parse()
+                .unwrap(),
+        );
+        test_load_truncated_scalar_impl(
+            "0x000000000000000000000000000000000000000000000000000000000000ecaf"
+                .parse()
+                .unwrap(),
+        );
+        test_load_truncated_scalar_impl(
+            "0x00000000000000000000000000000000000000000000000000000000000000af"
+                .parse()
+                .unwrap(),
+        );
+        test_load_truncated_scalar_impl(
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_store_scalar() {
+        let value1: BS = "0x1fcc49bb3722a3a6ac41aa0aac6ed68f218a7240ca2a9befd4e3243251f7ecaf"
+            .parse()
+            .unwrap();
+        let value2: BS = "0x39b3bad9cc2a94bf8f5f3c5277885fa778893898702be5ec79eaf59e08053a23"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            load_scalar::<BS>(store_scalar(value1).as_slice()).unwrap(),
+            value1
+        );
+        assert_eq!(
+            load_scalar::<BS>(store_scalar(value2).as_slice()).unwrap(),
+            value2
+        );
+    }
 }
