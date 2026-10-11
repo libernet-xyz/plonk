@@ -2,22 +2,44 @@ syntax = "proto3";
 
 package starkom.proto.plonk.v8;
 
+// Describes a polynomial constraint enforced by a `Gate`.
 message GateConstraint {
+  // A single variable.
   message Variable {
+    // Index of the witness column represented by the variable.
     uint64 column_index = 1;
+
+    // Row offset within the column.
     int64 rotation = 2;
   }
 
+  // A variable raised to a power.
+  //
+  // Negative exponents are supported and indicate field inversion (for example `var(0) ^ -3` means
+  // the witness value at column 0 inverted in the field and raised to the power of 3), but all
+  // constraints must be normalized to positive exponents before proving. See the docs for the
+  // `canonicalize_constraints` flag for details:
+  // https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.Options.html#structfield.canonicalize_constraints
   message Power {
     Variable variable = 1;
     int64 exponent = 2;
   }
 
+  // One term of the polynomial.
   message Monomial {
+    // Constant coefficient of the monomial.
+    //
+    // This is a value in the field and is stored as an integer in canonical (non-Montgomery) form,
+    // in little-endian byte order.
     bytes coefficient = 1;
+
+    // List of variables multiplied in the monomial with their respective exponents.
     repeated Power powers = 2;
   }
 
+  // The terms of the polynomial.
+  //
+  // A polynomial is a sum of monomials.
   repeated Monomial monomials = 1;
 }
 
@@ -26,21 +48,37 @@ message GateConstraint {
 // Currently only used for gate activation.
 message RowSelector { repeated uint64 row_index = 1; }
 
+// Describes an instance of a `Gate`.
 message GateInstance {
+  // Column offset for this instance.
+  //
+  // All variables in the gate constraint are shifted by this offset.
   uint64 column_index = 1;
+
+  // Zero-based index into the `Circuit.selectors` array. The corresponding `RowSelector` indicates
+  // the rows where the gate activates.
   uint64 selector_index = 2;
 }
 
+// Circuit gate descriptor.
 message Gate {
+  // Polynomial constraint enforced by the gate.
   GateConstraint constraint = 1;
+
+  // List of instantiations of the gate.
   repeated GateInstance instances = 2;
 }
 
+// Row and column coordinates of a public witness cell.
 message PublicCell {
   uint64 row_index = 1;
   uint64 column_index = 2;
 }
 
+// Describes a Starkom circuit.
+//
+// Unlike `CompressedCircuit`, the data in this message is suitable for both proving and
+// verification.
 message Circuit {
   // The raw number of rows of the circuit.
   //
@@ -69,12 +107,25 @@ message Circuit {
   // Gates used in the circuit.
   repeated Gate gates = 7;
 
+  // Sigma polynomials of the permutation argument, expressed on the value domain.
+  //
+  // There's one polynomial for every witness column and all use the same evaluation domain as the
+  // witness, so this array has the same size as the witness. The scalars in this table are laid out
+  // in column-major order, each scalar being a `bytes` array.
+  //
+  // Scalars are stored in canonical (non-Montgomery) integer form, in little-endian byte order.
   repeated bytes sigma_table = 8;
 
   // List of witness cells that are revealed in the proofs.
   repeated PublicCell public_cells = 9;
 }
 
+// Describes a Starkom circuit.
+//
+// Unlike `Circuit`, the data in this message is only suitable for verification. It's insufficient
+// for proving. On the other hand, `CompressedCircuit` messages are significantly smaller than their
+// `Circuit` counterpart because the former carry a single Merkle root for the circuit selectors and
+// sigma polynomials rather than the full polynomials.
 message CompressedCircuit {
   // The raw number of rows of the circuit.
   //
@@ -97,8 +148,12 @@ message CompressedCircuit {
   // algorithm, and the shape of all proofs.
   bool blinded = 5;
 
-  // Gate selectors expressed as lists of row indices indicating the rows where each gate activates.
-  repeated RowSelector selectors = 6;
+  // Gates used in the circuit.
+  repeated Gate gates = 6;
 
-  // TODO
+  // List of witness cells that are revealed in the proofs.
+  repeated PublicCell public_cells = 7;
+
+  // Merkle root of the circuit selectors and sigma polynomials.
+  bytes circuit_commitment = 8;
 }
