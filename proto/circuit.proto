@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package starkom.proto.plonk.v8;
+
+message GateConstraint {
+  message Variable {
+    uint64 column_index = 1;
+    int64 rotation = 2;
+  }
+
+  message Power {
+    Variable variable = 1;
+    int64 exponent = 2;
+  }
+
+  message Monomial {
+    bytes coefficient = 1;
+    repeated Power powers = 2;
+  }
+
+  repeated Monomial monomials = 1;
+}
+
+// A list of row indices indicating the rows where a given constraint activates.
+//
+// Currently only used for gate activation.
+message RowSelector { repeated uint64 row_index = 1; }
+
+message GateInstance {
+  uint64 column_index = 1;
+  uint64 selector_index = 2;
+}
+
+message Gate {
+  GateConstraint constraint = 1;
+  repeated GateInstance instances = 2;
+}
+
+message PublicCell {
+  uint64 row_index = 1;
+  uint64 column_index = 2;
+}
+
+message Circuit {
+  // The raw number of rows of the circuit.
+  //
+  // Unlike `degree_bound` this count doesn't include the blinding rows and is not padded to the
+  // next power of 2.
+  uint64 num_rows = 1;
+
+  // Number of witness rows (including the blinding rows) rounded up to the next power of 2.
+  uint64 degree_bound = 2;
+
+  // Number of witness columns.
+  uint64 num_columns = 3;
+
+  // Log2 of the blowup factor.
+  uint32 blowup_log2 = 4;
+
+  // Whether or not the circuit is blinded.
+  //
+  // This is relevant because it changes the number of committed polynomials, the verification
+  // algorithm, and the shape of all proofs.
+  bool blinded = 5;
+
+  // Gate selectors expressed as lists of row indices indicating the rows where each gate activates.
+  repeated RowSelector selectors = 6;
+
+  // Gates used in the circuit.
+  repeated Gate gates = 7;
+
+  repeated bytes sigma_table = 8;
+
+  // List of witness cells that are revealed in the proofs.
+  repeated PublicCell public_cells = 9;
+}
+
+message CompressedCircuit {
+  // The raw number of rows of the circuit.
+  //
+  // Unlike `degree_bound` this count doesn't include the blinding rows and is not padded to the
+  // next power of 2.
+  uint64 num_rows = 1;
+
+  // Number of witness rows (including the blinding rows) rounded up to the next power of 2.
+  uint64 degree_bound = 2;
+
+  // Number of witness columns.
+  uint64 num_columns = 3;
+
+  // Log2 of the blowup factor.
+  uint32 blowup_log2 = 4;
+
+  // Whether or not the circuit is blinded.
+  //
+  // This is relevant because it changes the number of committed polynomials, the verification
+  // algorithm, and the shape of all proofs.
+  bool blinded = 5;
+
+  // Gate selectors expressed as lists of row indices indicating the rows where each gate activates.
+  repeated RowSelector selectors = 6;
+
+  // TODO
+}

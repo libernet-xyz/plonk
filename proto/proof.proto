@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package starkom.proto.plonk.v8;
+
+import "pcs/pcs.proto";
+
+// A PLONK(ish) proof of knowledge of a witness for a circuit.
+//
+// `Proof`s are checked against a `Circuit` or `CompressedCircuit`.
+message Proof {
+  message PublicInput {
+    // Row index of the public cell.
+    uint64 row = 1;
+
+    // Column index of the public cell.
+    uint64 column = 2;
+
+    // Scalar value of the public cell.
+    //
+    // Must be stored in canonical (non-Montgomery) integer form, in little-endian byte order.
+    bytes value = 3;
+  }
+
+  // The public witness cells opened by the proof.
+  repeated PublicInput public_inputs = 1;
+
+  // The inner DEEP-FRI commitment.
+  pcs.v7.Commitment commitment = 2;
+
+  // The inner DEEP-FRI proof.
+  pcs.v7.Proof inner_proof = 3;
+}

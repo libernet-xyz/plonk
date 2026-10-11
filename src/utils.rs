@@ -1,5 +1,5 @@
 use crate::witness::Cell;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use primitive_types::{H256, U256};
 use sha3::Digest;
 use starkom_ff::{Field, Field256};
@@ -119,6 +119,37 @@ pub(crate) fn padded_circuit_size<F: Field, G: Field256<BaseField = F>>(
         0
     };
     std::cmp::max(2, (num_rows + min_blinding_rows).next_power_of_two())
+}
+
+/// Loads an `F` value from its little-endian canonical integer representation.
+///
+/// REQUIRES: the length of `bytes` must be less than or equal to [`F::LEN`](`Field::LEN`).
+///
+/// If `bytes` has less than `F::LEN` bytes the value is automatically padded with zeros.
+pub(crate) fn load_scalar<F: Field>(bytes: &[u8]) -> Result<F> {
+    if bytes.len() > F::LEN {
+        return Err(anyhow!(
+            "invalid scalar length (expected {}, got {})",
+            F::LEN,
+            bytes.len()
+        ));
+    }
+    const { assert!(F::LEN <= 32) }
+    let mut padded_bytes = [0u8; 32];
+    padded_bytes[0..bytes.len()].copy_from_slice(bytes);
+    F::try_from_le_bytes(&padded_bytes[0..F::LEN])
+        .into_option()
+        .context(format!(
+            "invalid scalar (exceeds the [0, {}) range)",
+            F::MODULUS
+        ))
+}
+
+/// Serializes an `F` value into its little-endian canonical integer representation.
+pub(crate) fn store_scalar<F: Field>(value: F) -> Vec<u8> {
+    let mut bytes = vec![0u8; F::LEN];
+    bytes.copy_from_slice(&value.to_u256().to_little_endian()[0..F::LEN]);
+    bytes
 }
 
 #[cfg(test)]

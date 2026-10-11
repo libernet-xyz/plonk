@@ -3,6 +3,16 @@
 
 #![doc = include_str!("../README.md")]
 
+pub mod starkom {
+    pub mod proto {
+        pub mod plonk {
+            pub mod v8 {
+                include!(concat!(env!("OUT_DIR"), "/starkom.proto.plonk.v8.rs"));
+            }
+        }
+    }
+}
+
 mod chip;
 mod expr;
 mod lexer;

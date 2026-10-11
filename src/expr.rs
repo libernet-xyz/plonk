@@ -1,7 +1,9 @@
 use crate::lexer;
 use crate::parser;
-use crate::utils::{is_pseudo_negative, isize_to_scalar};
+use crate::starkom::proto::plonk::v8 as proto;
+use crate::utils::{self, is_pseudo_negative, isize_to_scalar};
 use crate::witness::Cell;
+use anyhow::{Result, anyhow};
 use starkom_bluesky::Scalar as BS;
 use starkom_ff::Field;
 use starkom_goldilocks::GL;
@@ -583,6 +585,62 @@ impl<F: Field> Constraint<F> {
                 }
             })
             .sum()
+    }
+
+    /// Serializes this constraint to a [`GateConstraint`](`proto::GateConstraint`) protobuf.
+    pub fn to_proto(&self) -> proto::GateConstraint {
+        proto::GateConstraint {
+            monomials: self
+                .monomials
+                .iter()
+                .map(
+                    |(variables, &coefficient)| proto::gate_constraint::Monomial {
+                        coefficient: utils::store_scalar(coefficient),
+                        powers: variables
+                            .iter()
+                            .map(|(variable, &exponent)| proto::gate_constraint::Power {
+                                variable: Some(proto::gate_constraint::Variable {
+                                    column_index: variable.column_index() as u64,
+                                    rotation: variable.rotation() as i64,
+                                }),
+                                exponent: exponent as i64,
+                            })
+                            .collect(),
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    /// Deserializes a constraint from a [`GateConstraint`](`proto::GateConstraint`) protobuf.
+    pub fn from_proto(proto: &proto::GateConstraint) -> Result<Self> {
+        let mut constraint = Self {
+            monomials: proto
+                .monomials
+                .iter()
+                .map(|monomial| {
+                    Ok((
+                        monomial
+                            .powers
+                            .iter()
+                            .map(|power| match &power.variable {
+                                Some(variable) => Ok((
+                                    Variable {
+                                        column_index: variable.column_index as usize,
+                                        rotation: variable.rotation as isize,
+                                    },
+                                    power.exponent as isize,
+                                )),
+                                None => Err(anyhow!("invalid gate constraint: stray exponent")),
+                            })
+                            .collect::<Result<_>>()?,
+                        utils::load_scalar(monomial.coefficient.as_slice())?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+        };
+        constraint.normalize();
+        Ok(constraint)
     }
 }
 
