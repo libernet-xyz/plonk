@@ -152,6 +152,23 @@ pub(crate) fn store_scalar<F: Field>(value: F) -> Vec<u8> {
     bytes
 }
 
+/// Loads a 256-bit hash from its serialized byte form, erroring out if the length of the provided
+/// slice is not 32.
+pub(crate) fn load_hash(bytes: &[u8]) -> Result<H256> {
+    if bytes.len() != 32 {
+        return Err(anyhow!(
+            "invalid hash length (expected 32, got {})",
+            bytes.len()
+        ));
+    }
+    Ok(H256::from_slice(bytes))
+}
+
+/// Stores a 256-bit hash into its serialized byte form.
+pub(crate) fn store_hash(hash: H256) -> Vec<u8> {
+    hash.as_bytes().to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,5 +564,30 @@ mod tests {
             load_scalar::<BS>(store_scalar(value2).as_slice()).unwrap(),
             value2
         );
+    }
+
+    #[test]
+    fn test_load_sha2_hash() {
+        let hash1: H256 = "0x8c313b317b2ff13ecf3abea4e59dad76b24a13e7b5b8fa10a939fc2ab1713175"
+            .parse()
+            .unwrap();
+        let hash2: H256 = "0x51c39e4b5287d491be2e02080c39493b77be8fd3d032227815357c5360e3d230"
+            .parse()
+            .unwrap();
+        assert_eq!(load_hash(hash1.as_bytes()).unwrap(), hash1);
+        assert_eq!(load_hash(hash2.as_bytes()).unwrap(), hash2);
+        assert!(load_hash(&hash1.as_bytes()[0..31]).is_err());
+    }
+
+    #[test]
+    fn test_store_hash() {
+        let hash1: H256 = "0x8c313b317b2ff13ecf3abea4e59dad76b24a13e7b5b8fa10a939fc2ab1713175"
+            .parse()
+            .unwrap();
+        let hash2: H256 = "0x51c39e4b5287d491be2e02080c39493b77be8fd3d032227815357c5360e3d230"
+            .parse()
+            .unwrap();
+        assert_eq!(load_hash(store_hash(hash1).as_slice()).unwrap(), hash1);
+        assert_eq!(load_hash(store_hash(hash2).as_slice()).unwrap(), hash2);
     }
 }

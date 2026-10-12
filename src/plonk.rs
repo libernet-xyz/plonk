@@ -2191,6 +2191,134 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
 
         Ok(public_inputs)
     }
+
+    pub fn to_proto(&self) -> proto::CompressedCircuit {
+        proto::CompressedCircuit {
+            num_rows: self.num_rows as u64,
+            degree_bound: self.degree_bound as u64,
+            num_columns: self.num_columns as u64,
+            blowup_log2: self.blowup_log2 as u32,
+            blinded: self.blinded,
+            gates: self
+                .gates
+                .iter()
+                .map(|(constraint, instances)| proto::Gate {
+                    constraint: Some(constraint.to_proto()),
+                    instances: instances
+                        .iter()
+                        .map(|instance| proto::GateInstance {
+                            column_index: instance.column_index as u64,
+                            selector_index: instance.selector_index as u64,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            public_cells: self
+                .public_cells
+                .iter()
+                .map(|cell| proto::PublicCell {
+                    row_index: cell.row() as u64,
+                    column_index: cell.column() as u64,
+                })
+                .collect(),
+            circuit_commitment: utils::store_hash(self.circuit_commitment),
+        }
+    }
+
+    pub fn from_proto(proto: &proto::CompressedCircuit) -> Result<Self> {
+        let num_rows = proto.num_rows as usize;
+
+        let degree_bound = proto.degree_bound as usize;
+        if !degree_bound.is_power_of_two() {
+            return Err(anyhow!(
+                "invalid degree bound {} (not a power of 2)",
+                degree_bound
+            ));
+        }
+        if degree_bound < num_rows {
+            return Err(anyhow!(
+                "the degree bound {} is lower than the number of rows {}",
+                degree_bound,
+                num_rows
+            ));
+        }
+
+        let num_columns = proto.num_columns as usize;
+
+        let blowup_log2 = proto.blowup_log2 as usize;
+        if blowup_log2 == 0 {
+            return Err(anyhow!("invalid blowup factor 2^0"));
+        }
+        let degree_bound_log2 = degree_bound.trailing_zeros() as usize;
+        if degree_bound_log2 + blowup_log2 > F::BaseField::S {
+            return Err(anyhow!(
+                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
+                degree_bound_log2,
+                blowup_log2,
+                F::BaseField::S
+            ));
+        }
+
+        let gates: Vec<(Constraint<F>, Vec<GateInstance>)> = proto
+            .gates
+            .iter()
+            .map(|gate| {
+                Ok((
+                    match &gate.constraint {
+                        Some(constraint) => Constraint::from_proto(constraint),
+                        None => Err(anyhow!("missing gate constraint")),
+                    }?,
+                    gate.instances
+                        .iter()
+                        .map(|instance| {
+                            let column_index = instance.column_index as usize;
+                            if column_index >= num_columns {
+                                return Err(anyhow!(
+                                    "invalid column index {} in gate instance",
+                                    column_index
+                                ));
+                            }
+                            let selector_index = instance.selector_index as usize;
+                            Ok(GateInstance {
+                                column_index,
+                                selector_index,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        let public_cells: BTreeSet<Cell> = proto
+            .public_cells
+            .iter()
+            .map(|cell| {
+                let row_index = cell.row_index as usize;
+                let column_index = cell.column_index as usize;
+                if row_index < num_rows && column_index < num_columns {
+                    Ok(Cell::new(row_index, column_index))
+                } else {
+                    Err(anyhow!(
+                        "invalid public cell ({}, {})",
+                        row_index,
+                        column_index
+                    ))
+                }
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(Self {
+            num_rows,
+            degree_bound,
+            num_columns,
+            blowup_log2,
+            blinded: proto.blinded,
+            gates,
+            public_cells,
+            circuit_commitment: utils::load_hash(proto.circuit_commitment.as_slice())?,
+            _data: PhantomData,
+        })
+    }
 }
 
 #[cfg(test)]
