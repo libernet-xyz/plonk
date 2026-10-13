@@ -1767,9 +1767,17 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             })
             .collect::<Result<_>>()?;
 
+        if proto.sigma_table.len() != num_columns * degree_bound {
+            return Err(anyhow!(
+                "invalid sigma table size {} (want {} columns of {} values)",
+                proto.sigma_table.len(),
+                num_columns,
+                degree_bound
+            ));
+        }
         let sigma_values: Vec<Vec<F>> = proto
             .sigma_table
-            .chunks(degree_bound)
+            .chunks_exact(degree_bound)
             .map(|chunk| {
                 chunk
                     .iter()
@@ -3072,6 +3080,14 @@ mod tests {
             .resize(degree_bound + 1, vec![1]);
         let error = Circuit::<BS, BS>::from_proto(&proto).unwrap_err();
         assert!(error.to_string().contains("invalid selector"));
+    }
+
+    #[test]
+    fn test_truncated_sigma_table_is_rejected() {
+        let mut proto = build_vitalik_circuit().to_proto();
+        proto.sigma_table.pop();
+        let error = Circuit::<BS, BS>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("invalid sigma table size"));
     }
 
     #[test]
