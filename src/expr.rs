@@ -195,9 +195,6 @@ impl<F: Field> Constraint<F> {
 
     /// Makes a NOP constraint, ie. one that simply constrains `0 == 0`.
     ///
-    /// This type of gate can be used for revealing specific wires. Our engine also uses it
-    /// internally to add blinding rows.
-    ///
     /// The returned constraint is exactly the same as `Constraint::default()`.
     pub fn nop() -> Self {
         Self::default()
@@ -212,6 +209,18 @@ impl<F: Field> Constraint<F> {
                     .map(|(variable, _)| variable.column_index())
             })
             .min()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn get_max_column_index(&self) -> usize {
+        self.monomials
+            .iter()
+            .flat_map(|(variables, _)| {
+                variables
+                    .iter()
+                    .map(|(variable, _)| variable.column_index())
+            })
+            .max()
             .unwrap_or(0)
     }
 

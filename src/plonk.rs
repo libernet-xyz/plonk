@@ -51,7 +51,7 @@ fn get_rotation_set<'a, F: Field>(
 ) -> BTreeSet<isize> {
     gates
         .into_iter()
-        .map(|constraint| {
+        .flat_map(|constraint| {
             constraint
                 .get_free_variables()
                 .iter()
@@ -59,7 +59,6 @@ fn get_rotation_set<'a, F: Field>(
                 .collect::<BTreeSet<isize>>()
                 .into_iter()
         })
-        .flatten()
         .chain([0, 1])
         .collect::<BTreeSet<isize>>()
 }
@@ -1661,8 +1660,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             sigma_table: self
                 .sigma_values
                 .iter()
-                .map(|values| values.iter().copied().map(utils::store_scalar))
-                .flatten()
+                .flat_map(|values| values.iter().copied().map(utils::store_scalar))
                 .collect(),
             public_cells: self
                 .public_cells
@@ -1728,19 +1726,21 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             .gates
             .iter()
             .map(|gate| {
+                let constraint = match &gate.constraint {
+                    Some(constraint) => Constraint::from_proto(constraint),
+                    None => Err(anyhow!("missing gate constraint")),
+                }?;
+                let max_column_index = constraint.get_max_column_index();
                 Ok((
-                    match &gate.constraint {
-                        Some(constraint) => Constraint::from_proto(constraint),
-                        None => Err(anyhow!("missing gate constraint")),
-                    }?,
+                    constraint,
                     gate.instances
                         .iter()
                         .map(|instance| {
                             let column_index = instance.column_index as usize;
-                            if column_index >= num_columns {
+                            if column_index + max_column_index >= num_columns {
                                 return Err(anyhow!(
-                                    "invalid column index {} in gate instance",
-                                    column_index
+                                    "invalid gate placement: column {} overflows",
+                                    column_index + max_column_index
                                 ));
                             }
                             let selector_index = instance.selector_index as usize;
@@ -1953,12 +1953,11 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         let num_gate_selectors = self
             .gates
             .iter()
-            .map(|(_, gate_instances)| {
+            .flat_map(|(_, gate_instances)| {
                 gate_instances
                     .iter()
                     .map(|instance| instance.selector_index)
             })
-            .flatten()
             .collect::<BTreeSet<usize>>()
             .len();
         let num_sigma_polynomials = self.num_columns;
@@ -2313,19 +2312,21 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             .gates
             .iter()
             .map(|gate| {
+                let constraint = match &gate.constraint {
+                    Some(constraint) => Constraint::from_proto(constraint),
+                    None => Err(anyhow!("missing gate constraint")),
+                }?;
+                let max_column_index = constraint.get_max_column_index();
                 Ok((
-                    match &gate.constraint {
-                        Some(constraint) => Constraint::from_proto(constraint),
-                        None => Err(anyhow!("missing gate constraint")),
-                    }?,
+                    constraint,
                     gate.instances
                         .iter()
                         .map(|instance| {
                             let column_index = instance.column_index as usize;
-                            if column_index >= num_columns {
+                            if column_index + max_column_index >= num_columns {
                                 return Err(anyhow!(
-                                    "invalid column index {} in gate instance",
-                                    column_index
+                                    "invalid gate placement: column {} overflows",
+                                    column_index + max_column_index
                                 ));
                             }
                             let selector_index = instance.selector_index as usize;
@@ -3053,6 +3054,23 @@ mod tests {
         let public_inputs = circuit.verify(&proof).unwrap();
         assert_eq!(public_inputs.len(), 2);
         assert!(!public_inputs.contains_key(&cell(1, 2)));
+    }
+
+    #[test]
+    fn test_misplaced_gate_is_rejected() {
+        let mut proto = build_vitalik_circuit().to_proto();
+        proto.gates[1].instances[0].column_index = 1;
+        let error = Circuit::<BS, BS>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("invalid gate placement"));
+    }
+
+    #[test]
+    fn test_misplaced_compressed_gate_is_rejected() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.gates[1].instances[0].column_index = 1;
+        let error = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("invalid gate placement"));
     }
 
     #[test]
