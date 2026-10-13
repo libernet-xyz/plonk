@@ -3210,6 +3210,23 @@ mod tests {
     }
 
     #[test]
+    fn test_compressed_circuit_without_hash_backend_is_rejected() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.hash_backend = None;
+        let error = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("hash backend not specified"));
+    }
+
+    #[test]
+    fn test_compressed_circuit_with_wrong_hash_backend_is_rejected() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let error = CompressedCircuit::<BS, BS, Keccak256Hash<BS>>::from_proto(&circuit.to_proto())
+            .unwrap_err();
+        assert!(error.to_string().contains("incorrect hash backend"));
+    }
+
+    #[test]
     fn test_unblinded_proofs_are_deterministic() {
         let (_, proof1) = prove_vitalik_circuit();
         let (_, proof2) = prove_vitalik_circuit();
