@@ -4,11 +4,11 @@ use std::path::PathBuf;
 const PROTOS: [&str; 2] = ["circuit.proto", "proof.proto"];
 
 fn main() -> Result<()> {
-    let pcs_proto_dir = PathBuf::from(std::env::var("DEP_STARKOM_PCS_V7_PROTO_DIR").unwrap());
+    let pcs_proto_dir = PathBuf::from(std::env::var("DEP_STARKOM_PCS_V8_PROTO_DIR").unwrap());
     prost_build::Config::new()
         .extern_path(
-            ".starkom.proto.pcs.v7",
-            "::starkom_pcs::starkom::proto::pcs::v7",
+            ".starkom.proto.pcs.v8",
+            "::starkom_pcs::starkom::proto::pcs::v8",
         )
         .compile_protos(
             &PROTOS.map(|proto| format!("proto/{proto}")),

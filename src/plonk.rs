@@ -1,10 +1,11 @@
 use crate::chip::Chip;
 use crate::expr::{Constraint, Variable};
-use crate::starkom::proto::plonk::v8 as proto;
+use crate::starkom::proto::plonk::v9 as proto;
 use crate::utils::{self, encode_cell, encode_usize, padded_circuit_size};
 use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
+use prost::Name;
 use starkom_ff::{Field, Field256};
 use starkom_pcs::{self as pcs, hash::Hasher};
 use starkom_poly::Polynomial;
@@ -2268,6 +2269,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
     /// protobuf.
     pub fn to_proto(&self) -> proto::CompressedCircuit {
         proto::CompressedCircuit {
+            hash_backend: Some(prost_types::Any::from_msg(&H::ProtoTag::default()).unwrap()),
             num_rows: self.num_rows as u64,
             degree_bound: self.degree_bound as u64,
             num_columns: self.num_columns as u64,
@@ -2302,6 +2304,20 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
     /// Deserializes a compressed circuit from a
     /// [`CompressedCircuit`](`proto::CompressedCircuit`) protobuf.
     pub fn from_proto(proto: &proto::CompressedCircuit) -> Result<Self> {
+        match &proto.hash_backend {
+            Some(hash_backend) => {
+                hash_backend.to_msg::<H::ProtoTag>().map_err(|_| {
+                    anyhow!(
+                        "incorrect hash backend (got {}, want {})",
+                        hash_backend.type_url,
+                        H::ProtoTag::type_url()
+                    )
+                })?;
+                Ok(())
+            }
+            None => Err(anyhow!("hash backend not specified")),
+        }?;
+
         let num_rows = proto.num_rows as usize;
 
         let degree_bound = proto.degree_bound as usize;

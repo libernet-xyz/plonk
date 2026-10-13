@@ -1,6 +1,8 @@
 syntax = "proto3";
 
-package starkom.proto.plonk.v8;
+import "google/protobuf/any.proto";
+
+package starkom.proto.plonk.v9;
 
 // Describes a polynomial constraint enforced by a `Gate`.
 message GateConstraint {
@@ -136,33 +138,44 @@ message Circuit {
 // `Circuit` counterpart because the former carry a single Merkle root for the circuit selectors and
 // sigma polynomials rather than the full polynomials.
 message CompressedCircuit {
+  // Hash backend used to commit to the circuit.
+  //
+  // It can be one of the backends provided by `pcs.proto` or any other user-defined tag with a
+  // corresponding backend implementation.
+  //
+  // The `circuit_commitment` field is a hash produced by this backend.
+  //
+  // NOTE: in order to warrant 128-bit security in a quantum setting, all backends are required to
+  // use a ~256-bit cryptographic hash.
+  .google.protobuf.Any hash_backend = 1;
+
   // The raw number of rows of the circuit.
   //
   // Unlike `degree_bound` this count doesn't include the blinding rows and is not padded to the
   // next power of 2.
-  uint64 num_rows = 1;
+  uint64 num_rows = 2;
 
   // Number of witness rows (including the blinding rows) rounded up to the next power of 2.
-  uint64 degree_bound = 2;
+  uint64 degree_bound = 3;
 
   // Number of witness columns.
-  uint64 num_columns = 3;
+  uint64 num_columns = 4;
 
   // Log2 of the blowup factor.
-  uint32 blowup_log2 = 4;
+  uint32 blowup_log2 = 5;
 
   // Whether or not the circuit is blinded.
   //
   // This is relevant because it changes the number of committed polynomials, the verification
   // algorithm, and the shape of all proofs.
-  bool blinded = 5;
+  bool blinded = 6;
 
   // Gates used in the circuit.
-  repeated Gate gates = 6;
+  repeated Gate gates = 7;
 
   // List of witness cells that are revealed in the proofs.
-  repeated PublicCell public_cells = 7;
+  repeated PublicCell public_cells = 8;
 
   // Merkle root of the gate selectors, the sigma polynomials, and the circuit area selector.
-  bytes circuit_commitment = 8;
+  bytes circuit_commitment = 9;
 }

@@ -775,14 +775,15 @@ dependencies = [
 
 [[package]]
 name = "starkom-pcs"
-version = "7.1.1"
+version = "8.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f0c5a25ef1139c96dd95df42f9f7c6a20d2a6bae058a38fab98170db6296490"
+checksum = "d4bce1d7d1b48a83995235ae82599bbb455f3e8e752514c11e7980014fe99ad5"
 dependencies = [
  "anyhow",
  "primitive-types",
  "prost",
  "prost-build",
+ "prost-types",
  "sha2",
  "sha3",
  "starkom-ff",
@@ -793,12 +794,13 @@ dependencies = [
 
 [[package]]
 name = "starkom-plonk"
-version = "8.1.0"
+version = "9.0.0"
 dependencies = [
  "anyhow",
  "primitive-types",
  "prost",
  "prost-build",
+ "prost-types",
  "regex",
  "sha3",
  "starkom-bluesky",

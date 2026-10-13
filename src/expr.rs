@@ -1,6 +1,6 @@
 use crate::lexer;
 use crate::parser;
-use crate::starkom::proto::plonk::v8 as proto;
+use crate::starkom::proto::plonk::v9 as proto;
 use crate::utils::{self, is_pseudo_negative, isize_to_scalar};
 use crate::witness::Cell;
 use anyhow::{Result, anyhow};
