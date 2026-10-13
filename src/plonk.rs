@@ -1712,6 +1712,13 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             .selectors
             .iter()
             .map(|selector| {
+                if selector.coefficients.len() > degree_bound {
+                    return Err(anyhow!(
+                        "invalid selector with {} coefficients (the degree bound is {})",
+                        selector.coefficients.len(),
+                        degree_bound
+                    ));
+                }
                 Ok(Polynomial::with_coefficients(
                     selector
                         .coefficients
@@ -3054,6 +3061,17 @@ mod tests {
         let public_inputs = circuit.verify(&proof).unwrap();
         assert_eq!(public_inputs.len(), 2);
         assert!(!public_inputs.contains_key(&cell(1, 2)));
+    }
+
+    #[test]
+    fn test_oversized_selector_is_rejected() {
+        let mut proto = build_vitalik_circuit().to_proto();
+        let degree_bound = proto.degree_bound as usize;
+        proto.selectors[0]
+            .coefficients
+            .resize(degree_bound + 1, vec![1]);
+        let error = Circuit::<BS, BS>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("invalid selector"));
     }
 
     #[test]
