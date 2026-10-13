@@ -15,14 +15,13 @@ message GateConstraint {
 
   // A variable raised to a power.
   //
-  // Negative exponents are supported and indicate field inversion (for example `var(0) ^ -3` means
-  // the witness value at column 0 inverted in the field and raised to the power of 3), but all
-  // constraints must be normalized to positive exponents before proving. See the docs for the
-  // `canonicalize_constraints` flag for details:
+  // Only positive exponents can be serialized. Negative exponents (field inversions) must be
+  // removed when building the circuit, before serialization, because they can't be proven. See the
+  // docs for the `canonicalize_constraints` flag for details:
   // https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.Options.html#structfield.canonicalize_constraints
   message Power {
     Variable variable = 1;
-    int64 exponent = 2;
+    uint64 exponent = 2;
   }
 
   // One term of the polynomial.

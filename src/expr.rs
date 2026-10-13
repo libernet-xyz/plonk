@@ -588,6 +588,9 @@ impl<F: Field> Constraint<F> {
     }
 
     /// Serializes this constraint to a [`GateConstraint`](`proto::GateConstraint`) protobuf.
+    ///
+    /// REQUIRES: the constraint must be in [canonical form](`Self::canonicalize`). This method
+    /// panics if it has negative exponents.
     pub fn to_proto(&self) -> proto::GateConstraint {
         proto::GateConstraint {
             monomials: self
@@ -598,12 +601,15 @@ impl<F: Field> Constraint<F> {
                         coefficient: utils::store_scalar(coefficient),
                         powers: variables
                             .iter()
-                            .map(|(variable, &exponent)| proto::gate_constraint::Power {
-                                variable: Some(proto::gate_constraint::Variable {
-                                    column_index: variable.column_index() as u64,
-                                    rotation: variable.rotation() as i64,
-                                }),
-                                exponent: exponent as i64,
+                            .map(|(variable, &exponent)| {
+                                assert!(exponent >= 0, "the constraint is not in canonical form");
+                                proto::gate_constraint::Power {
+                                    variable: Some(proto::gate_constraint::Variable {
+                                        column_index: variable.column_index() as u64,
+                                        rotation: variable.rotation() as i64,
+                                    }),
+                                    exponent: exponent as usize as u64,
+                                }
                             })
                             .collect(),
                     },
@@ -629,7 +635,9 @@ impl<F: Field> Constraint<F> {
                                         column_index: variable.column_index as usize,
                                         rotation: variable.rotation as isize,
                                     },
-                                    power.exponent as isize,
+                                    isize::try_from(power.exponent).map_err(|_| {
+                                        anyhow!("invalid exponent {}", power.exponent)
+                                    })?,
                                 )),
                                 None => Err(anyhow!("invalid gate constraint: stray exponent")),
                             })
@@ -1806,5 +1814,20 @@ mod tests {
         test_serialization_impl(rvar(1, 1));
         test_serialization_impl(rvar(1, -1));
         test_serialization_impl(var(2) * make_const(from_const(16)) + rvar(4, -1) - var(4));
+    }
+
+    #[test]
+    #[should_panic(expected = "the constraint is not in canonical form")]
+    fn test_serialize_non_canonical_constraint() {
+        let constraint: Constraint<Scalar> = var(0) ^ -2;
+        constraint.to_proto();
+    }
+
+    #[test]
+    fn test_deserialize_oversized_exponent() {
+        let constraint: Constraint<Scalar> = var(0) ^ 2;
+        let mut proto = constraint.to_proto();
+        proto.monomials[0].powers[0].exponent = 1 << 63;
+        assert!(Constraint::<Scalar>::from_proto(&proto).is_err());
     }
 }
