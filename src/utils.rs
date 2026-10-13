@@ -1,5 +1,5 @@
 use crate::witness::Cell;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use primitive_types::{H256, U256};
 use sha3::Digest;
 use starkom_ff::{Field, Field256};
@@ -119,6 +119,54 @@ pub(crate) fn padded_circuit_size<F: Field, G: Field256<BaseField = F>>(
         0
     };
     std::cmp::max(2, (num_rows + min_blinding_rows).next_power_of_two())
+}
+
+/// Loads an `F` value from its little-endian canonical integer representation.
+///
+/// REQUIRES: the length of `bytes` must be less than or equal to [`F::LEN`](`Field::LEN`).
+///
+/// If `bytes` has less than `F::LEN` bytes the value is automatically padded with zeros.
+pub(crate) fn load_scalar<F: Field>(bytes: &[u8]) -> Result<F> {
+    if bytes.len() > F::LEN {
+        return Err(anyhow!(
+            "invalid scalar length (expected {}, got {})",
+            F::LEN,
+            bytes.len()
+        ));
+    }
+    const { assert!(F::LEN <= 32) }
+    let mut padded_bytes = [0u8; 32];
+    padded_bytes[0..bytes.len()].copy_from_slice(bytes);
+    F::try_from_le_bytes(&padded_bytes[0..F::LEN])
+        .into_option()
+        .context(format!(
+            "invalid scalar (exceeds the [0, {}) range)",
+            F::MODULUS
+        ))
+}
+
+/// Serializes an `F` value into its little-endian canonical integer representation.
+pub(crate) fn store_scalar<F: Field>(value: F) -> Vec<u8> {
+    let mut bytes = vec![0u8; F::LEN];
+    bytes.copy_from_slice(&value.to_u256().to_little_endian()[0..F::LEN]);
+    bytes
+}
+
+/// Loads a 256-bit hash from its serialized byte form, erroring out if the length of the provided
+/// slice is not 32.
+pub(crate) fn load_hash(bytes: &[u8]) -> Result<H256> {
+    if bytes.len() != 32 {
+        return Err(anyhow!(
+            "invalid hash length (expected 32, got {})",
+            bytes.len()
+        ));
+    }
+    Ok(H256::from_slice(bytes))
+}
+
+/// Stores a 256-bit hash into its serialized byte form.
+pub(crate) fn store_hash(hash: H256) -> Vec<u8> {
+    hash.as_bytes().to_vec()
 }
 
 #[cfg(test)]
@@ -448,5 +496,98 @@ mod tests {
         assert_eq!(padded_circuit_size::<BS, BS>(82, 3, true, [0, 1, 1]), 128);
         assert_eq!(padded_circuit_size::<BS, BS>(83, 3, true, [0, 1, 1]), 256);
         assert_eq!(padded_circuit_size::<BS, BS>(84, 3, true, [0, 1, 1]), 256);
+    }
+
+    #[test]
+    fn test_load_scalar() {
+        let value1: BS = "0x1fcc49bb3722a3a6ac41aa0aac6ed68f218a7240ca2a9befd4e3243251f7ecaf"
+            .parse()
+            .unwrap();
+        let value2: BS = "0x39b3bad9cc2a94bf8f5f3c5277885fa778893898702be5ec79eaf59e08053a23"
+            .parse()
+            .unwrap();
+        assert_eq!(load_scalar::<BS>(&value1.to_le_bytes()).unwrap(), value1);
+        assert_eq!(load_scalar::<BS>(&value2.to_le_bytes()).unwrap(), value2);
+    }
+
+    fn test_load_truncated_scalar_impl(value: BS) {
+        let bytes = value.to_le_bytes();
+        let length = bytes
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .map_or(0, |index| index + 1);
+        assert_eq!(load_scalar::<BS>(&bytes[0..length]).unwrap(), value);
+    }
+
+    #[test]
+    fn test_load_truncated_scalar() {
+        test_load_truncated_scalar_impl(
+            "0x00cc49bb3722a3a6ac41aa0aac6ed68f218a7240ca2a9befd4e3243251f7ecaf"
+                .parse()
+                .unwrap(),
+        );
+        test_load_truncated_scalar_impl(
+            "0x000049bb3722a3a6ac41aa0aac6ed68f218a7240ca2a9befd4e3243251f7ecaf"
+                .parse()
+                .unwrap(),
+        );
+        test_load_truncated_scalar_impl(
+            "0x000000000000000000000000000000000000000000000000000000000000ecaf"
+                .parse()
+                .unwrap(),
+        );
+        test_load_truncated_scalar_impl(
+            "0x00000000000000000000000000000000000000000000000000000000000000af"
+                .parse()
+                .unwrap(),
+        );
+        test_load_truncated_scalar_impl(
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_store_scalar() {
+        let value1: BS = "0x1fcc49bb3722a3a6ac41aa0aac6ed68f218a7240ca2a9befd4e3243251f7ecaf"
+            .parse()
+            .unwrap();
+        let value2: BS = "0x39b3bad9cc2a94bf8f5f3c5277885fa778893898702be5ec79eaf59e08053a23"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            load_scalar::<BS>(store_scalar(value1).as_slice()).unwrap(),
+            value1
+        );
+        assert_eq!(
+            load_scalar::<BS>(store_scalar(value2).as_slice()).unwrap(),
+            value2
+        );
+    }
+
+    #[test]
+    fn test_load_sha2_hash() {
+        let hash1: H256 = "0x8c313b317b2ff13ecf3abea4e59dad76b24a13e7b5b8fa10a939fc2ab1713175"
+            .parse()
+            .unwrap();
+        let hash2: H256 = "0x51c39e4b5287d491be2e02080c39493b77be8fd3d032227815357c5360e3d230"
+            .parse()
+            .unwrap();
+        assert_eq!(load_hash(hash1.as_bytes()).unwrap(), hash1);
+        assert_eq!(load_hash(hash2.as_bytes()).unwrap(), hash2);
+        assert!(load_hash(&hash1.as_bytes()[0..31]).is_err());
+    }
+
+    #[test]
+    fn test_store_hash() {
+        let hash1: H256 = "0x8c313b317b2ff13ecf3abea4e59dad76b24a13e7b5b8fa10a939fc2ab1713175"
+            .parse()
+            .unwrap();
+        let hash2: H256 = "0x51c39e4b5287d491be2e02080c39493b77be8fd3d032227815357c5360e3d230"
+            .parse()
+            .unwrap();
+        assert_eq!(load_hash(store_hash(hash1).as_slice()).unwrap(), hash1);
+        assert_eq!(load_hash(store_hash(hash2).as_slice()).unwrap(), hash2);
     }
 }

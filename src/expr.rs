@@ -1,7 +1,9 @@
 use crate::lexer;
 use crate::parser;
-use crate::utils::{is_pseudo_negative, isize_to_scalar};
+use crate::starkom::proto::plonk::v9 as proto;
+use crate::utils::{self, is_pseudo_negative, isize_to_scalar};
 use crate::witness::Cell;
+use anyhow::{Result, anyhow};
 use starkom_bluesky::Scalar as BS;
 use starkom_ff::Field;
 use starkom_goldilocks::GL;
@@ -193,9 +195,6 @@ impl<F: Field> Constraint<F> {
 
     /// Makes a NOP constraint, ie. one that simply constrains `0 == 0`.
     ///
-    /// This type of gate can be used for revealing specific wires. Our engine also uses it
-    /// internally to add blinding rows.
-    ///
     /// The returned constraint is exactly the same as `Constraint::default()`.
     pub fn nop() -> Self {
         Self::default()
@@ -210,6 +209,18 @@ impl<F: Field> Constraint<F> {
                     .map(|(variable, _)| variable.column_index())
             })
             .min()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn get_max_column_index(&self) -> usize {
+        self.monomials
+            .iter()
+            .flat_map(|(variables, _)| {
+                variables
+                    .iter()
+                    .map(|(variable, _)| variable.column_index())
+            })
+            .max()
             .unwrap_or(0)
     }
 
@@ -583,6 +594,70 @@ impl<F: Field> Constraint<F> {
                 }
             })
             .sum()
+    }
+
+    /// Serializes this constraint to a [`GateConstraint`](`proto::GateConstraint`) protobuf.
+    ///
+    /// REQUIRES: the constraint must be in [canonical form](`Self::canonicalize`). This method
+    /// panics if it has negative exponents.
+    pub fn to_proto(&self) -> proto::GateConstraint {
+        proto::GateConstraint {
+            monomials: self
+                .monomials
+                .iter()
+                .map(
+                    |(variables, &coefficient)| proto::gate_constraint::Monomial {
+                        coefficient: utils::store_scalar(coefficient),
+                        powers: variables
+                            .iter()
+                            .map(|(variable, &exponent)| {
+                                assert!(exponent >= 0, "the constraint is not in canonical form");
+                                proto::gate_constraint::Power {
+                                    variable: Some(proto::gate_constraint::Variable {
+                                        column_index: variable.column_index() as u64,
+                                        rotation: variable.rotation() as i64,
+                                    }),
+                                    exponent: exponent as usize as u64,
+                                }
+                            })
+                            .collect(),
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    /// Deserializes a constraint from a [`GateConstraint`](`proto::GateConstraint`) protobuf.
+    pub fn from_proto(proto: &proto::GateConstraint) -> Result<Self> {
+        let mut constraint = Self {
+            monomials: proto
+                .monomials
+                .iter()
+                .map(|monomial| {
+                    Ok((
+                        monomial
+                            .powers
+                            .iter()
+                            .map(|power| match &power.variable {
+                                Some(variable) => Ok((
+                                    Variable {
+                                        column_index: variable.column_index as usize,
+                                        rotation: variable.rotation as isize,
+                                    },
+                                    isize::try_from(power.exponent).map_err(|_| {
+                                        anyhow!("invalid exponent {}", power.exponent)
+                                    })?,
+                                )),
+                                None => Err(anyhow!("invalid gate constraint: stray exponent")),
+                            })
+                            .collect::<Result<_>>()?,
+                        utils::load_scalar(monomial.coefficient.as_slice())?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+        };
+        constraint.normalize();
+        Ok(constraint)
     }
 }
 
@@ -1730,5 +1805,38 @@ mod tests {
             from_const(148512)
         );
         assert_eq!(constraint.to_string(), "var(0) * var(1) * var(2)");
+    }
+
+    fn test_serialization_impl(constraint: Constraint<Scalar>) {
+        let proto = constraint.to_proto();
+        let decoded = Constraint::from_proto(&proto).unwrap();
+        assert_eq!(decoded, constraint);
+    }
+
+    #[test]
+    fn test_serialization() {
+        test_serialization_impl(Constraint::default());
+        test_serialization_impl(rvar(0, 0));
+        test_serialization_impl(rvar(0, 1));
+        test_serialization_impl(rvar(0, -1));
+        test_serialization_impl(rvar(1, 0));
+        test_serialization_impl(rvar(1, 1));
+        test_serialization_impl(rvar(1, -1));
+        test_serialization_impl(var(2) * make_const(from_const(16)) + rvar(4, -1) - var(4));
+    }
+
+    #[test]
+    #[should_panic(expected = "the constraint is not in canonical form")]
+    fn test_serialize_non_canonical_constraint() {
+        let constraint: Constraint<Scalar> = var(0) ^ -2;
+        constraint.to_proto();
+    }
+
+    #[test]
+    fn test_deserialize_oversized_exponent() {
+        let constraint: Constraint<Scalar> = var(0) ^ 2;
+        let mut proto = constraint.to_proto();
+        proto.monomials[0].powers[0].exponent = 1 << 63;
+        assert!(Constraint::<Scalar>::from_proto(&proto).is_err());
     }
 }

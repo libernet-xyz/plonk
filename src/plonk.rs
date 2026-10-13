@@ -1,9 +1,11 @@
 use crate::chip::Chip;
 use crate::expr::{Constraint, Variable};
+use crate::starkom::proto::plonk::v9 as proto;
 use crate::utils::{self, encode_cell, encode_usize, padded_circuit_size};
 use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
 use anyhow::{Result, anyhow};
 use primitive_types::H256;
+use prost::Name;
 use starkom_ff::{Field, Field256};
 use starkom_pcs::{self as pcs, hash::Hasher};
 use starkom_poly::Polynomial;
@@ -50,7 +52,7 @@ fn get_rotation_set<'a, F: Field>(
 ) -> BTreeSet<isize> {
     gates
         .into_iter()
-        .map(|constraint| {
+        .flat_map(|constraint| {
             constraint
                 .get_free_variables()
                 .iter()
@@ -58,7 +60,6 @@ fn get_rotation_set<'a, F: Field>(
                 .collect::<BTreeSet<isize>>()
                 .into_iter()
         })
-        .flatten()
         .chain([0, 1])
         .collect::<BTreeSet<isize>>()
 }
@@ -113,8 +114,8 @@ fn mask_degree_bound<'a, F: Field>(
 /// Builds a polynomial vanishes on the padding area. Used to switch the permutation argument off in
 /// the padding area while keeping it active in the circuit area, hence the name.
 ///
-/// REQUIRES: `degree_bound` must be strictly greater than `num_rows` (all circuits must have a
-/// padding area to fit blinding rows).
+/// REQUIRES: `0 < num_rows <= degree_bound`. Note that the padding area may be empty, e.g. in an
+/// unblinded circuit with a power-of-2 number of rows.
 ///
 /// Note that this function computes the vanishing polynomial of the padding area rather than the
 /// Lagrange indicator of the witness rows: the two gate constraints identically, but this one has
@@ -135,18 +136,6 @@ fn make_circuit_area_selector<F: Field>(num_rows: usize, degree_bound: usize) ->
     }
     coefficients.reverse();
     Polynomial::with_coefficients(coefficients)
-}
-
-/// Evaluates [`make_circuit_area_selector`] at a point, without materializing the polynomial.
-fn circuit_area_selector<F: Field>(x: F, num_rows: usize, degree_bound: usize) -> F {
-    let omega: F = Polynomial::<F>::domain_element2(1, degree_bound).into();
-    let mut power = omega.pow_small_vartime(num_rows);
-    let mut result = F::ONE;
-    for _ in num_rows..degree_bound {
-        result *= x - power;
-        power *= omega;
-    }
-    result
 }
 
 /// Evaluates the [Lagrange basis `L_0`](`Polynomial::lagrange0_2`) at a point, without
@@ -807,6 +796,54 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> Proof<F, G, H> {
     pub fn public_inputs(&self) -> &BTreeMap<Cell, F> {
         &self.public_inputs
     }
+
+    /// Serializes this proof to a [`Proof`](`proto::Proof`) protobuf.
+    pub fn to_proto(&self) -> proto::Proof {
+        proto::Proof {
+            public_inputs: self
+                .public_inputs
+                .iter()
+                .map(|(cell, &value)| proto::proof::PublicInput {
+                    row: cell.row() as u64,
+                    column: cell.column() as u64,
+                    value: utils::store_scalar(value),
+                })
+                .collect(),
+            commitment: Some(self.commitment.to_proto()),
+            inner_proof: Some(self.inner_proof.to_proto()),
+        }
+    }
+
+    /// Deserializes a proof from a [`Proof`](`proto::Proof`) protobuf.
+    ///
+    /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
+    /// invoke [`Circuit::verify`] or [`CompressedCircuit::verify`] separately.
+    pub fn from_proto(proto: &proto::Proof) -> Result<Self> {
+        let public_inputs: BTreeMap<Cell, F> = proto
+            .public_inputs
+            .iter()
+            .map(|input| {
+                Ok((
+                    Cell::new(input.row as usize, input.column as usize),
+                    utils::load_scalar(input.value.as_slice())?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let commitment = match &proto.commitment {
+            Some(commitment) => pcs::Commitment::from_proto(commitment),
+            None => Err(anyhow!("missing PCS commitment")),
+        }?;
+        let inner_proof = match &proto.inner_proof {
+            Some(inner_proof) => pcs::Proof::from_proto(inner_proof),
+            None => Err(anyhow!("missing PCS proof")),
+        }?;
+        Ok(Self {
+            public_inputs,
+            commitment,
+            inner_proof,
+            _data: PhantomData,
+        })
+    }
 }
 
 /// A PLONK circuit.
@@ -855,8 +892,8 @@ pub struct Circuit<F: Field, G: Field256<BaseField = F>> {
 
     /// Selector that switches the permutation argument off in the padding area.
     ///
-    /// See [`make_circuit_area_selector`]. It's never committed: the verifier evaluates it directly
-    /// with [`circuit_area_selector`].
+    /// See [`make_circuit_area_selector`]. It's committed in the circuit batch, right after the
+    /// sigma polynomials, so the verifier reads it from the openings rather than evaluating it.
     circuit_area_selector: Polynomial<F>,
 
     /// List of witness cells that are revealed in the proofs.
@@ -1058,6 +1095,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             .iter()
             .map(Self::embed_polynomial)
             .chain(self.sigma.iter().map(Self::embed_polynomial))
+            .chain(std::iter::once(Self::embed_polynomial(
+                &self.circuit_area_selector,
+            )))
             .collect();
         pcs::Committer::<G, H>::new(self.degree_bound, self.blowup_log2, circuit_polynomials)
     }
@@ -1098,11 +1138,12 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     /// The accumulator and helper columns will be committed in the PCS, while the start/end anchor
     /// constraints, helper authentication constraints, and the recurrence constraints are only
     /// included in the grand constraint and the computation of the PLONK quotient. Since `Z` and
-    /// the `h_i`s are committed and witness-derived, this function blinds them by filling the rows
-    /// corresponding to the padding area with random G values so that they don't leak any
-    /// information about the witness ([`padded_circuit_size`] ensures that the padding area has
-    /// enough capacity to warrant effective blinding given the number of rotations used in the
-    /// circuit and the required FRI queries).
+    /// the `h_i`s are committed and witness-derived, if the circuit is blinded this function blinds
+    /// them by filling the rows corresponding to the padding area with random G values so that they
+    /// don't leak any information about the witness ([`padded_circuit_size`] ensures that the
+    /// padding area has enough capacity to warrant effective blinding given the number of rotations
+    /// used in the circuit and the required FRI queries). If the circuit is not blinded those rows
+    /// are filled with zeros, so that proofs are deterministic.
     ///
     /// We use the Fiat-Shamir challenge `gamma` as the abstract variable for LogUp. The numerator
     /// factors of the standard PLONK permutation argument are:
@@ -1220,8 +1261,10 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                     })
                     .sum::<G>();
         }
-        for i in (self.num_rows + 1)..self.degree_bound {
-            accumulator[i] = G::random_default();
+        if self.blinded {
+            for i in (self.num_rows + 1)..self.degree_bound {
+                accumulator[i] = G::random_default();
+            }
         }
         if accumulator[self.num_rows % self.degree_bound] != G::ZERO {
             return Err(anyhow!("permutation accumulator end anchor check failed"));
@@ -1238,7 +1281,11 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                     .zip(denominators[0..self.num_rows].iter())
                     .map(|(&numerator, &denominator)| numerator - denominator)
                     .collect();
-                values.resize_with(self.degree_bound, G::random_default);
+                if self.blinded {
+                    values.resize_with(self.degree_bound, G::random_default);
+                } else {
+                    values.resize(self.degree_bound, G::ZERO);
+                }
                 Polynomial::encode2(values)
             })
             .collect();
@@ -1622,6 +1669,210 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     pub fn verify<H: Hasher<G>>(&self, proof: &Proof<F, G, H>) -> Result<BTreeMap<Cell, F>> {
         self.as_compressed::<H>().verify(proof)
     }
+
+    /// Serializes this circuit to a [`Circuit`](`proto::Circuit`) protobuf.
+    pub fn to_proto(&self) -> proto::Circuit {
+        proto::Circuit {
+            num_rows: self.num_rows as u64,
+            degree_bound: self.degree_bound as u64,
+            num_columns: self.num_columns as u64,
+            blowup_log2: self.blowup_log2 as u32,
+            blinded: self.blinded,
+            selectors: self
+                .selectors
+                .iter()
+                .map(|selector| proto::RowSelector {
+                    coefficients: selector
+                        .coefficients()
+                        .iter()
+                        .copied()
+                        .map(utils::store_scalar)
+                        .collect(),
+                })
+                .collect(),
+            gates: self
+                .gates
+                .iter()
+                .map(|(constraint, instances)| proto::Gate {
+                    constraint: Some(constraint.to_proto()),
+                    instances: instances
+                        .iter()
+                        .map(|instance| proto::GateInstance {
+                            column_index: instance.column_index as u64,
+                            selector_index: instance.selector_index as u64,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            sigma_table: self
+                .sigma_values
+                .iter()
+                .flat_map(|values| values.iter().copied().map(utils::store_scalar))
+                .collect(),
+            public_cells: self
+                .public_cells
+                .iter()
+                .map(|cell| proto::PublicCell {
+                    row_index: cell.row() as u64,
+                    column_index: cell.column() as u64,
+                })
+                .collect(),
+        }
+    }
+
+    /// Deserializes a circuit from a [`Circuit`](`proto::Circuit`) protobuf.
+    pub fn from_proto(proto: &proto::Circuit) -> Result<Self> {
+        let num_rows = proto.num_rows as usize;
+        if num_rows < 1 {
+            return Err(anyhow!("circuits must have at least one row"));
+        }
+
+        let degree_bound = proto.degree_bound as usize;
+        if !degree_bound.is_power_of_two() {
+            return Err(anyhow!(
+                "invalid degree bound {} (not a power of 2)",
+                degree_bound
+            ));
+        }
+        if degree_bound < num_rows {
+            return Err(anyhow!(
+                "the degree bound {} is lower than the number of rows {}",
+                degree_bound,
+                num_rows
+            ));
+        }
+
+        let num_columns = proto.num_columns as usize;
+
+        let blowup_log2 = proto.blowup_log2 as usize;
+        if blowup_log2 == 0 {
+            return Err(anyhow!("invalid blowup factor 2^0"));
+        }
+        let degree_bound_log2 = degree_bound.trailing_zeros() as usize;
+        if degree_bound_log2 + blowup_log2 > F::BaseField::S {
+            return Err(anyhow!(
+                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
+                degree_bound_log2,
+                blowup_log2,
+                F::BaseField::S
+            ));
+        }
+
+        let selectors: Vec<Polynomial<F>> = proto
+            .selectors
+            .iter()
+            .map(|selector| {
+                if selector.coefficients.len() > degree_bound {
+                    return Err(anyhow!(
+                        "invalid selector with {} coefficients (the degree bound is {})",
+                        selector.coefficients.len(),
+                        degree_bound
+                    ));
+                }
+                Ok(Polynomial::with_coefficients(
+                    selector
+                        .coefficients
+                        .iter()
+                        .map(|coefficient| utils::load_scalar(coefficient.as_slice()))
+                        .collect::<Result<_>>()?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        let gates: BTreeMap<Constraint<F>, BTreeSet<GateInstance>> = proto
+            .gates
+            .iter()
+            .map(|gate| {
+                let constraint = match &gate.constraint {
+                    Some(constraint) => Constraint::from_proto(constraint),
+                    None => Err(anyhow!("missing gate constraint")),
+                }?;
+                let max_column_index = constraint.get_max_column_index();
+                Ok((
+                    constraint,
+                    gate.instances
+                        .iter()
+                        .map(|instance| {
+                            let column_index = instance.column_index as usize;
+                            if column_index + max_column_index >= num_columns {
+                                return Err(anyhow!(
+                                    "invalid gate placement: column {} overflows",
+                                    column_index + max_column_index
+                                ));
+                            }
+                            let selector_index = instance.selector_index as usize;
+                            if selector_index >= selectors.len() {
+                                return Err(anyhow!(
+                                    "invalid selector index {} in gate instance",
+                                    selector_index
+                                ));
+                            }
+                            Ok(GateInstance {
+                                column_index,
+                                selector_index,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        if proto.sigma_table.len() != num_columns * degree_bound {
+            return Err(anyhow!(
+                "invalid sigma table size {} (want {} columns of {} values)",
+                proto.sigma_table.len(),
+                num_columns,
+                degree_bound
+            ));
+        }
+        let sigma_values: Vec<Vec<F>> = proto
+            .sigma_table
+            .chunks_exact(degree_bound)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|value| utils::load_scalar(value.as_slice()))
+                    .collect::<Result<_>>()
+            })
+            .collect::<Result<_>>()?;
+        let sigma: Vec<Polynomial<F>> = sigma_values
+            .iter()
+            .map(|column| Polynomial::encode2(column.clone()))
+            .collect();
+
+        let public_cells: BTreeSet<Cell> = proto
+            .public_cells
+            .iter()
+            .map(|cell| {
+                let row_index = cell.row_index as usize;
+                let column_index = cell.column_index as usize;
+                if row_index < num_rows && column_index < num_columns {
+                    Ok(Cell::new(row_index, column_index))
+                } else {
+                    Err(anyhow!(
+                        "invalid public cell ({}, {})",
+                        row_index,
+                        column_index
+                    ))
+                }
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(Self {
+            num_rows,
+            degree_bound,
+            num_columns,
+            blowup_log2,
+            blinded: proto.blinded,
+            selectors,
+            gates,
+            sigma,
+            sigma_values,
+            circuit_area_selector: make_circuit_area_selector(num_rows, degree_bound),
+            public_cells,
+            _data: PhantomData,
+        })
+    }
 }
 
 /// A PLONK circuit in committed form.
@@ -1655,7 +1906,7 @@ pub struct CompressedCircuit<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>
     /// List of witness cells that are revealed in the proofs.
     public_cells: BTreeSet<Cell>,
 
-    /// Merkle root of the circuit selectors and sigma polynomials.
+    /// Merkle root of the gate selectors, the sigma polynomials, and the circuit area selector.
     circuit_commitment: H256,
 
     _data: PhantomData<(G, H)>,
@@ -1701,7 +1952,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
     /// Calculates the stride of this circuit's quotient split.
     ///
     /// See [`Circuit::split_quotient`] for details.
-    fn get_quotient_stride(&self) -> usize {
+    fn get_quotient_stride(&self) -> Result<usize> {
         let mask_degree_bound = if self.blinded {
             mask_degree_bound(
                 self.blowup_log2,
@@ -1710,19 +1961,25 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         } else {
             0
         };
-        assert!(mask_degree_bound < self.degree_bound);
-        self.degree_bound - mask_degree_bound
+        if mask_degree_bound >= self.degree_bound {
+            return Err(anyhow!(
+                "degree bound {} too small for blinding (the quotient masks need {})",
+                self.degree_bound,
+                mask_degree_bound
+            ));
+        }
+        Ok(self.degree_bound - mask_degree_bound)
     }
 
     /// Calculates the number of chunks the quotient was split into.
     ///
     /// See [`quotient_degree_bound`] for details.
-    fn get_num_quotient_chunks(&self) -> usize {
-        quotient_degree_bound(
+    fn get_num_quotient_chunks(&self) -> Result<usize> {
+        Ok(quotient_degree_bound(
             self.degree_bound,
             self.gates.iter().map(|(constraint, _)| constraint),
         )
-        .div_ceil(self.get_quotient_stride())
+        .div_ceil(self.get_quotient_stride()?))
     }
 
     /// Verifies a [`Proof`], returning the map of proven public inputs if successful or an error
@@ -1767,22 +2024,23 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         let num_gate_selectors = self
             .gates
             .iter()
-            .map(|(_, gate_instances)| {
+            .flat_map(|(_, gate_instances)| {
                 gate_instances
                     .iter()
                     .map(|instance| instance.selector_index)
             })
-            .flatten()
             .collect::<BTreeSet<usize>>()
             .len();
         let num_sigma_polynomials = self.num_columns;
+        let num_circuit_area_selectors = 1;
         let num_witness_columns = self.num_columns;
         let num_permutation_accumulators = 1;
         let num_permutation_helpers = self.num_columns;
-        let num_quotient_chunks = self.get_num_quotient_chunks();
+        let num_quotient_chunks = self.get_num_quotient_chunks()?;
         let num_fri_randomizers = if self.blinded { 1 } else { 0 };
         let expected_polynomials = num_gate_selectors
             + num_sigma_polynomials
+            + num_circuit_area_selectors
             + num_witness_columns
             + num_permutation_accumulators
             + num_permutation_helpers
@@ -1795,6 +2053,52 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 inner_proof.num_polys(),
                 expected_polynomials,
             ));
+        }
+
+        let batch_sizes = commitment.batch_sizes();
+        if batch_sizes[COMMIT_INDEX_CIRCUIT]
+            != num_gate_selectors + num_sigma_polynomials + num_circuit_area_selectors
+        {
+            return Err(anyhow!(
+                "invalid number of circuit polynomials (got {}, want {})",
+                batch_sizes[COMMIT_INDEX_CIRCUIT],
+                num_gate_selectors + num_sigma_polynomials + num_circuit_area_selectors,
+            ));
+        }
+        if batch_sizes[COMMIT_INDEX_WITNESS] != num_witness_columns {
+            return Err(anyhow!(
+                "invalid number of witness polynomials (got {}, want {})",
+                batch_sizes[COMMIT_INDEX_WITNESS],
+                num_witness_columns,
+            ));
+        }
+        if batch_sizes[COMMIT_INDEX_PERMUTATION_ARGUMENT]
+            != num_permutation_accumulators + num_permutation_helpers
+        {
+            return Err(anyhow!(
+                "invalid number of permutation argument polynomials (got {}, want {})",
+                batch_sizes[COMMIT_INDEX_PERMUTATION_ARGUMENT],
+                num_permutation_accumulators + num_permutation_helpers,
+            ));
+        }
+        if batch_sizes[COMMIT_INDEX_QUOTIENT] != num_quotient_chunks + num_fri_randomizers {
+            return Err(anyhow!(
+                "invalid number of polynomials in the quotient batch (got {}, want {})",
+                batch_sizes[COMMIT_INDEX_QUOTIENT],
+                num_quotient_chunks + num_fri_randomizers,
+            ));
+        }
+
+        for (_, gate_instances) in &self.gates {
+            for instance in gate_instances {
+                if instance.selector_index >= num_gate_selectors {
+                    return Err(anyhow!(
+                        "invalid selector index {} (the circuit has {} selectors)",
+                        instance.selector_index,
+                        num_gate_selectors
+                    ));
+                }
+            }
         }
 
         let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
@@ -1857,7 +2161,9 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                         .get_free_variables()
                         .into_iter()
                         .map(|variable| {
-                            let offset = num_gate_selectors + num_sigma_polynomials;
+                            let offset = num_gate_selectors
+                                + num_sigma_polynomials
+                                + num_circuit_area_selectors;
                             let rotation = variable.rotation();
                             let challenge = xi
                                 * if rotation < 0 { omega_inv } else { omega }
@@ -1878,12 +2184,16 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         };
 
         let (permutation_accumulator, shifted_permutation_accumulator) = {
-            let index = num_gate_selectors + num_sigma_polynomials + num_witness_columns;
+            let index = num_gate_selectors
+                + num_sigma_polynomials
+                + num_circuit_area_selectors
+                + num_witness_columns;
             (points[&xi][index], points[&(xi * omega)][index])
         };
         let permutation_helpers: Vec<G> = {
             let offset = num_gate_selectors
                 + num_sigma_polynomials
+                + num_circuit_area_selectors
                 + num_witness_columns
                 + num_permutation_accumulators;
             (0..self.num_columns)
@@ -1901,13 +2211,13 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         );
 
         let witness_columns: Vec<G> = {
-            let offset = num_gate_selectors + num_sigma_polynomials;
+            let offset = num_gate_selectors + num_sigma_polynomials + num_circuit_area_selectors;
             (0..self.num_columns)
                 .map(|i| points[&xi][offset + i])
                 .collect()
         };
 
-        let circuit_area_selector = circuit_area_selector(xi, self.num_rows, self.degree_bound);
+        let circuit_area_selector = points[&xi][num_gate_selectors + num_sigma_polynomials];
 
         let (permutation_helper_constraints, permutation_recurrence_constraint) = {
             let mut generator_power = F::ONE;
@@ -1932,10 +2242,11 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         let quotient: G = {
             let offset = num_gate_selectors
                 + num_sigma_polynomials
+                + num_circuit_area_selectors
                 + num_witness_columns
                 + num_permutation_accumulators
                 + num_permutation_helpers;
-            let stride = self.get_quotient_stride();
+            let stride = self.get_quotient_stride()?;
             (0..num_quotient_chunks)
                 .map(|i| points[&xi][offset + i] * xi.pow_small(i * stride))
                 .sum()
@@ -2006,6 +2317,159 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         }
 
         Ok(public_inputs)
+    }
+
+    /// Serializes this compressed circuit to a [`CompressedCircuit`](`proto::CompressedCircuit`)
+    /// protobuf.
+    pub fn to_proto(&self) -> proto::CompressedCircuit {
+        proto::CompressedCircuit {
+            hash_backend: Some(prost_types::Any::from_msg(&H::ProtoTag::default()).unwrap()),
+            num_rows: self.num_rows as u64,
+            degree_bound: self.degree_bound as u64,
+            num_columns: self.num_columns as u64,
+            blowup_log2: self.blowup_log2 as u32,
+            blinded: self.blinded,
+            gates: self
+                .gates
+                .iter()
+                .map(|(constraint, instances)| proto::Gate {
+                    constraint: Some(constraint.to_proto()),
+                    instances: instances
+                        .iter()
+                        .map(|instance| proto::GateInstance {
+                            column_index: instance.column_index as u64,
+                            selector_index: instance.selector_index as u64,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            public_cells: self
+                .public_cells
+                .iter()
+                .map(|cell| proto::PublicCell {
+                    row_index: cell.row() as u64,
+                    column_index: cell.column() as u64,
+                })
+                .collect(),
+            circuit_commitment: utils::store_hash(self.circuit_commitment),
+        }
+    }
+
+    /// Deserializes a compressed circuit from a
+    /// [`CompressedCircuit`](`proto::CompressedCircuit`) protobuf.
+    pub fn from_proto(proto: &proto::CompressedCircuit) -> Result<Self> {
+        match &proto.hash_backend {
+            Some(hash_backend) => {
+                hash_backend.to_msg::<H::ProtoTag>().map_err(|_| {
+                    anyhow!(
+                        "incorrect hash backend (got {}, want {})",
+                        hash_backend.type_url,
+                        H::ProtoTag::type_url()
+                    )
+                })?;
+                Ok(())
+            }
+            None => Err(anyhow!("hash backend not specified")),
+        }?;
+
+        let num_rows = proto.num_rows as usize;
+
+        let degree_bound = proto.degree_bound as usize;
+        if !degree_bound.is_power_of_two() {
+            return Err(anyhow!(
+                "invalid degree bound {} (not a power of 2)",
+                degree_bound
+            ));
+        }
+        if degree_bound < num_rows {
+            return Err(anyhow!(
+                "the degree bound {} is lower than the number of rows {}",
+                degree_bound,
+                num_rows
+            ));
+        }
+
+        let num_columns = proto.num_columns as usize;
+
+        let blowup_log2 = proto.blowup_log2 as usize;
+        if blowup_log2 == 0 {
+            return Err(anyhow!("invalid blowup factor 2^0"));
+        }
+        let degree_bound_log2 = degree_bound.trailing_zeros() as usize;
+        if degree_bound_log2 + blowup_log2 > F::BaseField::S {
+            return Err(anyhow!(
+                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
+                degree_bound_log2,
+                blowup_log2,
+                F::BaseField::S
+            ));
+        }
+
+        let gates: BTreeMap<Constraint<F>, BTreeSet<GateInstance>> = proto
+            .gates
+            .iter()
+            .map(|gate| {
+                let constraint = match &gate.constraint {
+                    Some(constraint) => Constraint::from_proto(constraint),
+                    None => Err(anyhow!("missing gate constraint")),
+                }?;
+                let max_column_index = constraint.get_max_column_index();
+                Ok((
+                    constraint,
+                    gate.instances
+                        .iter()
+                        .map(|instance| {
+                            let column_index = instance.column_index as usize;
+                            if column_index + max_column_index >= num_columns {
+                                return Err(anyhow!(
+                                    "invalid gate placement: column {} overflows",
+                                    column_index + max_column_index
+                                ));
+                            }
+                            let selector_index = instance.selector_index as usize;
+                            Ok(GateInstance {
+                                column_index,
+                                selector_index,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let gates: Vec<(Constraint<F>, Vec<GateInstance>)> = gates
+            .into_iter()
+            .map(|(constraint, instances)| (constraint, instances.into_iter().collect()))
+            .collect();
+
+        let public_cells: BTreeSet<Cell> = proto
+            .public_cells
+            .iter()
+            .map(|cell| {
+                let row_index = cell.row_index as usize;
+                let column_index = cell.column_index as usize;
+                if row_index < num_rows && column_index < num_columns {
+                    Ok(Cell::new(row_index, column_index))
+                } else {
+                    Err(anyhow!(
+                        "invalid public cell ({}, {})",
+                        row_index,
+                        column_index
+                    ))
+                }
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(Self {
+            num_rows,
+            degree_bound,
+            num_columns,
+            blowup_log2,
+            blinded: proto.blinded,
+            gates,
+            public_cells,
+            circuit_commitment: utils::load_hash(proto.circuit_commitment.as_slice())?,
+            _data: PhantomData,
+        })
     }
 }
 
@@ -2088,241 +2552,241 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_bluesky_sha2_blowup_2() {
-        let c = parse_hash("0x9fe5967ca1e32fad3c75276d0fd4c1443efc98629e32f238e20a680ad787a7fb");
+        let c = parse_hash("0x494aac357b6f5ab4823556c990e2103966fcfc21741e75f6fc40179d0f78d0ff");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 1, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 1, false, 4, 17, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 1, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 1, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0x6253b7f92e3c65eb7b4bd7fc31d1e6d5b118208bac71f9805038bd16a5b848a1");
+        let c = parse_hash("0x80a860428464e9e7bc1143980f8b134724db4599b8fb8dedd9f7dc73d4a19bf9");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 1, true, 256, 21, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 1, true, 256, 22, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 1, true, 256, 21, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 1, true, 256, 22, c).is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_2() {
-        let c = parse_hash("0x14b96cbe7e06d202c793fc8fdf2d4d3ef085df211a3265200cb8846f16ba7266");
+        let c = parse_hash("0x5d238c3c08b337ff9d66b0a59508bbc3a4d85bdbf646532b828c55d0d60d9b9e");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, false, 4, 17, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0x3a71be08d409155fae05fe1f0c8e66a55c7b6def7ffb0db4117c716c41d138a0");
+        let c = parse_hash("0x3b4edcaab8d47a24310fe41411b6fd5a46cd0b9ba8ba3a4b8693e76148ec460e");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, true, 1024, 18, c)
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, true, 1024, 19, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, true, 1024, 18, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, true, 1024, 19, c).is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_keccak256_blowup_2() {
-        let c = parse_hash("0x5dfdd31c35c3d5b60da9efe6774981369bf16a8d904ed329a5e023dab4954c05");
+        let c = parse_hash("0xc4cd8b7e35b24ceeb0f496b261f4e050a8d169a1c7810c708b8acd2f5a5cda51");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 1, false, 4, 16, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 1, false, 4, 17, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 1, false, 4, 16, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 1, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0x4bdfd1797abe4eeddd46ac8dc1caf3c6e2d3dcb0ae9b53bd4de1435287819902");
+        let c = parse_hash("0xe3b395a6ce823af66fcd8b1be7c4a58b15d8e79dc2df372b4490252709af81ae");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 1, true, 256, 21, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 1, true, 256, 22, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 1, true, 256, 21, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 1, true, 256, 22, c)
                 .is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_2() {
-        let c = parse_hash("0x325a67efff006d084e3d7768ec3f2c299c6ceb148409ae0544c5c943ff94dcdc");
+        let c = parse_hash("0x86dcdee7e6873eaaa425dfc237fc4c7f77af904988bca7f0cd4c4c400b56bdb5");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, false, 4, 16, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, false, 4, 17, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, false, 4, 16, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0xeeed7b937aa91afe977399ce8fab86f8c7e1afedccb5540f29eff2b7141aeeea");
+        let c = parse_hash("0x4d4cc9e8eaaa01296defbcdb321057793799af019e5aa176b74bc636d2167d11");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, true, 1024, 18, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, true, 1024, 19, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, true, 1024, 18, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, true, 1024, 19, c)
                 .is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_sha2_blowup_4() {
-        let c = parse_hash("0x536cb14c6e41110506fed17d45f6e2f1584125ff1a9f6dd0fc33d646ac3a310e");
+        let c = parse_hash("0x29e743ccb630504a114568903ca3a50d45084a38c05efc7ed373f137d93b378e");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 2, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 2, false, 4, 17, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 2, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 2, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0x8cda4e201d43d403100d80d46f77676d5c4cf3d4000c2194690dbc50491b2068");
+        let c = parse_hash("0x9688c0d20c3c3e29ec873448e2c9266bdf5438b952d77783219e0ed6c6df5735");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 2, true, 128, 21, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 2, true, 128, 22, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 2, true, 128, 21, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 2, true, 128, 22, c).is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_4() {
-        let c = parse_hash("0x83ff09b4b78c402df87a0fbf00a852aade55c8c1e4623b889940b1f4e303f2f3");
+        let c = parse_hash("0x3a1e72c5b00277cc520e0effd8bd1569fae66f60cdbee8908edbc21d11872b42");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, false, 4, 17, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0x9944cd4ed248633167ce2c1f76eadcd7ee5122f5da4a68f8652573cc1a85ebe9");
+        let c = parse_hash("0x4c7d7516620c03a08d99b33688e2a9fdc3808b45d87dd69aa95ca85ca38fdd0c");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, true, 512, 18, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, true, 512, 19, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, true, 512, 18, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, true, 512, 19, c).is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_keccak256_blowup_4() {
-        let c = parse_hash("0x73ccb7fcea42181284a458d909ae7263ffebb44c9b3d691924b04bb681c46388");
+        let c = parse_hash("0x25cba5a6d07e62bee1099521f0179b9a4c5a753695f5ff346e1c20fef6325362");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 2, false, 4, 16, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 2, false, 4, 17, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 2, false, 4, 16, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 2, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0x6ce4465f607fac189f64609eeca2945ccb465e89dadae220cdec86dee788996e");
+        let c = parse_hash("0x27e4d3433480cea82eb942faa06f6ca8fca6b70eff7489e4f68447aa2dcdc4ca");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 2, true, 128, 21, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 2, true, 128, 22, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 2, true, 128, 21, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 2, true, 128, 22, c)
                 .is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_4() {
-        let c = parse_hash("0x3df1ac083cd51d3187609f02bcabc4ea139bbd45fd66a3ea32074bad698c8234");
+        let c = parse_hash("0x3fe4a6cc0d5570499ce1585875ffcd518881c5f4c69caa0b9eeeb74937a78c2c");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, false, 4, 16, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, false, 4, 17, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, false, 4, 16, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0xa9fadc7958f662393e128326728f743ad105e630a9c935ec1a67c3c56acbcb2f");
+        let c = parse_hash("0xa36a483e1102e89fee83608b007dada44fb8ad4af6de70b169cac1e53770bba0");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, true, 512, 18, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, true, 512, 19, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, true, 512, 18, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, true, 512, 19, c)
                 .is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_sha2_blowup_8() {
-        let c = parse_hash("0x0f30383f1e7ff1cad46edd74493bf78a2222c6e95fd623fe8e145464e50a0c47");
+        let c = parse_hash("0x5e09e011e83803e439e5e6b2239681a673e701087cfb737143b49681f1569295");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 3, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 3, false, 4, 17, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 3, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 3, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0xfaa758d5b451e78a3549acc3324c4b9fd66645c16d16d5ff1fb1c0c8092cf10b");
+        let c = parse_hash("0xbe3e4c72baa3bb138ed2308ddbd92545f0d4c823eaa9a8ee0568efc9700cc57b");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 3, true, 64, 25, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 3, true, 64, 26, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 3, true, 64, 25, c).is_ok()
+            test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 3, true, 64, 26, c).is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_8() {
-        let c = parse_hash("0x4e2c0e3dbc709c9c6f1a867907562202615f279bdb12526e662e65a46235d9b3");
+        let c = parse_hash("0xd0d162bd36980cd1aa2dd012e23b91ee810691a6c41a7aea1703c235dd73ab16");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, false, 4, 17, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, false, 4, 16, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0xebeea16a013a7d98f508c7c9ef1ea0f0f65aa4fe1b071d5d2e9bb6638922c578");
+        let c = parse_hash("0xd5ea16b3a4e9d498575a4c0e104e37c021d10a9a3bad6957a31f15c0c0256ddf");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, true, 256, 18, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, true, 256, 19, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, true, 256, 18, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, true, 256, 19, c).is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_keccak256_blowup_8() {
-        let c = parse_hash("0x756ff74bc1bb347948bb13c8bf4b8ba9aa8efda7c7ac3eb76a3c95622f7e19fb");
+        let c = parse_hash("0x918cf20623717b6dd0e0aa6940f7627ee4ea905c5371812ec2578553fbd1cd35");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 3, false, 4, 16, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 3, false, 4, 17, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 3, false, 4, 16, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 3, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0x7b6876688e4303ba818c51b7ffefe5fd8d176301601d5448e16f92f4393d2f08");
+        let c = parse_hash("0xac29596abf76483cc6322f88ee5e1e5f1f79263931872111715c8f18cc3648f1");
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 3, true, 64, 25, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 3, true, 64, 26, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 3, true, 64, 25, c)
+            test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 3, true, 64, 26, c)
                 .is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_8() {
-        let c = parse_hash("0xb79939622fc0db414ca6cf1d639adac4fc132e44a0d57d6cfb2ff9bc57352d83");
+        let c = parse_hash("0xbcc0b716b9a6e0cadd9f9d7649c292d309de3d31ab1e96e4be3bec100f3b4567");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, false, 4, 16, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, false, 4, 17, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, false, 4, 16, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0x04d5ce07d65d6254bb06402f392b73dac9d3a55a568ff72be3c48ececdf5037d");
+        let c = parse_hash("0xf140ccebb14a5d8916177696f89577d8cd01ac78fc55baacb37f6559d7899210");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, true, 256, 18, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, true, 256, 19, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, true, 256, 18, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, true, 256, 19, c)
                 .is_ok()
         );
     }
@@ -2405,88 +2869,88 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_variation_bluesky_blowup_2() {
-        let c = parse_hash("0xdc0b49948fab58111a5e3e0855fb77c590b8ea5678c713406a67aed8287e9e15");
+        let c = parse_hash("0x0d83bdf8e62a3314f42cff6e5f6a29626ba61473afebcbe56ec726c62f8c48df");
         assert!(
-            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 1, false, 4, 19, c)
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 1, false, 4, 20, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 1, false, 4, 19, c)
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 1, false, 4, 20, c)
                 .is_ok()
         );
-        let c = parse_hash("0xbaac964525732eec62f1a284a50f304c05c8c3eff104fb2cce6549b2b8a216de");
+        let c = parse_hash("0x53afd92a276e95d9a93af6afcf530d5c8422b003f75589cc69312bad21d28286");
         assert!(
-            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 1, true, 256, 24, c)
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 1, true, 256, 25, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 1, true, 256, 24, c)
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 1, true, 256, 25, c)
                 .is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_variation_goldilocks_blowup_2() {
-        let c = parse_hash("0x0bc1a60f5c63832d1149de23b1021cf7788ba434a192cf7cf9432d53dac9b059");
+        let c = parse_hash("0x7bbc068b0d252dbadd69b5880ad25d66fcc06fe9b4bbd74baca914018f29b97f");
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, false, 4, 19, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, false, 4, 20, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, false, 4, 19, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, false, 4, 20, c)
                 .is_ok()
         );
-        let c = parse_hash("0xa6c2c3af5c9ac76e6b7716b5f51903577455d45430d01bed3b7459594e872b90");
+        let c = parse_hash("0x0991c338e2e47af4e218965ba5deca587bbd5063920aa85b5a43d67163c43b80");
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, true, 1024, 21, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, true, 1024, 22, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, true, 1024, 21, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, true, 1024, 22, c)
                 .is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_variation_bluesky_blowup_4() {
-        let c = parse_hash("0xdfb66ceab0f6f70927eb5c41f7765f49182489333bc94044c2c6080537631a9f");
+        let c = parse_hash("0xd0356eba7d6d5f06968ffa2d3804ab14123faeadcff5066c458d484ef005253e");
         assert!(
-            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 2, false, 4, 19, c)
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 2, false, 4, 20, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 2, false, 4, 19, c)
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 2, false, 4, 20, c)
                 .is_ok()
         );
-        let c = parse_hash("0xafed26a83cc6cd3a0ae9c15ee144368d6b6288cad0027c0fb13144045647b927");
+        let c = parse_hash("0x160b80a89a2424f60b8e1e58a9753ca069f06778421e692bbf1c1ef22f11b816");
         assert!(
-            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 2, true, 128, 24, c)
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 2, true, 128, 25, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 2, true, 128, 24, c)
+            test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 2, true, 128, 25, c)
                 .is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_variation_goldilocks_blowup_4() {
-        let c = parse_hash("0xdae21cbae059796cb6f9d0217c4aaaed45a8eac772cf5fc971c6fabf5aa24fab");
+        let c = parse_hash("0xbe93c01dfc08b34e8f2efd3a4ed43a893aa199449c9c35a839e64f387450e41d");
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 2, false, 4, 19, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 2, false, 4, 20, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 2, false, 4, 19, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 2, false, 4, 20, c)
                 .is_ok()
         );
-        let c = parse_hash("0xae9764d8512bba669c42fbebdc70ba8f02041da44f4947fc6b28084f1999aba0");
+        let c = parse_hash("0x91b00431753f5bb800349a53b55477b878f74d8c9e8ebed01e841cc45e134296");
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 2, true, 512, 21, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 2, true, 512, 22, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 2, true, 512, 21, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 2, true, 512, 22, c)
                 .is_ok()
         );
     }
@@ -2626,11 +3090,267 @@ mod tests {
     }
 
     #[test]
+    fn test_wrong_circuit_batch_size_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_CIRCUIT].num_polys -= 1;
+        commitment.batches[COMMIT_INDEX_WITNESS].num_polys += 1;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid number of circuit polynomials")
+        );
+    }
+
+    #[test]
+    fn test_wrong_witness_batch_size_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_WITNESS].num_polys -= 1;
+        commitment.batches[COMMIT_INDEX_PERMUTATION_ARGUMENT].num_polys += 1;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid number of witness polynomials")
+        );
+    }
+
+    #[test]
+    fn test_wrong_permutation_argument_batch_size_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_PERMUTATION_ARGUMENT].num_polys -= 1;
+        commitment.batches[COMMIT_INDEX_QUOTIENT].num_polys += 1;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid number of permutation argument polynomials")
+        );
+    }
+
+    #[test]
+    fn test_wrong_quotient_batch_size_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_QUOTIENT].num_polys -= 1;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid number of polynomials in the quotient batch")
+        );
+    }
+
+    #[test]
     fn test_extra_opening_is_not_reported_as_public() {
         let (circuit, mut proof) = prove_vitalik_circuit();
         proof.public_inputs.insert(cell(1, 2), from_const(35));
         let public_inputs = circuit.verify(&proof).unwrap();
         assert_eq!(public_inputs.len(), 2);
         assert!(!public_inputs.contains_key(&cell(1, 2)));
+    }
+
+    #[test]
+    fn test_oversized_selector_is_rejected() {
+        let mut proto = build_vitalik_circuit().to_proto();
+        let degree_bound = proto.degree_bound as usize;
+        proto.selectors[0]
+            .coefficients
+            .resize(degree_bound + 1, vec![1]);
+        let error = Circuit::<BS, BS>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("invalid selector"));
+    }
+
+    #[test]
+    fn test_truncated_sigma_table_is_rejected() {
+        let mut proto = build_vitalik_circuit().to_proto();
+        proto.sigma_table.pop();
+        let error = Circuit::<BS, BS>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("invalid sigma table size"));
+    }
+
+    #[test]
+    fn test_misplaced_gate_is_rejected() {
+        let mut proto = build_vitalik_circuit().to_proto();
+        proto.gates[1].instances[0].column_index = 1;
+        let error = Circuit::<BS, BS>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("invalid gate placement"));
+    }
+
+    #[test]
+    fn test_misplaced_compressed_gate_is_rejected() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.gates[1].instances[0].column_index = 1;
+        let error = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("invalid gate placement"));
+    }
+
+    #[test]
+    fn test_sparse_selector_indices_are_rejected() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        for gate in &mut proto.gates {
+            for instance in &mut gate.instances {
+                if instance.selector_index == 2 {
+                    instance.selector_index = 99;
+                }
+            }
+        }
+        let circuit = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(error.to_string().contains("invalid selector index 99"));
+    }
+
+    #[test]
+    fn test_circuit_serialization() {
+        let circuit = build_vitalik_circuit();
+        let mut witness = circuit.make_witness();
+        witness.set(cell(0, 0), from_const(3));
+        witness.set(cell(0, 1), from_const(9));
+        witness.set(cell(1, 0), from_const(3));
+        witness.set(cell(1, 1), from_const(9));
+        witness.set(cell(1, 2), from_const(35));
+        witness.set(cell(2, 0), from_const(3));
+        witness.set(cell(2, 1), from_const(35));
+        let proof = circuit.prove::<Sha2Hash<BS>>(witness).unwrap();
+        let circuit = Circuit::<BS, BS>::from_proto(&circuit.to_proto()).unwrap();
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_compressed_circuit_serialization() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let circuit =
+            CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&circuit.to_proto()).unwrap();
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_reordered_gates_are_accepted() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.gates.reverse();
+        let circuit = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_circuit_without_rows_is_rejected() {
+        let mut proto = build_vitalik_circuit().to_proto();
+        proto.num_rows = 0;
+        let error = Circuit::<BS, BS>::from_proto(&proto).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("circuits must have at least one row")
+        );
+    }
+
+    #[test]
+    fn test_compressed_circuit_without_hash_backend_is_rejected() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.hash_backend = None;
+        let error = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("hash backend not specified"));
+    }
+
+    #[test]
+    fn test_compressed_circuit_with_wrong_hash_backend_is_rejected() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let error = CompressedCircuit::<BS, BS, Keccak256Hash<BS>>::from_proto(&circuit.to_proto())
+            .unwrap_err();
+        assert!(error.to_string().contains("incorrect hash backend"));
+    }
+
+    #[test]
+    fn test_unblinded_proofs_are_deterministic() {
+        let (_, proof1) = prove_vitalik_circuit();
+        let (_, proof2) = prove_vitalik_circuit();
+        assert_eq!(proof1.commitment.to_proto(), proof2.commitment.to_proto());
+        assert_eq!(proof1.inner_proof.to_proto(), proof2.inner_proof.to_proto());
+    }
+
+    #[test]
+    fn test_proof_serialization() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let proto = proof.to_proto();
+        let proof = Proof::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(proof.to_proto(), proto);
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_proof_without_commitment_is_rejected() {
+        let (_, proof) = prove_vitalik_circuit();
+        let mut proto = proof.to_proto();
+        proto.commitment = None;
+        let error = Proof::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("missing PCS commitment"));
+    }
+
+    #[test]
+    fn test_proof_without_inner_proof_is_rejected() {
+        let (_, proof) = prove_vitalik_circuit();
+        let mut proto = proof.to_proto();
+        proto.inner_proof = None;
+        let error = Proof::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("missing PCS proof"));
+    }
+
+    #[test]
+    fn test_proof_with_oversized_public_input_is_rejected() {
+        let (_, proof) = prove_vitalik_circuit();
+        let mut proto = proof.to_proto();
+        proto.public_inputs[0].value.push(0);
+        let error = Proof::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("invalid scalar length"));
+    }
+
+    #[test]
+    fn test_proof_with_wrong_hash_backend_is_rejected() {
+        let (_, proof) = prove_vitalik_circuit();
+        let error = Proof::<BS, BS, Keccak256Hash<BS>>::from_proto(&proof.to_proto()).unwrap_err();
+        assert!(error.to_string().contains("incorrect hash backend"));
+    }
+
+    #[test]
+    fn test_tampered_serialized_public_input_is_rejected() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let mut proto = proof.to_proto();
+        proto.public_inputs[1].value = utils::store_scalar(from_const(36));
+        let proof = Proof::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(error.to_string().contains("constraint violation"));
+    }
+
+    #[test]
+    fn test_blinded_circuit_without_room_for_masks_is_rejected() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.blinded = true;
+        let circuit = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(error.to_string().contains("too small for blinding"));
     }
 }

@@ -1,0 +1,181 @@
+syntax = "proto3";
+
+import "google/protobuf/any.proto";
+
+package starkom.proto.plonk.v9;
+
+// Describes a polynomial constraint enforced by a `Gate`.
+message GateConstraint {
+  // A single variable.
+  message Variable {
+    // Index of the witness column represented by the variable.
+    uint64 column_index = 1;
+
+    // Row offset within the column.
+    int64 rotation = 2;
+  }
+
+  // A variable raised to a power.
+  //
+  // Only positive exponents can be serialized. Negative exponents (field inversions) must be
+  // removed when building the circuit, before serialization, because they can't be proven. See the
+  // docs for the `canonicalize_constraints` flag for details:
+  // https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.Options.html#structfield.canonicalize_constraints
+  message Power {
+    Variable variable = 1;
+    uint64 exponent = 2;
+  }
+
+  // One term of the polynomial.
+  message Monomial {
+    // Constant coefficient of the monomial.
+    //
+    // This is a value in the field and is stored as an integer in canonical (non-Montgomery) form,
+    // in little-endian byte order.
+    bytes coefficient = 1;
+
+    // List of variables multiplied in the monomial with their respective exponents.
+    repeated Power powers = 2;
+  }
+
+  // The terms of the polynomial.
+  //
+  // A polynomial is a sum of monomials.
+  repeated Monomial monomials = 1;
+}
+
+// A sum of Lagrange bases indicating the rows where a given constraint activates.
+//
+// Currently only used for gate activation.
+message RowSelector {
+  // Coefficients of the polynomial from lowest degree to highest degree: the first coefficient is
+  // the constant term, the second coefficient is that of degree 1, and so on.
+  //
+  // Each coefficient is stored as a byte array representing the integer value in canonical
+  // (non-Montgomery) form, in little-endian order.
+  repeated bytes coefficients = 1;
+}
+
+// Describes an instance of a `Gate`.
+message GateInstance {
+  // Column offset for this instance.
+  //
+  // All variables in the gate constraint are shifted by this offset.
+  uint64 column_index = 1;
+
+  // Zero-based index into the `Circuit.selectors` array. The corresponding `RowSelector` activates
+  // the gate on the intended rows.
+  uint64 selector_index = 2;
+}
+
+// Circuit gate descriptor.
+message Gate {
+  // Polynomial constraint enforced by the gate.
+  GateConstraint constraint = 1;
+
+  // List of instantiations of the gate.
+  repeated GateInstance instances = 2;
+}
+
+// Row and column coordinates of a public witness cell.
+message PublicCell {
+  uint64 row_index = 1;
+  uint64 column_index = 2;
+}
+
+// Describes a Starkom circuit.
+//
+// Unlike `CompressedCircuit`, the data in this message is suitable for both proving and
+// verification.
+message Circuit {
+  // The raw number of rows of the circuit.
+  //
+  // Unlike `degree_bound` this count doesn't include the blinding rows and is not padded to the
+  // next power of 2.
+  uint64 num_rows = 1;
+
+  // Number of witness rows (including the blinding rows) rounded up to the next power of 2.
+  uint64 degree_bound = 2;
+
+  // Number of witness columns.
+  uint64 num_columns = 3;
+
+  // Log2 of the blowup factor.
+  uint32 blowup_log2 = 4;
+
+  // Whether or not the circuit is blinded.
+  //
+  // This is relevant because it changes the number of committed polynomials, the verification
+  // algorithm, and the shape of all proofs.
+  bool blinded = 5;
+
+  // Gate selectors used in the circuit.
+  //
+  // `Gate` instances refer to selectors in this pool to determine which rows each instance
+  // activates on.
+  repeated RowSelector selectors = 6;
+
+  // Gates used in the circuit.
+  repeated Gate gates = 7;
+
+  // Sigma polynomials of the permutation argument, expressed on the value domain.
+  //
+  // There's one polynomial for every witness column and all use the same evaluation domain as the
+  // witness, so this array has the same size as the witness. The scalars in this table are laid out
+  // in column-major order, each scalar being a `bytes` array.
+  //
+  // Scalars are stored in canonical (non-Montgomery) integer form, in little-endian byte order.
+  repeated bytes sigma_table = 8;
+
+  // List of witness cells that are revealed in the proofs.
+  repeated PublicCell public_cells = 9;
+}
+
+// Describes a Starkom circuit.
+//
+// Unlike `Circuit`, the data in this message is only suitable for verification. It's insufficient
+// for proving. On the other hand, `CompressedCircuit` messages are significantly smaller than their
+// `Circuit` counterpart because the former carry a single Merkle root for the circuit selectors and
+// sigma polynomials rather than the full polynomials.
+message CompressedCircuit {
+  // Hash backend used to commit to the circuit.
+  //
+  // It can be one of the backends provided by `pcs.proto` or any other user-defined tag with a
+  // corresponding backend implementation.
+  //
+  // The `circuit_commitment` field is a hash produced by this backend.
+  //
+  // NOTE: in order to warrant 128-bit security in a quantum setting, all backends are required to
+  // use a ~256-bit cryptographic hash.
+  .google.protobuf.Any hash_backend = 1;
+
+  // The raw number of rows of the circuit.
+  //
+  // Unlike `degree_bound` this count doesn't include the blinding rows and is not padded to the
+  // next power of 2.
+  uint64 num_rows = 2;
+
+  // Number of witness rows (including the blinding rows) rounded up to the next power of 2.
+  uint64 degree_bound = 3;
+
+  // Number of witness columns.
+  uint64 num_columns = 4;
+
+  // Log2 of the blowup factor.
+  uint32 blowup_log2 = 5;
+
+  // Whether or not the circuit is blinded.
+  //
+  // This is relevant because it changes the number of committed polynomials, the verification
+  // algorithm, and the shape of all proofs.
+  bool blinded = 6;
+
+  // Gates used in the circuit.
+  repeated Gate gates = 7;
+
+  // List of witness cells that are revealed in the proofs.
+  repeated PublicCell public_cells = 8;
+
+  // Merkle root of the gate selectors, the sigma polynomials, and the circuit area selector.
+  bytes circuit_commitment = 9;
+}
