@@ -163,6 +163,6 @@ message CompressedCircuit {
   // List of witness cells that are revealed in the proofs.
   repeated PublicCell public_cells = 7;
 
-  // Merkle root of the circuit selectors and sigma polynomials.
+  // Merkle root of the gate selectors, the sigma polynomials, and the circuit area selector.
   bytes circuit_commitment = 8;
 }
