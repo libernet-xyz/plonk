@@ -2323,7 +2323,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             ));
         }
 
-        let gates: Vec<(Constraint<F>, Vec<GateInstance>)> = proto
+        let gates: BTreeMap<Constraint<F>, BTreeSet<GateInstance>> = proto
             .gates
             .iter()
             .map(|gate| {
@@ -2354,6 +2354,10 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 ))
             })
             .collect::<Result<_>>()?;
+        let gates: Vec<(Constraint<F>, Vec<GateInstance>)> = gates
+            .into_iter()
+            .map(|(constraint, instances)| (constraint, instances.into_iter().collect()))
+            .collect();
 
         let public_cells: BTreeSet<Cell> = proto
             .public_cells
@@ -3147,6 +3151,18 @@ mod tests {
         let (circuit, proof) = prove_vitalik_circuit();
         let circuit =
             CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&circuit.to_proto()).unwrap();
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_reordered_gates_are_accepted() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.gates.reverse();
+        let circuit = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
         let public_inputs = circuit.verify(&proof).unwrap();
         assert_eq!(public_inputs.len(), 2);
         assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
