@@ -1952,7 +1952,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
     /// Calculates the stride of this circuit's quotient split.
     ///
     /// See [`Circuit::split_quotient`] for details.
-    fn get_quotient_stride(&self) -> usize {
+    fn get_quotient_stride(&self) -> Result<usize> {
         let mask_degree_bound = if self.blinded {
             mask_degree_bound(
                 self.blowup_log2,
@@ -1961,19 +1961,25 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         } else {
             0
         };
-        assert!(mask_degree_bound < self.degree_bound);
-        self.degree_bound - mask_degree_bound
+        if mask_degree_bound >= self.degree_bound {
+            return Err(anyhow!(
+                "degree bound {} too small for blinding (the quotient masks need {})",
+                self.degree_bound,
+                mask_degree_bound
+            ));
+        }
+        Ok(self.degree_bound - mask_degree_bound)
     }
 
     /// Calculates the number of chunks the quotient was split into.
     ///
     /// See [`quotient_degree_bound`] for details.
-    fn get_num_quotient_chunks(&self) -> usize {
-        quotient_degree_bound(
+    fn get_num_quotient_chunks(&self) -> Result<usize> {
+        Ok(quotient_degree_bound(
             self.degree_bound,
             self.gates.iter().map(|(constraint, _)| constraint),
         )
-        .div_ceil(self.get_quotient_stride())
+        .div_ceil(self.get_quotient_stride()?))
     }
 
     /// Verifies a [`Proof`], returning the map of proven public inputs if successful or an error
@@ -2030,7 +2036,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         let num_witness_columns = self.num_columns;
         let num_permutation_accumulators = 1;
         let num_permutation_helpers = self.num_columns;
-        let num_quotient_chunks = self.get_num_quotient_chunks();
+        let num_quotient_chunks = self.get_num_quotient_chunks()?;
         let num_fri_randomizers = if self.blinded { 1 } else { 0 };
         let expected_polynomials = num_gate_selectors
             + num_sigma_polynomials
@@ -2240,7 +2246,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 + num_witness_columns
                 + num_permutation_accumulators
                 + num_permutation_helpers;
-            let stride = self.get_quotient_stride();
+            let stride = self.get_quotient_stride()?;
             (0..num_quotient_chunks)
                 .map(|i| points[&xi][offset + i] * xi.pow_small(i * stride))
                 .sum()
@@ -3336,5 +3342,15 @@ mod tests {
         let proof = Proof::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
         let error = circuit.verify(&proof).unwrap_err();
         assert!(error.to_string().contains("constraint violation"));
+    }
+
+    #[test]
+    fn test_blinded_circuit_without_room_for_masks_is_rejected() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.blinded = true;
+        let circuit = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(error.to_string().contains("too small for blinding"));
     }
 }
