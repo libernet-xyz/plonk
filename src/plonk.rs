@@ -796,6 +796,54 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> Proof<F, G, H> {
     pub fn public_inputs(&self) -> &BTreeMap<Cell, F> {
         &self.public_inputs
     }
+
+    /// Serializes this proof to a [`Proof`](`proto::Proof`) protobuf.
+    pub fn to_proto(&self) -> proto::Proof {
+        proto::Proof {
+            public_inputs: self
+                .public_inputs
+                .iter()
+                .map(|(cell, &value)| proto::proof::PublicInput {
+                    row: cell.row() as u64,
+                    column: cell.column() as u64,
+                    value: utils::store_scalar(value),
+                })
+                .collect(),
+            commitment: Some(self.commitment.to_proto()),
+            inner_proof: Some(self.inner_proof.to_proto()),
+        }
+    }
+
+    /// Deserializes a proof from a [`Proof`](`proto::Proof`) protobuf.
+    ///
+    /// NOTE: this method does not validate the proof, it only deserializes it. The caller must
+    /// invoke [`Circuit::verify`] or [`CompressedCircuit::verify`] separately.
+    pub fn from_proto(proto: &proto::Proof) -> Result<Self> {
+        let public_inputs: BTreeMap<Cell, F> = proto
+            .public_inputs
+            .iter()
+            .map(|input| {
+                Ok((
+                    Cell::new(input.row as usize, input.column as usize),
+                    utils::load_scalar(input.value.as_slice())?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let commitment = match &proto.commitment {
+            Some(commitment) => pcs::Commitment::from_proto(commitment),
+            None => Err(anyhow!("missing PCS commitment")),
+        }?;
+        let inner_proof = match &proto.inner_proof {
+            Some(inner_proof) => pcs::Proof::from_proto(inner_proof),
+            None => Err(anyhow!("missing PCS proof")),
+        }?;
+        Ok(Self {
+            public_inputs,
+            commitment,
+            inner_proof,
+            _data: PhantomData,
+        })
+    }
 }
 
 /// A PLONK circuit.
@@ -3232,5 +3280,61 @@ mod tests {
         let (_, proof2) = prove_vitalik_circuit();
         assert_eq!(proof1.commitment.to_proto(), proof2.commitment.to_proto());
         assert_eq!(proof1.inner_proof.to_proto(), proof2.inner_proof.to_proto());
+    }
+
+    #[test]
+    fn test_proof_serialization() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let proto = proof.to_proto();
+        let proof = Proof::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        assert_eq!(proof.to_proto(), proto);
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_proof_without_commitment_is_rejected() {
+        let (_, proof) = prove_vitalik_circuit();
+        let mut proto = proof.to_proto();
+        proto.commitment = None;
+        let error = Proof::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("missing PCS commitment"));
+    }
+
+    #[test]
+    fn test_proof_without_inner_proof_is_rejected() {
+        let (_, proof) = prove_vitalik_circuit();
+        let mut proto = proof.to_proto();
+        proto.inner_proof = None;
+        let error = Proof::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("missing PCS proof"));
+    }
+
+    #[test]
+    fn test_proof_with_oversized_public_input_is_rejected() {
+        let (_, proof) = prove_vitalik_circuit();
+        let mut proto = proof.to_proto();
+        proto.public_inputs[0].value.push(0);
+        let error = Proof::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("invalid scalar length"));
+    }
+
+    #[test]
+    fn test_proof_with_wrong_hash_backend_is_rejected() {
+        let (_, proof) = prove_vitalik_circuit();
+        let error = Proof::<BS, BS, Keccak256Hash<BS>>::from_proto(&proof.to_proto()).unwrap_err();
+        assert!(error.to_string().contains("incorrect hash backend"));
+    }
+
+    #[test]
+    fn test_tampered_serialized_public_input_is_rejected() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let mut proto = proof.to_proto();
+        proto.public_inputs[1].value = utils::store_scalar(from_const(36));
+        let proof = Proof::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(error.to_string().contains("constraint violation"));
     }
 }
