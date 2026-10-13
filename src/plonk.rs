@@ -1089,11 +1089,12 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     /// The accumulator and helper columns will be committed in the PCS, while the start/end anchor
     /// constraints, helper authentication constraints, and the recurrence constraints are only
     /// included in the grand constraint and the computation of the PLONK quotient. Since `Z` and
-    /// the `h_i`s are committed and witness-derived, this function blinds them by filling the rows
-    /// corresponding to the padding area with random G values so that they don't leak any
-    /// information about the witness ([`padded_circuit_size`] ensures that the padding area has
-    /// enough capacity to warrant effective blinding given the number of rotations used in the
-    /// circuit and the required FRI queries).
+    /// the `h_i`s are committed and witness-derived, if the circuit is blinded this function blinds
+    /// them by filling the rows corresponding to the padding area with random G values so that they
+    /// don't leak any information about the witness ([`padded_circuit_size`] ensures that the
+    /// padding area has enough capacity to warrant effective blinding given the number of rotations
+    /// used in the circuit and the required FRI queries). If the circuit is not blinded those rows
+    /// are filled with zeros, so that proofs are deterministic.
     ///
     /// We use the Fiat-Shamir challenge `gamma` as the abstract variable for LogUp. The numerator
     /// factors of the standard PLONK permutation argument are:
@@ -1211,8 +1212,10 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                     })
                     .sum::<G>();
         }
-        for i in (self.num_rows + 1)..self.degree_bound {
-            accumulator[i] = G::random_default();
+        if self.blinded {
+            for i in (self.num_rows + 1)..self.degree_bound {
+                accumulator[i] = G::random_default();
+            }
         }
         if accumulator[self.num_rows % self.degree_bound] != G::ZERO {
             return Err(anyhow!("permutation accumulator end anchor check failed"));
@@ -1229,7 +1232,11 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                     .zip(denominators[0..self.num_rows].iter())
                     .map(|(&numerator, &denominator)| numerator - denominator)
                     .collect();
-                values.resize_with(self.degree_bound, G::random_default);
+                if self.blinded {
+                    values.resize_with(self.degree_bound, G::random_default);
+                } else {
+                    values.resize(self.degree_bound, G::ZERO);
+                }
                 Polynomial::encode2(values)
             })
             .collect();
@@ -3184,5 +3191,13 @@ mod tests {
                 .to_string()
                 .contains("circuits must have at least one row")
         );
+    }
+
+    #[test]
+    fn test_unblinded_proofs_are_deterministic() {
+        let (_, proof1) = prove_vitalik_circuit();
+        let (_, proof2) = prove_vitalik_circuit();
+        assert_eq!(proof1.commitment.to_proto(), proof2.commitment.to_proto());
+        assert_eq!(proof1.inner_proof.to_proto(), proof2.inner_proof.to_proto());
     }
 }
