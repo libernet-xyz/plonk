@@ -1624,6 +1624,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         self.as_compressed::<H>().verify(proof)
     }
 
+    /// Serializes this circuit to a [`Circuit`](`proto::Circuit`) protobuf.
     pub fn to_proto(&self) -> proto::Circuit {
         proto::Circuit {
             num_rows: self.num_rows as u64,
@@ -1674,6 +1675,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         }
     }
 
+    /// Deserializes a circuit from a [`Circuit`](`proto::Circuit`) protobuf.
     pub fn from_proto(proto: &proto::Circuit) -> Result<Self> {
         let num_rows = proto.num_rows as usize;
 
@@ -1981,6 +1983,38 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             ));
         }
 
+        let batch_sizes = commitment.batch_sizes();
+        if batch_sizes[COMMIT_INDEX_CIRCUIT] != num_gate_selectors + num_sigma_polynomials {
+            return Err(anyhow!(
+                "invalid number of circuit polynomials (got {}, want {})",
+                batch_sizes[COMMIT_INDEX_CIRCUIT],
+                num_gate_selectors + num_sigma_polynomials,
+            ));
+        }
+        if batch_sizes[COMMIT_INDEX_WITNESS] != num_witness_columns {
+            return Err(anyhow!(
+                "invalid number of witness polynomials (got {}, want {})",
+                batch_sizes[COMMIT_INDEX_WITNESS],
+                num_witness_columns,
+            ));
+        }
+        if batch_sizes[COMMIT_INDEX_PERMUTATION_ARGUMENT]
+            != num_permutation_accumulators + num_permutation_helpers
+        {
+            return Err(anyhow!(
+                "invalid number of permutation argument polynomials (got {}, want {})",
+                batch_sizes[COMMIT_INDEX_PERMUTATION_ARGUMENT],
+                num_permutation_accumulators + num_permutation_helpers,
+            ));
+        }
+        if batch_sizes[COMMIT_INDEX_QUOTIENT] != num_quotient_chunks + num_fri_randomizers {
+            return Err(anyhow!(
+                "invalid number of quotient polynomials (got {}, want {})",
+                batch_sizes[COMMIT_INDEX_QUOTIENT],
+                num_quotient_chunks + num_fri_randomizers,
+            ));
+        }
+
         let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
         let omega_inv = omega.invert_vartime().unwrap();
 
@@ -2192,6 +2226,8 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         Ok(public_inputs)
     }
 
+    /// Serializes this compressed circuit to a [`CompressedCircuit`](`proto::CompressedCircuit`)
+    /// protobuf.
     pub fn to_proto(&self) -> proto::CompressedCircuit {
         proto::CompressedCircuit {
             num_rows: self.num_rows as u64,
@@ -2225,6 +2261,8 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         }
     }
 
+    /// Deserializes a compressed circuit from a
+    /// [`CompressedCircuit`](`proto::CompressedCircuit`) protobuf.
     pub fn from_proto(proto: &proto::CompressedCircuit) -> Result<Self> {
         let num_rows = proto.num_rows as usize;
 
@@ -2938,11 +2976,100 @@ mod tests {
     }
 
     #[test]
+    fn test_wrong_circuit_batch_size_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_CIRCUIT].num_polys -= 1;
+        commitment.batches[COMMIT_INDEX_WITNESS].num_polys += 1;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid number of circuit polynomials")
+        );
+    }
+
+    #[test]
+    fn test_wrong_witness_batch_size_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_WITNESS].num_polys -= 1;
+        commitment.batches[COMMIT_INDEX_PERMUTATION_ARGUMENT].num_polys += 1;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid number of witness polynomials")
+        );
+    }
+
+    #[test]
+    fn test_wrong_permutation_argument_batch_size_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_PERMUTATION_ARGUMENT].num_polys -= 1;
+        commitment.batches[COMMIT_INDEX_QUOTIENT].num_polys += 1;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid number of permutation argument polynomials")
+        );
+    }
+
+    #[test]
+    fn test_wrong_quotient_batch_size_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_QUOTIENT].num_polys -= 1;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid number of quotient polynomials")
+        );
+    }
+
+    #[test]
     fn test_extra_opening_is_not_reported_as_public() {
         let (circuit, mut proof) = prove_vitalik_circuit();
         proof.public_inputs.insert(cell(1, 2), from_const(35));
         let public_inputs = circuit.verify(&proof).unwrap();
         assert_eq!(public_inputs.len(), 2);
         assert!(!public_inputs.contains_key(&cell(1, 2)));
+    }
+
+    #[test]
+    fn test_circuit_serialization() {
+        let circuit = build_vitalik_circuit();
+        let mut witness = circuit.make_witness();
+        witness.set(cell(0, 0), from_const(3));
+        witness.set(cell(0, 1), from_const(9));
+        witness.set(cell(1, 0), from_const(3));
+        witness.set(cell(1, 1), from_const(9));
+        witness.set(cell(1, 2), from_const(35));
+        witness.set(cell(2, 0), from_const(3));
+        witness.set(cell(2, 1), from_const(35));
+        let proof = circuit.prove::<Sha2Hash<BS>>(witness).unwrap();
+        let circuit = Circuit::<BS, BS>::from_proto(&circuit.to_proto()).unwrap();
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_compressed_circuit_serialization() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let circuit =
+            CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&circuit.to_proto()).unwrap();
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
     }
 }
