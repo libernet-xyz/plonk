@@ -2009,10 +2009,22 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         }
         if batch_sizes[COMMIT_INDEX_QUOTIENT] != num_quotient_chunks + num_fri_randomizers {
             return Err(anyhow!(
-                "invalid number of quotient polynomials (got {}, want {})",
+                "invalid number of polynomials in the quotient batch (got {}, want {})",
                 batch_sizes[COMMIT_INDEX_QUOTIENT],
                 num_quotient_chunks + num_fri_randomizers,
             ));
+        }
+
+        for (_, gate_instances) in &self.gates {
+            for instance in gate_instances {
+                if instance.selector_index >= num_gate_selectors {
+                    return Err(anyhow!(
+                        "invalid selector index {} (the circuit has {} selectors)",
+                        instance.selector_index,
+                        num_gate_selectors
+                    ));
+                }
+            }
         }
 
         let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
@@ -3030,7 +3042,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("invalid number of quotient polynomials")
+                .contains("invalid number of polynomials in the quotient batch")
         );
     }
 
@@ -3041,6 +3053,22 @@ mod tests {
         let public_inputs = circuit.verify(&proof).unwrap();
         assert_eq!(public_inputs.len(), 2);
         assert!(!public_inputs.contains_key(&cell(1, 2)));
+    }
+
+    #[test]
+    fn test_sparse_selector_indices_are_rejected() {
+        let (circuit, proof) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        for gate in &mut proto.gates {
+            for instance in &mut gate.instances {
+                if instance.selector_index == 2 {
+                    instance.selector_index = 99;
+                }
+            }
+        }
+        let circuit = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(error.to_string().contains("invalid selector index 99"));
     }
 
     #[test]
