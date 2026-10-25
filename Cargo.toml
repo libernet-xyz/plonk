@@ -1,12 +1,12 @@
 [package]
 name = "starkom-plonk"
-version = "9.0.0"
+version = "10.0.0"
 description = "The PLONK arithmetization scheme used in Starkom."
 license = "Apache-2.0"
 repository = "https://github.com/libernet-xyz/plonk.git"
 readme = "README.md"
 edition = "2024"
-links = "starkom-plonk-v9"
+links = "starkom-plonk-v10"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -21,13 +21,13 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 regex = "1.13.1"
 sha3 = "0.12.0"
-starkom-bluesky = "3.7.2"
-starkom-ff = "4.1.0"
-starkom-goldilocks = "3.3.0"
-starkom-koalabear = "1.3.0"
-starkom-pcs = "8.0.1"
-starkom-poly = "4.6.1"
-starkom-schraderbrau = "1.1.1"
+starkom-bluesky = "3.8.0"
+starkom-ff = "4.2.0"
+starkom-goldilocks = "3.4.1"
+starkom-koalabear = "1.4.0"
+starkom-pcs = { version = "9.0.0", path = "../pcs" }
+starkom-poly = "4.6.2"
+starkom-schraderbrau = "1.2.0"
 
 [build-dependencies]
 prost-build = "0.14.4"

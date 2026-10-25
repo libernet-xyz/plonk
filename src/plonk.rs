@@ -1,6 +1,6 @@
 use crate::chip::Chip;
 use crate::expr::{Constraint, Variable};
-use crate::starkom::proto::plonk::v9 as proto;
+use crate::starkom::proto::plonk::v10 as proto;
 use crate::utils::{self, encode_cell, encode_usize, padded_circuit_size};
 use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
 use anyhow::{Result, anyhow};
@@ -106,9 +106,10 @@ fn quotient_degree_bound<'a, F: Field>(
 /// [quotient split](`Circuit::split_quotient`).
 fn mask_degree_bound<'a, F: Field>(
     blowup_log2: usize,
+    grinding_bits: usize,
     gate_constraints: impl IntoIterator<Item = &'a Constraint<F>>,
 ) -> usize {
-    get_rotation_set(gate_constraints).len() + pcs::num_queries(blowup_log2) + 1
+    get_rotation_set(gate_constraints).len() + pcs::num_queries(blowup_log2, grinding_bits) + 1
 }
 
 /// Builds a polynomial vanishes on the padding area. Used to switch the permutation argument off in
@@ -164,6 +165,28 @@ fn public_cell_challenge<F: Field, G: Field256, H: Hasher<G>>(
     H::challenge(*DST_PSI, transcript.as_slice())
 }
 
+fn pcs_config_to_proto(config: &pcs::Options) -> proto::PcsConfig {
+    proto::PcsConfig {
+        degree_bound: config.degree_bound as u64,
+        blowup_log2: config.blowup_log2 as u32,
+        fold_rate: config.fold_rate as u32,
+        max_rounds: config.max_rounds as u64,
+        grinding_bits: config.grinding_bits as u32,
+    }
+}
+
+fn pcs_config_from_proto<F: Field>(proto: &proto::PcsConfig) -> Result<pcs::Options> {
+    let config = pcs::Options {
+        degree_bound: proto.degree_bound as usize,
+        blowup_log2: proto.blowup_log2 as usize,
+        fold_rate: proto.fold_rate as usize,
+        max_rounds: proto.max_rounds as usize,
+        grinding_bits: proto.grinding_bits as usize,
+    };
+    config.validate::<F>()?;
+    Ok(config)
+}
+
 /// Circuit compilation & proving options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -183,6 +206,12 @@ pub struct Options {
     /// Log2 of the blowup factor used to compute the low-degree extensions for the underlying PCS.
     pub blowup_log2: usize,
 
+    pub fri_fold_rate: usize,
+
+    pub max_fri_rounds: usize,
+
+    pub grinding_bits: usize,
+
     /// Indicates whether or not blinding must be added to the circuit. In other words, this flag
     /// toggles the zero-knowledge feature of Starkom.
     ///
@@ -196,6 +225,9 @@ impl Default for Options {
         Self {
             canonicalize_constraints: false,
             blowup_log2: OPTIONS_DEFAULT_BLOWUP_LOG2,
+            fri_fold_rate: 1,
+            max_fri_rounds: usize::MAX,
+            grinding_bits: 0,
             blind: false,
         }
     }
@@ -602,6 +634,7 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
         let degree_bound = padded_circuit_size::<F, G>(
             self.num_rows,
             options.blowup_log2,
+            options.grinding_bits,
             options.blind,
             self.gates.iter().flat_map(|(constraint, _)| {
                 constraint
@@ -650,9 +683,14 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
 
         Ok(Circuit {
             num_rows: self.num_rows,
-            degree_bound,
             num_columns: self.num_columns,
-            blowup_log2: options.blowup_log2,
+            pcs_config: pcs::Options {
+                degree_bound,
+                blowup_log2: options.blowup_log2,
+                fold_rate: options.fri_fold_rate,
+                max_rounds: options.max_fri_rounds,
+                grinding_bits: options.grinding_bits,
+            },
             blinded: options.blind,
             selectors,
             gates,
@@ -768,19 +806,9 @@ pub struct Proof<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> {
 }
 
 impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> Proof<F, G, H> {
-    /// Returns the proven degree bound.
-    pub fn degree_bound(&self) -> usize {
-        self.inner_proof.degree_bound()
-    }
-
-    /// Returns the base-2 logarithm of the blowup factor used in the proof.
-    pub fn blowup_log2(&self) -> usize {
-        self.inner_proof.blowup_log2()
-    }
-
-    /// Returns the size of the extended evaluation domain.
-    pub fn extended_domain_size(&self) -> usize {
-        self.inner_proof.extended_domain_size()
+    /// Returns the options used to configure the PCS.
+    pub fn pcs_config(&self) -> &pcs::Options {
+        self.inner_proof.options()
     }
 
     /// Returns the number of committed polynomials.
@@ -855,19 +883,14 @@ pub struct Circuit<F: Field, G: Field256<BaseField = F>> {
     /// padded to the next power of 2.
     num_rows: usize,
 
-    /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
-    ///
-    /// This is the direct result of [`padded_circuit_size`].
-    degree_bound: usize,
-
     /// Number of witness columns.
     num_columns: usize,
 
-    /// Log2 of the blowup factor.
-    blowup_log2: usize,
-
     /// Whether or not the circuit is blinded (see [`Options::blind`]).
     blinded: bool,
+
+    /// Configuration parameters for the underlying PCS.
+    pcs_config: pcs::Options,
 
     /// Gate selectors.
     ///
@@ -907,20 +930,16 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         self.num_rows
     }
 
-    pub fn degree_bound(&self) -> usize {
-        self.degree_bound
-    }
-
     pub fn num_columns(&self) -> usize {
         self.num_columns
     }
 
-    pub fn blowup_log2(&self) -> usize {
-        self.blowup_log2
-    }
-
     pub fn is_blinded(&self) -> bool {
         self.blinded
+    }
+
+    pub fn pcs_config(&self) -> &pcs::Options {
+        &self.pcs_config
     }
 
     pub fn num_gates(&self) -> usize {
@@ -951,14 +970,21 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                 .map(Variable::rotation)
                 .collect::<BTreeSet<isize>>()
         });
-        let degree_bound =
-            padded_circuit_size::<F, G>(self.num_rows, self.blowup_log2, self.blinded, rotations);
+        let degree_bound = padded_circuit_size::<F, G>(
+            self.num_rows,
+            self.pcs_config.blowup_log2,
+            self.pcs_config.grinding_bits,
+            self.blinded,
+            rotations,
+        );
         Witness::new(self.num_rows, self.num_columns, degree_bound)
     }
 
     /// Performs various checks to verify that the provided `witness` is compatible with this
     /// circuit and doesn't violate any constraints.
     pub fn check_witness(&self, witness: &Witness<F>) -> Result<()> {
+        let degree_bound = self.pcs_config.degree_bound;
+
         if witness.num_rows() != self.num_rows {
             return Err(anyhow!(
                 "wrong number of rows: got {}, want {}",
@@ -973,11 +999,10 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                 self.num_columns
             ));
         }
-        if witness.degree_bound() != self.degree_bound {
+        if witness.degree_bound() != degree_bound {
             return Err(anyhow!(
-                "incorrect degree bound: got {}, want {}",
-                witness.degree_bound(),
-                self.degree_bound
+                "incorrect degree bound: got {}, want {degree_bound}",
+                witness.degree_bound()
             ));
         }
 
@@ -1023,11 +1048,11 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
         let cell_by_identity_value: BTreeMap<F, Cell> = {
             let mut cell_by_identity_value = BTreeMap::default();
-            let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
+            let omega = Polynomial::<G>::domain_element2(1, degree_bound);
             let mut generator_power = F::ONE;
             for column in 0..self.num_columns {
                 let mut omega_power = F::ONE;
-                for row in 0..self.degree_bound {
+                for row in 0..degree_bound {
                     cell_by_identity_value
                         .insert(generator_power * omega_power, Cell::new(row, column));
                     omega_power *= omega;
@@ -1099,7 +1124,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                 &self.circuit_area_selector,
             )))
             .collect();
-        pcs::Committer::<G, H>::new(self.degree_bound, self.blowup_log2, circuit_polynomials)
+        pcs::Committer::<G, H>::new(self.pcs_config, circuit_polynomials)
     }
 
     fn get_variable_substitution(
@@ -1223,21 +1248,23 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         Vec<Polynomial<G>>, // helper constraints
         Polynomial<G>,      // recurrence constraint
     )> {
-        let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
+        let degree_bound = self.pcs_config.degree_bound;
+
+        let omega = Polynomial::<G>::domain_element2(1, degree_bound);
         let omega_inv = omega.invert_vartime().unwrap();
         let circuit_area_selector = Self::embed_polynomial(&self.circuit_area_selector);
 
         // Helper columns are initially stored in these two flat arrays, expressed in the value
         // domain and laid out in column-major order. Later on they're converted to individual
         // column polynomials.
-        let mut numerator_table = vec![G::ZERO; self.num_columns * self.degree_bound];
-        let mut denominator_table = vec![G::ZERO; self.num_columns * self.degree_bound];
+        let mut numerator_table = vec![G::ZERO; self.num_columns * degree_bound];
+        let mut denominator_table = vec![G::ZERO; self.num_columns * degree_bound];
 
         let mut generator_power = F::ONE;
         for i in 0..self.num_columns {
-            let offset = i * self.degree_bound;
+            let offset = i * degree_bound;
             let mut omega_power = F::ONE;
-            for j in 0..self.degree_bound {
+            for j in 0..degree_bound {
                 let witness_value: G = witness.get_at(Cell::new(j, i)).into();
                 numerator_table[offset + j] =
                     witness_value + beta * (generator_power * omega_power) + gamma;
@@ -1251,30 +1278,30 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         G::invert_batch(numerator_table.as_mut_slice());
         G::invert_batch(denominator_table.as_mut_slice());
 
-        let mut accumulator = vec![G::ZERO; self.degree_bound];
+        let mut accumulator = vec![G::ZERO; degree_bound];
         for i in 0..self.num_rows {
-            accumulator[(i + 1) % self.degree_bound] = accumulator[i]
+            accumulator[(i + 1) % degree_bound] = accumulator[i]
                 + (0..self.num_columns)
                     .map(|j| {
-                        numerator_table[j * self.degree_bound + i]
-                            - denominator_table[j * self.degree_bound + i]
+                        numerator_table[j * degree_bound + i]
+                            - denominator_table[j * degree_bound + i]
                     })
                     .sum::<G>();
         }
         if self.blinded {
-            for i in (self.num_rows + 1)..self.degree_bound {
+            for i in (self.num_rows + 1)..degree_bound {
                 accumulator[i] = G::random_default();
             }
         }
-        if accumulator[self.num_rows % self.degree_bound] != G::ZERO {
+        if accumulator[self.num_rows % degree_bound] != G::ZERO {
             return Err(anyhow!("permutation accumulator end anchor check failed"));
         }
 
         let accumulator = Polynomial::<G>::encode2(accumulator);
 
         let helpers: Vec<Polynomial<G>> = numerator_table
-            .chunks(self.degree_bound)
-            .zip(denominator_table.chunks(self.degree_bound))
+            .chunks(degree_bound)
+            .zip(denominator_table.chunks(degree_bound))
             .map(|(numerators, denominators)| {
                 let mut values: Vec<G> = numerators[0..self.num_rows]
                     .iter()
@@ -1282,9 +1309,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                     .map(|(&numerator, &denominator)| numerator - denominator)
                     .collect();
                 if self.blinded {
-                    values.resize_with(self.degree_bound, G::random_default);
+                    values.resize_with(degree_bound, G::random_default);
                 } else {
-                    values.resize(self.degree_bound, G::ZERO);
+                    values.resize(degree_bound, G::ZERO);
                 }
                 Polynomial::encode2(values)
             })
@@ -1312,9 +1339,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             .collect();
 
         let start_anchor_constraint =
-            accumulator.clone() * Polynomial::lagrange0_2(self.degree_bound).clone();
+            accumulator.clone() * Polynomial::lagrange0_2(degree_bound).clone();
         let end_anchor_constraint = accumulator.clone()
-            * Polynomial::<G>::lagrange0_2(self.degree_bound)
+            * Polynomial::<G>::lagrange0_2(degree_bound)
                 .clone()
                 .shift_domain_by(omega_inv.pow_small(self.num_rows).into());
         let recurrence_constraint = (accumulator.clone().shift_domain_by(omega.into())
@@ -1369,11 +1396,12 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                 .or_default()
                 .push((cell.row(), value));
         }
-        let mut public_inputs = vec![G::ZERO; self.degree_bound];
+        let degree_bound = self.pcs_config.degree_bound;
+        let mut public_inputs = vec![G::ZERO; degree_bound];
         let mut constraint = Polynomial::<G>::default();
         for (&column_index, cells) in &cells_by_column {
             let power = psi.pow_small(column_index);
-            let mut selector = vec![F::ZERO; self.degree_bound];
+            let mut selector = vec![F::ZERO; degree_bound];
             for &(row, value) in cells {
                 selector[row] = F::ONE;
                 public_inputs[row] += power * value;
@@ -1422,20 +1450,21 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     /// `N` is guaranteed to exceed `s + 1` by at least `num_rows`.
     fn split_quotient(&self, quotient: Polynomial<G>) -> Vec<Polynomial<G>> {
         let quotient_degree_bound = quotient_degree_bound(
-            self.degree_bound,
+            self.pcs_config.degree_bound,
             self.gates.iter().map(|(constraint, _)| constraint),
         );
 
         let mask_degree_bound = if self.blinded {
             mask_degree_bound(
-                self.blowup_log2,
+                self.pcs_config.blowup_log2,
+                self.pcs_config.grinding_bits,
                 self.gates.iter().map(|(constraint, _)| constraint),
             )
         } else {
             0
         };
-        assert!(mask_degree_bound < self.degree_bound);
-        let stride = self.degree_bound - mask_degree_bound;
+        assert!(mask_degree_bound < self.pcs_config.degree_bound);
+        let stride = self.pcs_config.degree_bound - mask_degree_bound;
 
         let mut coefficients = quotient.take();
         assert!(coefficients.len() <= quotient_degree_bound);
@@ -1485,7 +1514,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     /// the quotient batch, so leaving it out shifts no other index.
     fn make_fri_randomizer(&self) -> Polynomial<G> {
         Polynomial::with_coefficients(
-            (0..self.degree_bound)
+            (0..self.pcs_config.degree_bound)
                 .map(|_| G::random_default())
                 .collect(),
         )
@@ -1498,6 +1527,8 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             witness.blind();
         }
 
+        let degree_bound = self.pcs_config.degree_bound;
+
         if witness.num_rows() != self.num_rows {
             return Err(anyhow!(
                 "incorrect witness size (got {} rows, want {})",
@@ -1505,11 +1536,10 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                 self.num_rows
             ));
         }
-        if witness.degree_bound() != self.degree_bound {
+        if witness.degree_bound() != degree_bound {
             return Err(anyhow!(
-                "incorrect witness degree bound (got {}, want {})",
-                witness.degree_bound(),
-                self.degree_bound
+                "incorrect witness degree bound (got {}, want {degree_bound})",
+                witness.degree_bound()
             ));
         }
         if witness.num_columns() != self.num_columns {
@@ -1525,7 +1555,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         let columns = witness.clone().encode();
         committer.add_batch(columns.iter().map(Self::embed_polynomial).collect());
 
-        let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
+        let omega = Polynomial::<G>::domain_element2(1, degree_bound);
         let omega_inv = omega.invert_vartime().unwrap();
 
         let gate_constraint = {
@@ -1597,7 +1627,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             constraint += permutation_recurrence_constraint * power;
             power *= alpha;
             constraint += public_cell_constraint * power;
-            constraint.divide_by_zero(self.degree_bound)?
+            constraint.divide_by_zero(degree_bound)?
         };
         committer.add_batch(
             self.split_quotient(quotient)
@@ -1608,7 +1638,8 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
         let xi = H::challenge(*DST_XI, &[committer.transcript_hash()]);
 
-        let (commitment, prover) = committer.commit(BTreeSet::from_iter(
+        let (commitment, prover) = committer.commit();
+        let inner_proof = prover.prove(BTreeSet::from_iter(
             get_rotation_set(self.gates.iter().map(|(constraint, _)| constraint))
                 .into_iter()
                 .map(|rotation| {
@@ -1616,7 +1647,6 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                         .pow_small(rotation.unsigned_abs())
                 }),
         ));
-        let inner_proof = prover.prove(&commitment);
 
         Ok(Proof {
             public_inputs,
@@ -1630,10 +1660,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         let committer = self.make_committer::<H>();
         CompressedCircuit {
             num_rows: self.num_rows,
-            degree_bound: self.degree_bound,
             num_columns: self.num_columns,
-            blowup_log2: self.blowup_log2,
             blinded: self.blinded,
+            pcs_config: self.pcs_config,
             gates: self
                 .gates
                 .into_iter()
@@ -1649,10 +1678,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         let committer = self.make_committer::<H>();
         CompressedCircuit {
             num_rows: self.num_rows,
-            degree_bound: self.degree_bound,
             num_columns: self.num_columns,
-            blowup_log2: self.blowup_log2,
             blinded: self.blinded,
+            pcs_config: self.pcs_config,
             gates: self
                 .gates
                 .iter()
@@ -1674,10 +1702,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     pub fn to_proto(&self) -> proto::Circuit {
         proto::Circuit {
             num_rows: self.num_rows as u64,
-            degree_bound: self.degree_bound as u64,
             num_columns: self.num_columns as u64,
-            blowup_log2: self.blowup_log2 as u32,
             blinded: self.blinded,
+            pcs_config: pcs_config_to_proto(&self.pcs_config),
             selectors: self
                 .selectors
                 .iter()
@@ -1727,7 +1754,14 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             return Err(anyhow!("circuits must have at least one row"));
         }
 
-        let degree_bound = proto.degree_bound as usize;
+        let num_columns = proto.num_columns as usize;
+
+        let pcs_config_proto = &match proto.pcs_config {
+            Some(proto) => pcs_config_from_proto::<G>(proto),
+            None => Err(anyhow!("missing PCS settings")),
+        }?;
+
+        let degree_bound = pcs_config_proto.degree_bound as usize;
         if !degree_bound.is_power_of_two() {
             return Err(anyhow!(
                 "invalid degree bound {} (not a power of 2)",
@@ -1742,9 +1776,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             ));
         }
 
-        let num_columns = proto.num_columns as usize;
-
-        let blowup_log2 = proto.blowup_log2 as usize;
+        let blowup_log2 = pcs_config_proto.blowup_log2 as usize;
         if blowup_log2 == 0 {
             return Err(anyhow!("invalid blowup factor 2^0"));
         }
@@ -1860,10 +1892,15 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
         Ok(Self {
             num_rows,
-            degree_bound,
             num_columns,
-            blowup_log2,
             blinded: proto.blinded,
+            pcs_config: pcs::Options {
+                degree_bound: pcs_config_proto.degree_bound as usize,
+                blowup_log2: pcs_config_proto.blowup_log2 as usize,
+                fold_rate: pcs_config_proto.fold_rate as usize,
+                max_rounds: pcs_config_proto.max_rounds as usize,
+                grinding_bits: pcs_config_proto.grinding_bits as usize,
+            },
             selectors,
             gates,
             sigma,
@@ -1887,17 +1924,14 @@ pub struct CompressedCircuit<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>
     /// padded to the next power of 2.
     num_rows: usize,
 
-    /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
-    degree_bound: usize,
-
     /// Number of witness columns.
     num_columns: usize,
 
-    /// Log2 of the blowup factor.
-    blowup_log2: usize,
-
     /// Whether or not the circuit is blinded (see [`Options::blind`]).
     blinded: bool,
+
+    /// Configuration parameters for the underlying PCS.
+    pcs_config: pcs::Options,
 
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
     /// second component is the set of instances of that gate across the circuit.
@@ -1917,20 +1951,16 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         self.num_rows
     }
 
-    pub fn degree_bound(&self) -> usize {
-        self.degree_bound
-    }
-
     pub fn num_columns(&self) -> usize {
         self.num_columns
     }
 
-    pub fn blowup_log2(&self) -> usize {
-        self.blowup_log2
-    }
-
     pub fn is_blinded(&self) -> bool {
         self.blinded
+    }
+
+    pub fn pcs_config(&self) -> &pcs::Options {
+        &self.pcs_config
     }
 
     pub fn public_cells(&self) -> &BTreeSet<Cell> {
@@ -1955,20 +1985,21 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
     fn get_quotient_stride(&self) -> Result<usize> {
         let mask_degree_bound = if self.blinded {
             mask_degree_bound(
-                self.blowup_log2,
+                self.pcs_config.blowup_log2,
+                self.pcs_config.grinding_bits,
                 self.gates.iter().map(|(constraint, _)| constraint),
             )
         } else {
             0
         };
-        if mask_degree_bound >= self.degree_bound {
+        if mask_degree_bound >= self.pcs_config.degree_bound {
             return Err(anyhow!(
                 "degree bound {} too small for blinding (the quotient masks need {})",
-                self.degree_bound,
+                self.pcs_config.degree_bound,
                 mask_degree_bound
             ));
         }
-        Ok(self.degree_bound - mask_degree_bound)
+        Ok(self.pcs_config.degree_bound - mask_degree_bound)
     }
 
     /// Calculates the number of chunks the quotient was split into.
@@ -1976,7 +2007,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
     /// See [`quotient_degree_bound`] for details.
     fn get_num_quotient_chunks(&self) -> Result<usize> {
         Ok(quotient_degree_bound(
-            self.degree_bound,
+            self.pcs_config.degree_bound,
             self.gates.iter().map(|(constraint, _)| constraint),
         )
         .div_ceil(self.get_quotient_stride()?))

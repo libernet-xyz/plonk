@@ -105,6 +105,7 @@ pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
 pub(crate) fn padded_circuit_size<F: Field, G: Field256<BaseField = F>>(
     num_rows: usize,
     blowup_log2: usize,
+    grinding_bits: usize,
     blind: bool,
     rotations: impl IntoIterator<Item = isize>,
 ) -> usize {
@@ -114,7 +115,7 @@ pub(crate) fn padded_circuit_size<F: Field, G: Field256<BaseField = F>>(
             .chain(rotations.into_iter())
             .collect::<BTreeSet<isize>>()
             .len();
-        (num_rotations + pcs::num_queries(blowup_log2) + 1) * G::LEN.div_ceil(F::LEN)
+        (num_rotations + pcs::num_queries(blowup_log2, grinding_bits) + 1) * G::LEN.div_ceil(F::LEN)
     } else {
         0
     };
