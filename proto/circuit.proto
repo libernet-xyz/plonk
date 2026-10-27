@@ -30,10 +30,13 @@ message PcsConfig {
 
   // Number of grinding bits.
   //
-  // Each FRI query is complemented with a proof-of-work with this many leading zero bits to improve
-  // soundness and reduce the query count.
+  // Every proof carries a single proof-of-work nonce whose hash must have at least this many
+  // leading zero bits. Each grinding bit doubles the prover's proof-of-work and replaces one bit of
+  // security that would otherwise come from the FRI queries, so the number of queries goes down
+  // while soundness stays at 128 bits. Proofs with more grinding bits than this value (and
+  // therefore fewer queries) are accepted too.
   //
-  // To disable proof-of-work set this field to 0.
+  // To disable proof-of-work set this field to 0. It must not exceed 256.
   uint32 grinding_bits = 5;
 }
 

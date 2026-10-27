@@ -1507,14 +1507,15 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
     /// Samples the uniformly random polynomial that makes the DEEP-FRI layer zero-knowledge.
     ///
-    /// FRI is not zero-knowledge on its own: the fold siblings and the final layer revealed by the
-    /// queries are linear functionals of the random linear combination of all committed
-    /// polynomials, and there are more of them than that combination has coefficients, so without
-    /// further measures the transcript determines the combination entirely -- one random linear
-    /// combination of every witness column, helper, and quotient chunk. Adding a polynomial with
-    /// all its `N` coefficients uniformly random makes the combination itself uniform, so that the
-    /// folds reveal nothing beyond the point openings and the query leaves, which the blinding rows
-    /// of the witness take care of.
+    /// FRI is not zero-knowledge on its own: the cosets opened by the queries and the folded
+    /// polynomial sent in the clear after the last round are linear functionals of the random
+    /// linear combination of all committed polynomials, and they can be enough to determine that
+    /// combination entirely -- one random linear combination of every witness column, helper, and
+    /// quotient chunk. With zero rounds the folded polynomial is the whole DEEP quotient, which
+    /// together with the opened values always determines it. Adding a polynomial with all its `N`
+    /// coefficients uniformly random makes the combination itself uniform, so that FRI reveals
+    /// nothing beyond the point openings and the query leaves, which the blinding rows of the
+    /// witness take care of.
     ///
     /// The randomizer takes part in no constraint and the verifier ignores its openings; it only
     /// needs to be in the batch. Note that it has to be uniform over `G`, not `F`: it masks
