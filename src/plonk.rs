@@ -1704,7 +1704,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             num_rows: self.num_rows as u64,
             num_columns: self.num_columns as u64,
             blinded: self.blinded,
-            pcs_config: pcs_config_to_proto(&self.pcs_config),
+            pcs_config: Some(pcs_config_to_proto(&self.pcs_config)),
             selectors: self
                 .selectors
                 .iter()
@@ -1756,7 +1756,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
         let num_columns = proto.num_columns as usize;
 
-        let pcs_config_proto = &match proto.pcs_config {
+        let pcs_config_proto = match &proto.pcs_config {
             Some(proto) => pcs_config_from_proto::<G>(proto),
             None => Err(anyhow!("missing PCS settings")),
         }?;
@@ -2037,18 +2037,20 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             ));
         }
 
-        if inner_proof.degree_bound() != self.degree_bound {
+        let degree_bound = self.pcs_config.degree_bound;
+        if inner_proof.options().degree_bound != degree_bound {
             return Err(anyhow!(
-                "wrong degree bound (got {}, want {})",
-                inner_proof.degree_bound(),
-                self.degree_bound
+                "wrong degree bound (got {}, want {degree_bound})",
+                inner_proof.options().degree_bound
             ));
         }
-        if inner_proof.blowup_log2() != self.blowup_log2 {
+
+        let blowup_log2 = self.pcs_config.blowup_log2;
+        if inner_proof.options().blowup_log2 != blowup_log2 {
             return Err(anyhow!(
                 "blowup factor mismatch (got {}, want {})",
-                1usize << inner_proof.blowup_log2(),
-                1usize << self.blowup_log2
+                1usize << inner_proof.options().blowup_log2,
+                1usize << blowup_log2
             ));
         }
 
@@ -2132,7 +2134,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             }
         }
 
-        let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
+        let omega = Polynomial::<G>::domain_element2(1, degree_bound);
         let omega_inv = omega.invert_vartime().unwrap();
 
         let xi = H::challenge(
@@ -2282,7 +2284,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 .map(|i| points[&xi][offset + i] * xi.pow_small(i * stride))
                 .sum()
         };
-        let zero = xi.pow_small(self.degree_bound) - G::ONE;
+        let zero = xi.pow_small(degree_bound) - G::ONE;
 
         let alpha = H::challenge(
             *DST_ALPHA,
@@ -2290,11 +2292,11 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         );
 
         let permutation_start_anchor_constraint =
-            permutation_accumulator * lagrange0(xi, self.degree_bound);
+            permutation_accumulator * lagrange0(xi, degree_bound);
         let permutation_end_anchor_constraint = permutation_accumulator
             * lagrange0(
                 xi * omega_inv.pow_small_vartime(self.num_rows),
-                self.degree_bound,
+                degree_bound,
             );
 
         let public_cell_constraint: G = {
@@ -2310,7 +2312,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 .collect();
             let mut lagrange: Vec<G> = rows
                 .iter()
-                .map(|&row| G::from(self.degree_bound as u64) * (xi - omega.pow_small_vartime(row)))
+                .map(|&row| G::from(degree_bound as u64) * (xi - omega.pow_small_vartime(row)))
                 .collect();
             G::invert_batch(lagrange.as_mut_slice());
             let lagrange: BTreeMap<usize, G> = rows
@@ -2356,10 +2358,9 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         proto::CompressedCircuit {
             hash_backend: Some(prost_types::Any::from_msg(&H::ProtoTag::default()).unwrap()),
             num_rows: self.num_rows as u64,
-            degree_bound: self.degree_bound as u64,
             num_columns: self.num_columns as u64,
-            blowup_log2: self.blowup_log2 as u32,
             blinded: self.blinded,
+            pcs_config: Some(pcs_config_to_proto(&self.pcs_config)),
             gates: self
                 .gates
                 .iter()
@@ -2404,8 +2405,14 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         }?;
 
         let num_rows = proto.num_rows as usize;
+        let num_columns = proto.num_columns as usize;
 
-        let degree_bound = proto.degree_bound as usize;
+        let pcs_config_proto = match &proto.pcs_config {
+            Some(proto) => pcs_config_from_proto::<G>(proto),
+            None => Err(anyhow!("missing PCS settings")),
+        }?;
+
+        let degree_bound = pcs_config_proto.degree_bound as usize;
         if !degree_bound.is_power_of_two() {
             return Err(anyhow!(
                 "invalid degree bound {} (not a power of 2)",
@@ -2419,8 +2426,6 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 num_rows
             ));
         }
-
-        let num_columns = proto.num_columns as usize;
 
         let blowup_log2 = proto.blowup_log2 as usize;
         if blowup_log2 == 0 {
@@ -2492,10 +2497,15 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
 
         Ok(Self {
             num_rows,
-            degree_bound,
             num_columns,
-            blowup_log2,
             blinded: proto.blinded,
+            pcs_config: pcs::Options {
+                degree_bound: pcs_config_proto.degree_bound as usize,
+                blowup_log2: pcs_config_proto.blowup_log2 as usize,
+                fold_rate: pcs_config_proto.fold_rate as usize,
+                max_rounds: pcs_config_proto.max_rounds as usize,
+                grinding_bits: pcs_config_proto.grinding_bits as usize,
+            },
             gates,
             public_cells,
             circuit_commitment: utils::load_hash(proto.circuit_commitment.as_slice())?,
