@@ -206,10 +206,22 @@ pub struct Options {
     /// Log2 of the blowup factor used to compute the low-degree extensions for the underlying PCS.
     pub blowup_log2: usize,
 
+    /// Number of FRI folds per round, i.e. the base-2 logarithm of the folding arity (see
+    /// [`pcs::Options::fold_rate`]). Must be greater than 0.
     pub fri_fold_rate: usize,
 
+    /// Maximum number of FRI folding rounds (see [`pcs::Options::max_rounds`]). The polynomial left
+    /// after the last round is sent in the clear, so 0 sends the whole DEEP quotient.
+    ///
+    /// NOTE: specifying 0 does not impact zero-knowledge. If the [`blind`](`Self::blind`) flag is
+    /// enabled it will be infeasible for an external observer to derive the original witness
+    /// regardless of the number of FRI rounds. `max_fri_rounds` and
+    /// [`fri_fold_rate`](`Self::fri_fold_rate`) are only for proof size optimization.
     pub max_fri_rounds: usize,
 
+    /// Number of proof-of-work bits required by the underlying PCS (see
+    /// [`pcs::Options::grinding_bits`]). Every grinding bit lowers the number of FRI queries, and
+    /// therefore the number of blinding rows of blinded circuits. Must not exceed 256.
     pub grinding_bits: usize,
 
     /// Indicates whether or not blinding must be added to the circuit. In other words, this flag
@@ -1756,37 +1768,17 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
         let num_columns = proto.num_columns as usize;
 
-        let pcs_config_proto = match &proto.pcs_config {
+        let pcs_config = match &proto.pcs_config {
             Some(proto) => pcs_config_from_proto::<G>(proto),
             None => Err(anyhow!("missing PCS settings")),
         }?;
 
-        let degree_bound = pcs_config_proto.degree_bound as usize;
-        if !degree_bound.is_power_of_two() {
-            return Err(anyhow!(
-                "invalid degree bound {} (not a power of 2)",
-                degree_bound
-            ));
-        }
+        let degree_bound = pcs_config.degree_bound;
         if degree_bound < num_rows {
             return Err(anyhow!(
                 "the degree bound {} is lower than the number of rows {}",
                 degree_bound,
                 num_rows
-            ));
-        }
-
-        let blowup_log2 = pcs_config_proto.blowup_log2 as usize;
-        if blowup_log2 == 0 {
-            return Err(anyhow!("invalid blowup factor 2^0"));
-        }
-        let degree_bound_log2 = degree_bound.trailing_zeros() as usize;
-        if degree_bound_log2 + blowup_log2 > F::BaseField::S {
-            return Err(anyhow!(
-                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
-                degree_bound_log2,
-                blowup_log2,
-                F::BaseField::S
             ));
         }
 
@@ -1894,13 +1886,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             num_rows,
             num_columns,
             blinded: proto.blinded,
-            pcs_config: pcs::Options {
-                degree_bound: pcs_config_proto.degree_bound as usize,
-                blowup_log2: pcs_config_proto.blowup_log2 as usize,
-                fold_rate: pcs_config_proto.fold_rate as usize,
-                max_rounds: pcs_config_proto.max_rounds as usize,
-                grinding_bits: pcs_config_proto.grinding_bits as usize,
-            },
+            pcs_config,
             selectors,
             gates,
             sigma,
@@ -2037,22 +2023,14 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             ));
         }
 
+        if !inner_proof.options().satisfies(&self.pcs_config) {
+            return Err(anyhow!(
+                "PCS settings mismatch (got {:?}, want {:?})",
+                inner_proof.options(),
+                self.pcs_config
+            ));
+        }
         let degree_bound = self.pcs_config.degree_bound;
-        if inner_proof.options().degree_bound != degree_bound {
-            return Err(anyhow!(
-                "wrong degree bound (got {}, want {degree_bound})",
-                inner_proof.options().degree_bound
-            ));
-        }
-
-        let blowup_log2 = self.pcs_config.blowup_log2;
-        if inner_proof.options().blowup_log2 != blowup_log2 {
-            return Err(anyhow!(
-                "blowup factor mismatch (got {}, want {})",
-                1usize << inner_proof.options().blowup_log2,
-                1usize << blowup_log2
-            ));
-        }
 
         let num_gate_selectors = self
             .gates
@@ -2407,37 +2385,17 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         let num_rows = proto.num_rows as usize;
         let num_columns = proto.num_columns as usize;
 
-        let pcs_config_proto = match &proto.pcs_config {
+        let pcs_config = match &proto.pcs_config {
             Some(proto) => pcs_config_from_proto::<G>(proto),
             None => Err(anyhow!("missing PCS settings")),
         }?;
 
-        let degree_bound = pcs_config_proto.degree_bound as usize;
-        if !degree_bound.is_power_of_two() {
-            return Err(anyhow!(
-                "invalid degree bound {} (not a power of 2)",
-                degree_bound
-            ));
-        }
+        let degree_bound = pcs_config.degree_bound;
         if degree_bound < num_rows {
             return Err(anyhow!(
                 "the degree bound {} is lower than the number of rows {}",
                 degree_bound,
                 num_rows
-            ));
-        }
-
-        let blowup_log2 = proto.blowup_log2 as usize;
-        if blowup_log2 == 0 {
-            return Err(anyhow!("invalid blowup factor 2^0"));
-        }
-        let degree_bound_log2 = degree_bound.trailing_zeros() as usize;
-        if degree_bound_log2 + blowup_log2 > F::BaseField::S {
-            return Err(anyhow!(
-                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
-                degree_bound_log2,
-                blowup_log2,
-                F::BaseField::S
             ));
         }
 
@@ -2499,13 +2457,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             num_rows,
             num_columns,
             blinded: proto.blinded,
-            pcs_config: pcs::Options {
-                degree_bound: pcs_config_proto.degree_bound as usize,
-                blowup_log2: pcs_config_proto.blowup_log2 as usize,
-                fold_rate: pcs_config_proto.fold_rate as usize,
-                max_rounds: pcs_config_proto.max_rounds as usize,
-                grinding_bits: pcs_config_proto.grinding_bits as usize,
-            },
+            pcs_config,
             gates,
             public_cells,
             circuit_commitment: utils::load_hash(proto.circuit_commitment.as_slice())?,
@@ -2555,11 +2507,12 @@ mod tests {
             canonicalize_constraints,
             blowup_log2,
             blind,
+            ..Options::default()
         })?;
         assert_eq!(circuit.num_rows(), 3);
-        assert_eq!(circuit.degree_bound(), expected_degree_bound);
+        assert_eq!(circuit.pcs_config().degree_bound, expected_degree_bound);
         assert_eq!(circuit.num_columns(), 3);
-        assert_eq!(circuit.blowup_log2(), blowup_log2);
+        assert_eq!(circuit.pcs_config().blowup_log2, blowup_log2);
         assert_eq!(circuit.is_blinded(), blind);
         assert_eq!(circuit.num_gates(), 3);
         assert_eq!(circuit.get_max_gate_degree(), 2);
@@ -2576,10 +2529,10 @@ mod tests {
         witness.set(cell(2, 1), 35u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
         let proof = circuit.prove::<H>(witness)?;
-        assert_eq!(proof.degree_bound(), expected_degree_bound);
-        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(proof.pcs_config().degree_bound, expected_degree_bound);
+        assert_eq!(proof.pcs_config().blowup_log2, blowup_log2);
         assert_eq!(
-            proof.extended_domain_size(),
+            proof.pcs_config().extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
         assert_eq!(proof.num_polys(), expected_num_polys);
@@ -2866,11 +2819,12 @@ mod tests {
             canonicalize_constraints,
             blowup_log2,
             blind,
+            ..Options::default()
         })?;
         assert_eq!(circuit.num_rows(), 4);
-        assert_eq!(circuit.degree_bound(), expected_degree_bound);
+        assert_eq!(circuit.pcs_config().degree_bound, expected_degree_bound);
         assert_eq!(circuit.num_columns(), 4);
-        assert_eq!(circuit.blowup_log2(), blowup_log2);
+        assert_eq!(circuit.pcs_config().blowup_log2, blowup_log2);
         assert_eq!(circuit.is_blinded(), blind);
         assert_eq!(circuit.num_gates(), 3);
         assert_eq!(circuit.get_max_gate_degree(), 2);
@@ -2892,10 +2846,10 @@ mod tests {
         witness.set(cell(3, 2), 44u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
         let proof = circuit.prove::<H>(witness)?;
-        assert_eq!(proof.degree_bound(), expected_degree_bound);
-        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(proof.pcs_config().degree_bound, expected_degree_bound);
+        assert_eq!(proof.pcs_config().blowup_log2, blowup_log2);
         assert_eq!(
-            proof.extended_domain_size(),
+            proof.pcs_config().extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
         assert_eq!(proof.num_polys(), expected_num_polys);
@@ -2996,7 +2950,20 @@ mod tests {
         );
     }
 
+    fn vitalik_circuit_options() -> Options {
+        Options {
+            canonicalize_constraints: false,
+            blowup_log2: 1,
+            blind: false,
+            ..Options::default()
+        }
+    }
+
     fn build_vitalik_circuit() -> Circuit<BS, BS> {
+        build_vitalik_circuit_with_options(vitalik_circuit_options())
+    }
+
+    fn build_vitalik_circuit_with_options(options: Options) -> Circuit<BS, BS> {
         let mut builder = CircuitBuilder::<BS, BS>::default();
         builder.add_gate(0, (var(0) ^ 2) - var(1));
         builder.connect(cell(0, 0).into(), cell(1, 0).into());
@@ -3006,19 +2973,13 @@ mod tests {
         builder.connect(cell(1, 2).into(), cell(2, 1).into());
         builder.add_gate(2, Constraint::nop());
         builder.declare_public_cells([cell(2, 0), cell(2, 1)]);
-        builder
-            .build(Options {
-                canonicalize_constraints: false,
-                blowup_log2: 1,
-                blind: false,
-            })
-            .unwrap()
+        builder.build(options).unwrap()
     }
 
     #[test]
     fn test_check_witness_detects_wrong_number_of_rows() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(4, 3, circuit.degree_bound());
+        let witness = Witness::new(4, 3, circuit.pcs_config().degree_bound);
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("wrong number of rows"));
     }
@@ -3026,7 +2987,7 @@ mod tests {
     #[test]
     fn test_check_witness_detects_wrong_number_of_columns() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(3, 4, circuit.degree_bound());
+        let witness = Witness::new(3, 4, circuit.pcs_config().degree_bound);
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("wrong number of columns"));
     }
@@ -3034,7 +2995,7 @@ mod tests {
     #[test]
     fn test_check_witness_detects_wrong_degree_bound() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(3, 3, circuit.degree_bound() * 2);
+        let witness = Witness::new(3, 3, circuit.pcs_config().degree_bound * 2);
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("incorrect degree bound"));
     }
@@ -3088,7 +3049,16 @@ mod tests {
         CompressedCircuit<BS, BS, Sha2Hash<BS>>,
         Proof<BS, BS, Sha2Hash<BS>>,
     ) {
-        let circuit = build_vitalik_circuit();
+        prove_vitalik_circuit_with_options(vitalik_circuit_options())
+    }
+
+    fn prove_vitalik_circuit_with_options(
+        options: Options,
+    ) -> (
+        CompressedCircuit<BS, BS, Sha2Hash<BS>>,
+        Proof<BS, BS, Sha2Hash<BS>>,
+    ) {
+        let circuit = build_vitalik_circuit_with_options(options);
         let mut witness = circuit.make_witness();
         witness.set(cell(0, 0), from_const(3));
         witness.set(cell(0, 1), from_const(9));
@@ -3201,7 +3171,7 @@ mod tests {
     #[test]
     fn test_oversized_selector_is_rejected() {
         let mut proto = build_vitalik_circuit().to_proto();
-        let degree_bound = proto.degree_bound as usize;
+        let degree_bound = proto.pcs_config.as_ref().unwrap().degree_bound as usize;
         proto.selectors[0]
             .coefficients
             .resize(degree_bound + 1, vec![1]);
@@ -3393,5 +3363,138 @@ mod tests {
         let circuit = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
         let error = circuit.verify(&proof).unwrap_err();
         assert!(error.to_string().contains("too small for blinding"));
+    }
+
+    #[test]
+    fn test_blinded_circuit_with_grinding() {
+        // 8 grinding bits bring the queries from 128 down to 120, so the 3 rows and the 123
+        // blinding rows fit in 128 rather than 256.
+        let (circuit, proof) = prove_vitalik_circuit_with_options(Options {
+            grinding_bits: 8,
+            blind: true,
+            ..vitalik_circuit_options()
+        });
+        assert_eq!(circuit.pcs_config().degree_bound, 128);
+        assert_eq!(circuit.pcs_config().grinding_bits, 8);
+        assert_eq!(proof.pcs_config(), circuit.pcs_config());
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_circuit_with_fri_rounds() {
+        let (circuit, proof) = prove_vitalik_circuit_with_options(Options {
+            fri_fold_rate: 2,
+            max_fri_rounds: 1,
+            ..vitalik_circuit_options()
+        });
+        assert_eq!(circuit.pcs_config().fold_rate, 2);
+        assert_eq!(circuit.pcs_config().max_rounds, 1);
+        assert_eq!(proof.pcs_config().num_rounds(), 1);
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    fn test_mismatched_pcs_config_is_rejected_impl(
+        circuit_options: Options,
+        proof_options: Options,
+    ) {
+        let (circuit, _) = prove_vitalik_circuit_with_options(circuit_options);
+        let (_, proof) = prove_vitalik_circuit_with_options(proof_options);
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(error.to_string().contains("PCS settings mismatch"));
+    }
+
+    #[test]
+    fn test_mismatched_pcs_config_is_rejected() {
+        test_mismatched_pcs_config_is_rejected_impl(
+            vitalik_circuit_options(),
+            Options {
+                fri_fold_rate: 2,
+                ..vitalik_circuit_options()
+            },
+        );
+        test_mismatched_pcs_config_is_rejected_impl(
+            vitalik_circuit_options(),
+            Options {
+                max_fri_rounds: 1,
+                ..vitalik_circuit_options()
+            },
+        );
+        test_mismatched_pcs_config_is_rejected_impl(
+            Options {
+                grinding_bits: 8,
+                ..vitalik_circuit_options()
+            },
+            vitalik_circuit_options(),
+        );
+    }
+
+    #[test]
+    fn test_proof_with_more_grinding_bits_is_accepted() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let (_, proof) = prove_vitalik_circuit_with_options(Options {
+            grinding_bits: 8,
+            ..vitalik_circuit_options()
+        });
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_pcs_config_serialization() {
+        let circuit = build_vitalik_circuit_with_options(Options {
+            fri_fold_rate: 2,
+            max_fri_rounds: 1,
+            grinding_bits: 8,
+            ..vitalik_circuit_options()
+        });
+        let pcs_config = *circuit.pcs_config();
+        let proto = circuit.to_proto();
+        let compressed_circuit = circuit.to_compressed::<Sha2Hash<BS>>();
+        let circuit = Circuit::<BS, BS>::from_proto(&proto).unwrap();
+        let compressed_circuit =
+            CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&compressed_circuit.to_proto())
+                .unwrap();
+        assert_eq!(*circuit.pcs_config(), pcs_config);
+        assert_eq!(*compressed_circuit.pcs_config(), pcs_config);
+    }
+
+    #[test]
+    fn test_circuit_without_pcs_config_is_rejected() {
+        let mut proto = build_vitalik_circuit().to_proto();
+        proto.pcs_config = None;
+        let error = Circuit::<BS, BS>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("missing PCS settings"));
+    }
+
+    #[test]
+    fn test_compressed_circuit_without_pcs_config_is_rejected() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.pcs_config = None;
+        let error = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("missing PCS settings"));
+    }
+
+    #[test]
+    fn test_circuit_with_invalid_fold_rate_is_rejected() {
+        let mut proto = build_vitalik_circuit().to_proto();
+        proto.pcs_config.as_mut().unwrap().fold_rate = 0;
+        assert!(Circuit::<BS, BS>::from_proto(&proto).is_err());
+    }
+
+    #[test]
+    fn test_compressed_circuit_with_too_many_grinding_bits_is_rejected() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.pcs_config.as_mut().unwrap().grinding_bits = pcs::PROOF_OF_WORK_BITS as u32 + 1;
+        assert!(CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).is_err());
     }
 }
