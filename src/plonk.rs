@@ -105,11 +105,14 @@ fn quotient_degree_bound<'a, F: Field>(
 /// Calculates the degree bound of the polynomials used to mask the
 /// [quotient split](`Circuit::split_quotient`).
 fn mask_degree_bound<'a, F: Field>(
+    security_bits: usize,
     blowup_log2: usize,
     grinding_bits: usize,
     gate_constraints: impl IntoIterator<Item = &'a Constraint<F>>,
 ) -> usize {
-    get_rotation_set(gate_constraints).len() + pcs::num_queries(blowup_log2, grinding_bits) + 1
+    get_rotation_set(gate_constraints).len()
+        + pcs::num_queries(security_bits, blowup_log2, grinding_bits)
+        + 1
 }
 
 /// Builds a polynomial vanishes on the padding area. Used to switch the permutation argument off in
@@ -168,6 +171,7 @@ fn public_cell_challenge<F: Field, G: Field256, H: Hasher<G>>(
 fn pcs_config_to_proto(config: &pcs::Options) -> proto::PcsConfig {
     proto::PcsConfig {
         degree_bound: config.degree_bound as u64,
+        security_bits: config.security_bits as u32,
         blowup_log2: config.blowup_log2 as u32,
         fold_rate: config.fold_rate as u32,
         max_rounds: config.max_rounds as u64,
@@ -178,6 +182,7 @@ fn pcs_config_to_proto(config: &pcs::Options) -> proto::PcsConfig {
 fn pcs_config_from_proto<F: Field>(proto: &proto::PcsConfig) -> Result<pcs::Options> {
     let config = pcs::Options {
         degree_bound: proto.degree_bound as usize,
+        security_bits: proto.security_bits as usize,
         blowup_log2: proto.blowup_log2 as usize,
         fold_rate: proto.fold_rate as usize,
         max_rounds: proto.max_rounds as usize,
@@ -202,6 +207,15 @@ pub struct Options {
     /// proving with negative exponents, so enable this flag only if your circuit is correctly
     /// constrained even when those variables are zero.
     pub canonicalize_constraints: bool,
+
+    /// The target security level in bits for the underlying PCS (see
+    /// [`pcs::Options::security_bits`]). Together with [`blowup_log2`](`Self::blowup_log2`) and
+    /// [`grinding_bits`](`Self::grinding_bits`) it determines the number of FRI queries (see
+    /// [`pcs::num_queries`]).
+    ///
+    /// NOTE: when the [`blind`](`Self::blind`) flag is enabled every FRI query requires extra
+    /// blinding rows, so a higher security level may increase the padded circuit size.
+    pub security_bits: usize,
 
     /// Log2 of the blowup factor used to compute the low-degree extensions for the underlying PCS.
     pub blowup_log2: usize,
@@ -236,6 +250,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             canonicalize_constraints: false,
+            security_bits: 128,
             blowup_log2: OPTIONS_DEFAULT_BLOWUP_LOG2,
             fri_fold_rate: 1,
             max_fri_rounds: usize::MAX,
@@ -645,6 +660,7 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
 
         let degree_bound = padded_circuit_size::<F, G>(
             self.num_rows,
+            options.security_bits,
             options.blowup_log2,
             options.grinding_bits,
             options.blind,
@@ -698,6 +714,7 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
             num_columns: self.num_columns,
             pcs_config: pcs::Options {
                 degree_bound,
+                security_bits: options.security_bits,
                 blowup_log2: options.blowup_log2,
                 fold_rate: options.fri_fold_rate,
                 max_rounds: options.max_fri_rounds,
@@ -984,6 +1001,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         });
         let degree_bound = padded_circuit_size::<F, G>(
             self.num_rows,
+            self.pcs_config.security_bits,
             self.pcs_config.blowup_log2,
             self.pcs_config.grinding_bits,
             self.blinded,
@@ -1468,6 +1486,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
         let mask_degree_bound = if self.blinded {
             mask_degree_bound(
+                self.pcs_config.security_bits,
                 self.pcs_config.blowup_log2,
                 self.pcs_config.grinding_bits,
                 self.gates.iter().map(|(constraint, _)| constraint),
@@ -1972,6 +1991,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
     fn get_quotient_stride(&self) -> Result<usize> {
         let mask_degree_bound = if self.blinded {
             mask_degree_bound(
+                self.pcs_config.security_bits,
                 self.pcs_config.blowup_log2,
                 self.pcs_config.grinding_bits,
                 self.gates.iter().map(|(constraint, _)| constraint),

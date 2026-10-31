@@ -9,8 +9,16 @@ message PcsConfig {
   // Size of the evaluation domain.
   uint64 degree_bound = 1;
 
+  // The target security level in bits.
+  //
+  // Together with `blowup_log2` and `grinding_bits` it determines the number of FRI queries: every
+  // query provides `blowup_log2` bits of security and grinding provides the rest, so there are
+  // `max(1, ceil((security_bits - grinding_bits) / blowup_log2))` queries, with the subtraction
+  // clamped to 0.
+  uint32 security_bits = 2;
+
   // Log2 of the blowup factor.
-  uint32 blowup_log2 = 2;
+  uint32 blowup_log2 = 3;
 
   // Number of FRI folds per round.
   //
@@ -18,7 +26,7 @@ message PcsConfig {
   // this many times, reducing the number of required rounds.
   //
   // `fold_rate` must be greater than 0.
-  uint32 fold_rate = 3;
+  uint32 fold_rate = 4;
 
   // Maximum number of FRI folding rounds.
   //
@@ -26,18 +34,18 @@ message PcsConfig {
   // `log2(degree_bound) / fold_rate`, rounded down. Rather than being folded further, the
   // polynomial resulting from the last round is sent in the clear. With 0 there's no folding at all
   // and the whole DEEP quotient is sent in the clear.
-  uint64 max_rounds = 4;
+  uint64 max_rounds = 5;
 
   // Number of grinding bits.
   //
   // Every proof carries a single proof-of-work nonce whose hash must have at least this many
   // leading zero bits. Each grinding bit doubles the prover's proof-of-work and replaces one bit of
   // security that would otherwise come from the FRI queries, so the number of queries goes down
-  // while soundness stays at 128 bits. Proofs with more grinding bits than this value (and
-  // therefore fewer queries) are accepted too.
+  // while soundness stays at `security_bits` bits. Proofs with more grinding bits than this value
+  // (and therefore fewer queries) are accepted too.
   //
   // To disable proof-of-work set this field to 0. It must not exceed 256.
-  uint32 grinding_bits = 5;
+  uint32 grinding_bits = 6;
 }
 
 // Describes a polynomial constraint enforced by a `Gate`.
