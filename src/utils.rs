@@ -84,24 +84,27 @@ pub(crate) fn scalar_to_isize<F: Field>(value: F) -> Result<isize> {
 /// one-element domain, where that term alone overflows a quotient degree bound of `(1 - 1) * E`.
 ///
 /// The minimum number of blinding rows is computed so that the added randomness absorbs the
-/// information leak caused by opening all FRI queries and all rotations used in the circuit, and
-/// adds an extra 256 bits on top of that.
+/// information that a proof leaks about every witness column, and adds ~256 bits of excess on top
+/// of that (see the notes about zero-knowledge in the `starkom-pcs` documentation). The witness
+/// columns are committed over the base field `F`, so writing `T` for the extension degree of `G`
+/// over `F` (e.g. 4 for F=Goldilocks and G=Goldilocks^4, 1 when F and G coincide):
+///
+/// * every FRI query opens one evaluation of every witness column, i.e. one element of `F`;
+/// * every opened rotation `W(xi)`, `W(omega*xi)`, etc. leaks an element of `G`, which is worth `T`
+///   elements of `F`, because the challenge `xi` is in `G` (not in the `F` subfield) and touches
+///   all coefficients of the polynomial upon evaluation;
+/// * the Merkle roots and paths are deterministic hashes of all evaluations, so `T` more elements
+///   of `F` (~256 bits) are needed to make it infeasible to guess the witness and check the guess
+///   against them.
+///
+/// For this reason our formula is:
+///
+///   min_blinding_rows = num_queries + T * (num_rotations + 1)
 ///
 /// In the implementation we always force the 0 and +1 rotations into the provided rotation set
 /// because the main challenge xi and the shifted challenge xi*omega are always opened (for the
 /// final algebraic check and the permutation argument, respectively) even if the circuit doesn't
 /// use those rotations.
-///
-/// NOTE: when using the extension field pattern (e.g. F=Goldilocks, G=Goldilocks^4) each opened
-/// rotation `W(xi)`, `W(omega*xi)`, etc. leaks `G::BITS` bits of information about the witness
-/// column `W`, not just `F::BITS` bits! That is because the challenge `xi` is in `G` (not in the
-/// `F` subfield) and touches all coefficients of the polynomial upon evaluation, so an evaluation
-/// yields 256 bits of information. For this reason our formula is:
-///
-///   min_blinding_rows = (num_rotations + num_queries + 1) * ceil(G::LEN / F::LEN)
-///
-/// ensuring that every opened FRI query and every opened rotation is absorbed by 256 bits of
-/// blinding, and 256 bits of excess are added on top of that.
 pub(crate) fn padded_circuit_size<F: Field, G: Field256<BaseField = F>>(
     num_rows: usize,
     security_bits: usize,
@@ -116,8 +119,8 @@ pub(crate) fn padded_circuit_size<F: Field, G: Field256<BaseField = F>>(
             .chain(rotations.into_iter())
             .collect::<BTreeSet<isize>>()
             .len();
-        (num_rotations + pcs::num_queries(security_bits, blowup_log2, grinding_bits) + 1)
-            * G::LEN.div_ceil(F::LEN)
+        pcs::num_queries(security_bits, blowup_log2, grinding_bits)
+            + G::EXTENSION_DEGREE * (num_rotations + 1)
     } else {
         0
     };
@@ -178,6 +181,7 @@ mod tests {
     use super::*;
     use starkom_bluesky::{Scalar as BS, from_const};
     use starkom_goldilocks::{GL, GL4};
+    use starkom_koalabear::{KB, KB8};
 
     const SECURITY_BITS: usize = 128;
 
@@ -326,81 +330,94 @@ mod tests {
     #[test]
     fn test_padded_circuit_size_goldilocks() {
         let lambda = SECURITY_BITS;
-        assert_eq!(pcs::<GL, GL4>(1, lambda, 1, 0, true, [0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(2, lambda, 1, 0, true, [0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(3, lambda, 1, 0, true, [0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(499, lambda, 1, 0, true, [0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(500, lambda, 1, 0, true, [0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(501, lambda, 1, 0, true, [0, 1]), 2048);
-        assert_eq!(pcs::<GL, GL4>(502, lambda, 1, 0, true, [0, 1]), 2048);
-        assert_eq!(pcs::<GL, GL4>(1523, lambda, 1, 0, true, [0, 1]), 2048);
-        assert_eq!(pcs::<GL, GL4>(1524, lambda, 1, 0, true, [0, 1]), 2048);
-        assert_eq!(pcs::<GL, GL4>(1525, lambda, 1, 0, true, [0, 1]), 4096);
-        assert_eq!(pcs::<GL, GL4>(1526, lambda, 1, 0, true, [0, 1]), 4096);
+        assert_eq!(pcs::<GL, GL4>(1, lambda, 1, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(2, lambda, 1, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(3, lambda, 1, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(115, lambda, 1, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(116, lambda, 1, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(117, lambda, 1, 0, true, [0, 1]), 512);
+        assert_eq!(pcs::<GL, GL4>(118, lambda, 1, 0, true, [0, 1]), 512);
+        assert_eq!(pcs::<GL, GL4>(371, lambda, 1, 0, true, [0, 1]), 512);
+        assert_eq!(pcs::<GL, GL4>(372, lambda, 1, 0, true, [0, 1]), 512);
+        assert_eq!(pcs::<GL, GL4>(373, lambda, 1, 0, true, [0, 1]), 1024);
+        assert_eq!(pcs::<GL, GL4>(374, lambda, 1, 0, true, [0, 1]), 1024);
 
-        assert_eq!(pcs::<GL, GL4>(1, lambda, 2, 0, true, [0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(2, lambda, 2, 0, true, [0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(3, lambda, 2, 0, true, [0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(243, lambda, 2, 0, true, [0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(244, lambda, 2, 0, true, [0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(245, lambda, 2, 0, true, [0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(246, lambda, 2, 0, true, [0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(755, lambda, 2, 0, true, [0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(756, lambda, 2, 0, true, [0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(757, lambda, 2, 0, true, [0, 1]), 2048);
-        assert_eq!(pcs::<GL, GL4>(758, lambda, 2, 0, true, [0, 1]), 2048);
+        assert_eq!(pcs::<GL, GL4>(1, lambda, 2, 0, true, [0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(2, lambda, 2, 0, true, [0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(3, lambda, 2, 0, true, [0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(51, lambda, 2, 0, true, [0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(52, lambda, 2, 0, true, [0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(53, lambda, 2, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(54, lambda, 2, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(179, lambda, 2, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(180, lambda, 2, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(181, lambda, 2, 0, true, [0, 1]), 512);
+        assert_eq!(pcs::<GL, GL4>(182, lambda, 2, 0, true, [0, 1]), 512);
 
-        assert_eq!(pcs::<GL, GL4>(1, lambda, 3, 0, true, [0, 1]), 256);
-        assert_eq!(pcs::<GL, GL4>(2, lambda, 3, 0, true, [0, 1]), 256);
-        assert_eq!(pcs::<GL, GL4>(3, lambda, 3, 0, true, [0, 1]), 256);
-        assert_eq!(pcs::<GL, GL4>(71, lambda, 3, 0, true, [0, 1]), 256);
-        assert_eq!(pcs::<GL, GL4>(72, lambda, 3, 0, true, [0, 1]), 256);
-        assert_eq!(pcs::<GL, GL4>(73, lambda, 3, 0, true, [0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(74, lambda, 3, 0, true, [0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(327, lambda, 3, 0, true, [0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(328, lambda, 3, 0, true, [0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(329, lambda, 3, 0, true, [0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(330, lambda, 3, 0, true, [0, 1]), 1024);
+        assert_eq!(pcs::<GL, GL4>(1, lambda, 3, 0, true, [0, 1]), 64);
+        assert_eq!(pcs::<GL, GL4>(2, lambda, 3, 0, true, [0, 1]), 64);
+        assert_eq!(pcs::<GL, GL4>(3, lambda, 3, 0, true, [0, 1]), 64);
+        assert_eq!(pcs::<GL, GL4>(8, lambda, 3, 0, true, [0, 1]), 64);
+        assert_eq!(pcs::<GL, GL4>(9, lambda, 3, 0, true, [0, 1]), 64);
+        assert_eq!(pcs::<GL, GL4>(10, lambda, 3, 0, true, [0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(11, lambda, 3, 0, true, [0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(72, lambda, 3, 0, true, [0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(73, lambda, 3, 0, true, [0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(74, lambda, 3, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(75, lambda, 3, 0, true, [0, 1]), 256);
     }
 
     #[test]
     fn test_padded_circuit_size_goldilocks_three_rotations() {
         let lambda = SECURITY_BITS;
-        assert_eq!(pcs::<GL, GL4>(1, lambda, 1, 0, true, [-1, 0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(2, lambda, 1, 0, true, [-1, 0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(3, lambda, 1, 0, true, [-1, 0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(495, lambda, 1, 0, true, [-1, 0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(496, lambda, 1, 0, true, [-1, 0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(497, lambda, 1, 0, true, [-1, 0, 1]), 2048);
-        assert_eq!(pcs::<GL, GL4>(498, lambda, 1, 0, true, [-1, 0, 1]), 2048);
-        assert_eq!(pcs::<GL, GL4>(1519, lambda, 1, 0, true, [-1, 0, 1]), 2048);
-        assert_eq!(pcs::<GL, GL4>(1520, lambda, 1, 0, true, [-1, 0, 1]), 2048);
-        assert_eq!(pcs::<GL, GL4>(1521, lambda, 1, 0, true, [-1, 0, 1]), 4096);
-        assert_eq!(pcs::<GL, GL4>(1522, lambda, 1, 0, true, [-1, 0, 1]), 4096);
+        assert_eq!(pcs::<GL, GL4>(1, lambda, 1, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(2, lambda, 1, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(3, lambda, 1, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(111, lambda, 1, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(112, lambda, 1, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(113, lambda, 1, 0, true, [-1, 0, 1]), 512);
+        assert_eq!(pcs::<GL, GL4>(114, lambda, 1, 0, true, [-1, 0, 1]), 512);
+        assert_eq!(pcs::<GL, GL4>(367, lambda, 1, 0, true, [-1, 0, 1]), 512);
+        assert_eq!(pcs::<GL, GL4>(368, lambda, 1, 0, true, [-1, 0, 1]), 512);
+        assert_eq!(pcs::<GL, GL4>(369, lambda, 1, 0, true, [-1, 0, 1]), 1024);
+        assert_eq!(pcs::<GL, GL4>(370, lambda, 1, 0, true, [-1, 0, 1]), 1024);
 
-        assert_eq!(pcs::<GL, GL4>(1, lambda, 2, 0, true, [-1, 0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(2, lambda, 2, 0, true, [-1, 0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(3, lambda, 2, 0, true, [-1, 0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(239, lambda, 2, 0, true, [-1, 0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(240, lambda, 2, 0, true, [-1, 0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(241, lambda, 2, 0, true, [-1, 0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(242, lambda, 2, 0, true, [-1, 0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(751, lambda, 2, 0, true, [-1, 0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(752, lambda, 2, 0, true, [-1, 0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(753, lambda, 2, 0, true, [-1, 0, 1]), 2048);
-        assert_eq!(pcs::<GL, GL4>(754, lambda, 2, 0, true, [-1, 0, 1]), 2048);
+        assert_eq!(pcs::<GL, GL4>(1, lambda, 2, 0, true, [-1, 0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(2, lambda, 2, 0, true, [-1, 0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(3, lambda, 2, 0, true, [-1, 0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(47, lambda, 2, 0, true, [-1, 0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(48, lambda, 2, 0, true, [-1, 0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(49, lambda, 2, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(50, lambda, 2, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(175, lambda, 2, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(176, lambda, 2, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(177, lambda, 2, 0, true, [-1, 0, 1]), 512);
+        assert_eq!(pcs::<GL, GL4>(178, lambda, 2, 0, true, [-1, 0, 1]), 512);
 
-        assert_eq!(pcs::<GL, GL4>(1, lambda, 3, 0, true, [-1, 0, 1]), 256);
-        assert_eq!(pcs::<GL, GL4>(2, lambda, 3, 0, true, [-1, 0, 1]), 256);
-        assert_eq!(pcs::<GL, GL4>(3, lambda, 3, 0, true, [-1, 0, 1]), 256);
-        assert_eq!(pcs::<GL, GL4>(67, lambda, 3, 0, true, [-1, 0, 1]), 256);
-        assert_eq!(pcs::<GL, GL4>(68, lambda, 3, 0, true, [-1, 0, 1]), 256);
-        assert_eq!(pcs::<GL, GL4>(69, lambda, 3, 0, true, [-1, 0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(70, lambda, 3, 0, true, [-1, 0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(323, lambda, 3, 0, true, [-1, 0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(324, lambda, 3, 0, true, [-1, 0, 1]), 512);
-        assert_eq!(pcs::<GL, GL4>(325, lambda, 3, 0, true, [-1, 0, 1]), 1024);
-        assert_eq!(pcs::<GL, GL4>(326, lambda, 3, 0, true, [-1, 0, 1]), 1024);
+        assert_eq!(pcs::<GL, GL4>(1, lambda, 3, 0, true, [-1, 0, 1]), 64);
+        assert_eq!(pcs::<GL, GL4>(2, lambda, 3, 0, true, [-1, 0, 1]), 64);
+        assert_eq!(pcs::<GL, GL4>(3, lambda, 3, 0, true, [-1, 0, 1]), 64);
+        assert_eq!(pcs::<GL, GL4>(4, lambda, 3, 0, true, [-1, 0, 1]), 64);
+        assert_eq!(pcs::<GL, GL4>(5, lambda, 3, 0, true, [-1, 0, 1]), 64);
+        assert_eq!(pcs::<GL, GL4>(6, lambda, 3, 0, true, [-1, 0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(7, lambda, 3, 0, true, [-1, 0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(68, lambda, 3, 0, true, [-1, 0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(69, lambda, 3, 0, true, [-1, 0, 1]), 128);
+        assert_eq!(pcs::<GL, GL4>(70, lambda, 3, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<GL, GL4>(71, lambda, 3, 0, true, [-1, 0, 1]), 256);
+    }
+
+    /// With KoalaBear^8 every opened rotation leaks 8 elements of KoalaBear.
+    #[test]
+    fn test_padded_circuit_size_koalabear() {
+        let lambda = SECURITY_BITS;
+        assert_eq!(pcs::<KB, KB8>(1, lambda, 1, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<KB, KB8>(104, lambda, 1, 0, true, [0, 1]), 256);
+        assert_eq!(pcs::<KB, KB8>(105, lambda, 1, 0, true, [0, 1]), 512);
+
+        assert_eq!(pcs::<KB, KB8>(1, lambda, 1, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<KB, KB8>(96, lambda, 1, 0, true, [-1, 0, 1]), 256);
+        assert_eq!(pcs::<KB, KB8>(97, lambda, 1, 0, true, [-1, 0, 1]), 512);
     }
 
     #[test]

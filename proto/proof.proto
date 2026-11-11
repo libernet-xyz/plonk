@@ -25,8 +25,8 @@ message Proof {
   repeated PublicInput public_inputs = 1;
 
   // The inner DEEP-FRI commitment.
-  pcs.v9.Commitment commitment = 2;
+  pcs.v10.Commitment commitment = 2;
 
   // The inner DEEP-FRI proof.
-  pcs.v9.Proof inner_proof = 3;
+  pcs.v10.Proof inner_proof = 3;
 }
