@@ -6,8 +6,8 @@
 pub mod starkom {
     pub mod proto {
         pub mod plonk {
-            pub mod v9 {
-                include!(concat!(env!("OUT_DIR"), "/starkom.proto.plonk.v9.rs"));
+            pub mod v10 {
+                include!(concat!(env!("OUT_DIR"), "/starkom.proto.plonk.v10.rs"));
             }
         }
     }

@@ -1,6 +1,6 @@
 use crate::chip::Chip;
 use crate::expr::{Constraint, Variable};
-use crate::starkom::proto::plonk::v9 as proto;
+use crate::starkom::proto::plonk::v10 as proto;
 use crate::utils::{self, encode_cell, encode_usize, padded_circuit_size};
 use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
 use anyhow::{Result, anyhow};
@@ -105,10 +105,31 @@ fn quotient_degree_bound<'a, F: Field>(
 /// Calculates the degree bound of the polynomials used to mask the
 /// [quotient split](`Circuit::split_quotient`).
 fn mask_degree_bound<'a, F: Field>(
+    security_bits: usize,
     blowup_log2: usize,
+    grinding_bits: usize,
     gate_constraints: impl IntoIterator<Item = &'a Constraint<F>>,
 ) -> usize {
-    get_rotation_set(gate_constraints).len() + pcs::num_queries(blowup_log2) + 1
+    get_rotation_set(gate_constraints).len()
+        + pcs::num_queries(security_bits, blowup_log2, grinding_bits)
+        + 1
+}
+
+/// Returns the number of witness randomizers of a circuit, i.e. the uniformly random polynomials
+/// committed after the witness columns in the witness batch.
+///
+/// The witness batch is committed over the base field `F`, so every leaf of its Merkle tree holds
+/// one element of `F` per polynomial, and the Merkle paths reveal the hashes of unopened leaves. A
+/// blinded circuit needs ~256 bits of entropy in every leaf to make brute-forcing them infeasible,
+/// so if it has fewer witness columns than the extension degree `T` of `G` over `F` (e.g. 4 for
+/// Goldilocks^4, 1 when F and G coincide) it pads the batch with random polynomials up to `T`.
+/// They take part in no constraint and the verifier ignores their openings.
+fn num_witness_randomizers<G: Field256>(blinded: bool, num_columns: usize) -> usize {
+    if blinded {
+        G::EXTENSION_DEGREE.saturating_sub(num_columns)
+    } else {
+        0
+    }
 }
 
 /// Builds a polynomial vanishes on the padding area. Used to switch the permutation argument off in
@@ -164,6 +185,30 @@ fn public_cell_challenge<F: Field, G: Field256, H: Hasher<G>>(
     H::challenge(*DST_PSI, transcript.as_slice())
 }
 
+fn pcs_config_to_proto(config: &pcs::Options) -> proto::PcsConfig {
+    proto::PcsConfig {
+        degree_bound: config.degree_bound as u64,
+        security_bits: config.security_bits as u32,
+        blowup_log2: config.blowup_log2 as u32,
+        fold_rate: config.fold_rate as u32,
+        max_rounds: config.max_rounds as u64,
+        grinding_bits: config.grinding_bits as u32,
+    }
+}
+
+fn pcs_config_from_proto<F: Field>(proto: &proto::PcsConfig) -> Result<pcs::Options> {
+    let config = pcs::Options {
+        degree_bound: proto.degree_bound as usize,
+        security_bits: proto.security_bits as usize,
+        blowup_log2: proto.blowup_log2 as usize,
+        fold_rate: proto.fold_rate as usize,
+        max_rounds: proto.max_rounds as usize,
+        grinding_bits: proto.grinding_bits as usize,
+    };
+    config.validate::<F>()?;
+    Ok(config)
+}
+
 /// Circuit compilation & proving options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -180,14 +225,41 @@ pub struct Options {
     /// constrained even when those variables are zero.
     pub canonicalize_constraints: bool,
 
+    /// The target security level in bits for the underlying PCS (see
+    /// [`pcs::Options::security_bits`]). Together with [`blowup_log2`](`Self::blowup_log2`) and
+    /// [`grinding_bits`](`Self::grinding_bits`) it determines the number of FRI queries (see
+    /// [`pcs::num_queries`]).
+    ///
+    /// NOTE: when the [`blind`](`Self::blind`) flag is enabled every FRI query requires extra
+    /// blinding rows, so a higher security level may increase the padded circuit size.
+    pub security_bits: usize,
+
     /// Log2 of the blowup factor used to compute the low-degree extensions for the underlying PCS.
     pub blowup_log2: usize,
+
+    /// Number of FRI folds per round, i.e. the base-2 logarithm of the folding arity (see
+    /// [`pcs::Options::fold_rate`]). Must be greater than 0.
+    pub fri_fold_rate: usize,
+
+    /// Maximum number of FRI folding rounds (see [`pcs::Options::max_rounds`]). The polynomial left
+    /// after the last round is sent in the clear, so 0 sends the whole DEEP quotient.
+    ///
+    /// NOTE: specifying 0 does not impact zero-knowledge. If the [`blind`](`Self::blind`) flag is
+    /// enabled it will be infeasible for an external observer to derive the original witness
+    /// regardless of the number of FRI rounds. `max_fri_rounds` and
+    /// [`fri_fold_rate`](`Self::fri_fold_rate`) are only for proof size optimization.
+    pub max_fri_rounds: usize,
+
+    /// Number of proof-of-work bits required by the underlying PCS (see
+    /// [`pcs::Options::grinding_bits`]). Every grinding bit lowers the number of FRI queries, and
+    /// therefore the number of blinding rows of blinded circuits. Must not exceed 256.
+    pub grinding_bits: usize,
 
     /// Indicates whether or not blinding must be added to the circuit. In other words, this flag
     /// toggles the zero-knowledge feature of Starkom.
     ///
-    /// Blinding is disabled by default because it may add an extra cost due to increasing the
-    /// minimum padding area and adding an extra column for FRI randomization.
+    /// Blinding is disabled by default because it adds extra costs due to increasing the minimum
+    /// padding area and adding several columns for randomization.
     pub blind: bool,
 }
 
@@ -195,7 +267,11 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             canonicalize_constraints: false,
+            security_bits: 128,
             blowup_log2: OPTIONS_DEFAULT_BLOWUP_LOG2,
+            fri_fold_rate: 1,
+            max_fri_rounds: usize::MAX,
+            grinding_bits: 0,
             blind: false,
         }
     }
@@ -601,7 +677,9 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
 
         let degree_bound = padded_circuit_size::<F, G>(
             self.num_rows,
+            options.security_bits,
             options.blowup_log2,
+            options.grinding_bits,
             options.blind,
             self.gates.iter().flat_map(|(constraint, _)| {
                 constraint
@@ -650,9 +728,15 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
 
         Ok(Circuit {
             num_rows: self.num_rows,
-            degree_bound,
             num_columns: self.num_columns,
-            blowup_log2: options.blowup_log2,
+            pcs_config: pcs::Options {
+                degree_bound,
+                security_bits: options.security_bits,
+                blowup_log2: options.blowup_log2,
+                fold_rate: options.fri_fold_rate,
+                max_rounds: options.max_fri_rounds,
+                grinding_bits: options.grinding_bits,
+            },
             blinded: options.blind,
             selectors,
             gates,
@@ -768,28 +852,18 @@ pub struct Proof<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> {
 }
 
 impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> Proof<F, G, H> {
-    /// Returns the proven degree bound.
-    pub fn degree_bound(&self) -> usize {
-        self.inner_proof.degree_bound()
-    }
-
-    /// Returns the base-2 logarithm of the blowup factor used in the proof.
-    pub fn blowup_log2(&self) -> usize {
-        self.inner_proof.blowup_log2()
-    }
-
-    /// Returns the size of the extended evaluation domain.
-    pub fn extended_domain_size(&self) -> usize {
-        self.inner_proof.extended_domain_size()
+    /// Returns the options used to configure the PCS.
+    pub fn pcs_config(&self) -> &pcs::Options {
+        self.inner_proof.options()
     }
 
     /// Returns the number of committed polynomials.
     ///
-    /// These include the circuit selectors, the sigma polynomials, the witness columns, the
-    /// permutation argument accumulator, the LogUp helper columns, the chunks of the grand
-    /// quotient, and the FRI randomizer.
+    /// These include the circuit selectors, the sigma polynomials, the circuit area selector, the
+    /// witness columns, the witness randomizers, the permutation argument accumulator, the LogUp
+    /// helper columns, the chunks of the grand quotient, and the FRI randomizer.
     pub fn num_polys(&self) -> usize {
-        self.inner_proof.num_polys()
+        self.commitment.num_polys()
     }
 
     /// Returns a reference to the map of the revealed witness locations and corresponding values.
@@ -855,19 +929,14 @@ pub struct Circuit<F: Field, G: Field256<BaseField = F>> {
     /// padded to the next power of 2.
     num_rows: usize,
 
-    /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
-    ///
-    /// This is the direct result of [`padded_circuit_size`].
-    degree_bound: usize,
-
     /// Number of witness columns.
     num_columns: usize,
 
-    /// Log2 of the blowup factor.
-    blowup_log2: usize,
-
     /// Whether or not the circuit is blinded (see [`Options::blind`]).
     blinded: bool,
+
+    /// Configuration parameters for the underlying PCS.
+    pcs_config: pcs::Options,
 
     /// Gate selectors.
     ///
@@ -907,20 +976,16 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         self.num_rows
     }
 
-    pub fn degree_bound(&self) -> usize {
-        self.degree_bound
-    }
-
     pub fn num_columns(&self) -> usize {
         self.num_columns
     }
 
-    pub fn blowup_log2(&self) -> usize {
-        self.blowup_log2
-    }
-
     pub fn is_blinded(&self) -> bool {
         self.blinded
+    }
+
+    pub fn pcs_config(&self) -> &pcs::Options {
+        &self.pcs_config
     }
 
     pub fn num_gates(&self) -> usize {
@@ -951,14 +1016,22 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                 .map(Variable::rotation)
                 .collect::<BTreeSet<isize>>()
         });
-        let degree_bound =
-            padded_circuit_size::<F, G>(self.num_rows, self.blowup_log2, self.blinded, rotations);
+        let degree_bound = padded_circuit_size::<F, G>(
+            self.num_rows,
+            self.pcs_config.security_bits,
+            self.pcs_config.blowup_log2,
+            self.pcs_config.grinding_bits,
+            self.blinded,
+            rotations,
+        );
         Witness::new(self.num_rows, self.num_columns, degree_bound)
     }
 
     /// Performs various checks to verify that the provided `witness` is compatible with this
     /// circuit and doesn't violate any constraints.
     pub fn check_witness(&self, witness: &Witness<F>) -> Result<()> {
+        let degree_bound = self.pcs_config.degree_bound;
+
         if witness.num_rows() != self.num_rows {
             return Err(anyhow!(
                 "wrong number of rows: got {}, want {}",
@@ -973,11 +1046,10 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                 self.num_columns
             ));
         }
-        if witness.degree_bound() != self.degree_bound {
+        if witness.degree_bound() != degree_bound {
             return Err(anyhow!(
-                "incorrect degree bound: got {}, want {}",
-                witness.degree_bound(),
-                self.degree_bound
+                "incorrect degree bound: got {}, want {degree_bound}",
+                witness.degree_bound()
             ));
         }
 
@@ -1023,11 +1095,11 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
         let cell_by_identity_value: BTreeMap<F, Cell> = {
             let mut cell_by_identity_value = BTreeMap::default();
-            let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
+            let omega = Polynomial::<G>::domain_element2(1, degree_bound);
             let mut generator_power = F::ONE;
             for column in 0..self.num_columns {
                 let mut omega_power = F::ONE;
-                for row in 0..self.degree_bound {
+                for row in 0..degree_bound {
                     cell_by_identity_value
                         .insert(generator_power * omega_power, Cell::new(row, column));
                     omega_power *= omega;
@@ -1089,17 +1161,19 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         )
     }
 
+    /// Builds a PCS committer with the circuit batch: the gate selectors, the sigma polynomials,
+    /// and the circuit area selector, all over the base field `F`.
     fn make_committer<H: Hasher<G>>(&self) -> pcs::Committer<G, H> {
-        let circuit_polynomials = self
-            .selectors
-            .iter()
-            .map(Self::embed_polynomial)
-            .chain(self.sigma.iter().map(Self::embed_polynomial))
-            .chain(std::iter::once(Self::embed_polynomial(
-                &self.circuit_area_selector,
-            )))
-            .collect();
-        pcs::Committer::<G, H>::new(self.degree_bound, self.blowup_log2, circuit_polynomials)
+        let mut committer = pcs::Committer::<G, H>::new(self.pcs_config);
+        committer.add_base_batch(
+            self.selectors
+                .iter()
+                .chain(self.sigma.iter())
+                .chain(std::iter::once(&self.circuit_area_selector))
+                .cloned()
+                .collect(),
+        );
+        committer
     }
 
     fn get_variable_substitution(
@@ -1223,21 +1297,23 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         Vec<Polynomial<G>>, // helper constraints
         Polynomial<G>,      // recurrence constraint
     )> {
-        let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
+        let degree_bound = self.pcs_config.degree_bound;
+
+        let omega = Polynomial::<G>::domain_element2(1, degree_bound);
         let omega_inv = omega.invert_vartime().unwrap();
         let circuit_area_selector = Self::embed_polynomial(&self.circuit_area_selector);
 
         // Helper columns are initially stored in these two flat arrays, expressed in the value
         // domain and laid out in column-major order. Later on they're converted to individual
         // column polynomials.
-        let mut numerator_table = vec![G::ZERO; self.num_columns * self.degree_bound];
-        let mut denominator_table = vec![G::ZERO; self.num_columns * self.degree_bound];
+        let mut numerator_table = vec![G::ZERO; self.num_columns * degree_bound];
+        let mut denominator_table = vec![G::ZERO; self.num_columns * degree_bound];
 
         let mut generator_power = F::ONE;
         for i in 0..self.num_columns {
-            let offset = i * self.degree_bound;
+            let offset = i * degree_bound;
             let mut omega_power = F::ONE;
-            for j in 0..self.degree_bound {
+            for j in 0..degree_bound {
                 let witness_value: G = witness.get_at(Cell::new(j, i)).into();
                 numerator_table[offset + j] =
                     witness_value + beta * (generator_power * omega_power) + gamma;
@@ -1251,30 +1327,30 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         G::invert_batch(numerator_table.as_mut_slice());
         G::invert_batch(denominator_table.as_mut_slice());
 
-        let mut accumulator = vec![G::ZERO; self.degree_bound];
+        let mut accumulator = vec![G::ZERO; degree_bound];
         for i in 0..self.num_rows {
-            accumulator[(i + 1) % self.degree_bound] = accumulator[i]
+            accumulator[(i + 1) % degree_bound] = accumulator[i]
                 + (0..self.num_columns)
                     .map(|j| {
-                        numerator_table[j * self.degree_bound + i]
-                            - denominator_table[j * self.degree_bound + i]
+                        numerator_table[j * degree_bound + i]
+                            - denominator_table[j * degree_bound + i]
                     })
                     .sum::<G>();
         }
         if self.blinded {
-            for i in (self.num_rows + 1)..self.degree_bound {
+            for i in (self.num_rows + 1)..degree_bound {
                 accumulator[i] = G::random_default();
             }
         }
-        if accumulator[self.num_rows % self.degree_bound] != G::ZERO {
+        if accumulator[self.num_rows % degree_bound] != G::ZERO {
             return Err(anyhow!("permutation accumulator end anchor check failed"));
         }
 
         let accumulator = Polynomial::<G>::encode2(accumulator);
 
         let helpers: Vec<Polynomial<G>> = numerator_table
-            .chunks(self.degree_bound)
-            .zip(denominator_table.chunks(self.degree_bound))
+            .chunks(degree_bound)
+            .zip(denominator_table.chunks(degree_bound))
             .map(|(numerators, denominators)| {
                 let mut values: Vec<G> = numerators[0..self.num_rows]
                     .iter()
@@ -1282,9 +1358,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                     .map(|(&numerator, &denominator)| numerator - denominator)
                     .collect();
                 if self.blinded {
-                    values.resize_with(self.degree_bound, G::random_default);
+                    values.resize_with(degree_bound, G::random_default);
                 } else {
-                    values.resize(self.degree_bound, G::ZERO);
+                    values.resize(degree_bound, G::ZERO);
                 }
                 Polynomial::encode2(values)
             })
@@ -1312,9 +1388,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             .collect();
 
         let start_anchor_constraint =
-            accumulator.clone() * Polynomial::lagrange0_2(self.degree_bound).clone();
+            accumulator.clone() * Polynomial::lagrange0_2(degree_bound).clone();
         let end_anchor_constraint = accumulator.clone()
-            * Polynomial::<G>::lagrange0_2(self.degree_bound)
+            * Polynomial::<G>::lagrange0_2(degree_bound)
                 .clone()
                 .shift_domain_by(omega_inv.pow_small(self.num_rows).into());
         let recurrence_constraint = (accumulator.clone().shift_domain_by(omega.into())
@@ -1369,11 +1445,12 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                 .or_default()
                 .push((cell.row(), value));
         }
-        let mut public_inputs = vec![G::ZERO; self.degree_bound];
+        let degree_bound = self.pcs_config.degree_bound;
+        let mut public_inputs = vec![G::ZERO; degree_bound];
         let mut constraint = Polynomial::<G>::default();
         for (&column_index, cells) in &cells_by_column {
             let power = psi.pow_small(column_index);
-            let mut selector = vec![F::ZERO; self.degree_bound];
+            let mut selector = vec![F::ZERO; degree_bound];
             for &(row, value) in cells {
                 selector[row] = F::ONE;
                 public_inputs[row] += power * value;
@@ -1418,24 +1495,27 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     /// The `R_i` masks must compensate `s = num_rotations + num_queries` reveals, so their degree
     /// bound must be `s + 1` (as computed by [`mask_degree_bound`]). That means the degree bound of
     /// each chunk will be `M = N - s - 1` rather than `N` itself, and that's always okay because
-    /// [`padded_circuit_size`] rounds `num_rows + [G:F] * (s + 1)` up to the next power of two, so
-    /// `N` is guaranteed to exceed `s + 1` by at least `num_rows`.
+    /// [`padded_circuit_size`] rounds `num_rows + num_queries + T * (num_rotations + 1)` up to the
+    /// next power of two, with `T >= 1` being the extension degree of `G` over `F`, so `N` is
+    /// guaranteed to exceed `s + 1` by at least `num_rows`.
     fn split_quotient(&self, quotient: Polynomial<G>) -> Vec<Polynomial<G>> {
         let quotient_degree_bound = quotient_degree_bound(
-            self.degree_bound,
+            self.pcs_config.degree_bound,
             self.gates.iter().map(|(constraint, _)| constraint),
         );
 
         let mask_degree_bound = if self.blinded {
             mask_degree_bound(
-                self.blowup_log2,
+                self.pcs_config.security_bits,
+                self.pcs_config.blowup_log2,
+                self.pcs_config.grinding_bits,
                 self.gates.iter().map(|(constraint, _)| constraint),
             )
         } else {
             0
         };
-        assert!(mask_degree_bound < self.degree_bound);
-        let stride = self.degree_bound - mask_degree_bound;
+        assert!(mask_degree_bound < self.pcs_config.degree_bound);
+        let stride = self.pcs_config.degree_bound - mask_degree_bound;
 
         let mut coefficients = quotient.take();
         assert!(coefficients.len() <= quotient_degree_bound);
@@ -1466,14 +1546,15 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
     /// Samples the uniformly random polynomial that makes the DEEP-FRI layer zero-knowledge.
     ///
-    /// FRI is not zero-knowledge on its own: the fold siblings and the final layer revealed by the
-    /// queries are linear functionals of the random linear combination of all committed
-    /// polynomials, and there are more of them than that combination has coefficients, so without
-    /// further measures the transcript determines the combination entirely -- one random linear
-    /// combination of every witness column, helper, and quotient chunk. Adding a polynomial with
-    /// all its `N` coefficients uniformly random makes the combination itself uniform, so that the
-    /// folds reveal nothing beyond the point openings and the query leaves, which the blinding rows
-    /// of the witness take care of.
+    /// FRI is not zero-knowledge on its own: the cosets opened by the queries and the folded
+    /// polynomial sent in the clear after the last round are linear functionals of the random
+    /// linear combination of all committed polynomials, and they can be enough to determine that
+    /// combination entirely -- one random linear combination of every witness column, helper, and
+    /// quotient chunk. With zero rounds the folded polynomial is the whole DEEP quotient, which
+    /// together with the opened values always determines it. Adding a polynomial with all its `N`
+    /// coefficients uniformly random makes the combination itself uniform, so that FRI reveals
+    /// nothing beyond the point openings and the query leaves, which the blinding rows of the
+    /// witness take care of.
     ///
     /// The randomizer takes part in no constraint and the verifier ignores its openings; it only
     /// needs to be in the batch. Note that it has to be uniform over `G`, not `F`: it masks
@@ -1485,10 +1566,25 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     /// the quotient batch, so leaving it out shifts no other index.
     fn make_fri_randomizer(&self) -> Polynomial<G> {
         Polynomial::with_coefficients(
-            (0..self.degree_bound)
+            (0..self.pcs_config.degree_bound)
                 .map(|_| G::random_default())
                 .collect(),
         )
+    }
+
+    /// Samples the [witness randomizers](`num_witness_randomizers`), uniformly random polynomials
+    /// over `F` with all their `N` coefficients random, so that all their evaluations on the
+    /// extended domain are random too.
+    fn make_witness_randomizers(&self) -> Vec<Polynomial<F>> {
+        (0..num_witness_randomizers::<G>(self.blinded, self.num_columns))
+            .map(|_| {
+                Polynomial::with_coefficients(
+                    (0..self.pcs_config.degree_bound)
+                        .map(|_| F::random_default())
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     /// Proves correctness of the given witness, or returns an error in case of a constraint
@@ -1498,6 +1594,8 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             witness.blind();
         }
 
+        let degree_bound = self.pcs_config.degree_bound;
+
         if witness.num_rows() != self.num_rows {
             return Err(anyhow!(
                 "incorrect witness size (got {} rows, want {})",
@@ -1505,11 +1603,10 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                 self.num_rows
             ));
         }
-        if witness.degree_bound() != self.degree_bound {
+        if witness.degree_bound() != degree_bound {
             return Err(anyhow!(
-                "incorrect witness degree bound (got {}, want {})",
-                witness.degree_bound(),
-                self.degree_bound
+                "incorrect witness degree bound (got {}, want {degree_bound})",
+                witness.degree_bound()
             ));
         }
         if witness.num_columns() != self.num_columns {
@@ -1523,9 +1620,15 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         let mut committer = self.make_committer::<H>();
 
         let columns = witness.clone().encode();
-        committer.add_batch(columns.iter().map(Self::embed_polynomial).collect());
+        committer.add_base_batch(
+            columns
+                .iter()
+                .cloned()
+                .chain(self.make_witness_randomizers())
+                .collect(),
+        );
 
-        let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
+        let omega = Polynomial::<G>::domain_element2(1, degree_bound);
         let omega_inv = omega.invert_vartime().unwrap();
 
         let gate_constraint = {
@@ -1597,7 +1700,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             constraint += permutation_recurrence_constraint * power;
             power *= alpha;
             constraint += public_cell_constraint * power;
-            constraint.divide_by_zero(self.degree_bound)?
+            constraint.divide_by_zero(degree_bound)?
         };
         committer.add_batch(
             self.split_quotient(quotient)
@@ -1608,7 +1711,8 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
         let xi = H::challenge(*DST_XI, &[committer.transcript_hash()]);
 
-        let (commitment, prover) = committer.commit(BTreeSet::from_iter(
+        let (commitment, prover) = committer.commit();
+        let inner_proof = prover.prove(BTreeSet::from_iter(
             get_rotation_set(self.gates.iter().map(|(constraint, _)| constraint))
                 .into_iter()
                 .map(|rotation| {
@@ -1616,7 +1720,6 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
                         .pow_small(rotation.unsigned_abs())
                 }),
         ));
-        let inner_proof = prover.prove(&commitment);
 
         Ok(Proof {
             public_inputs,
@@ -1630,10 +1733,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         let committer = self.make_committer::<H>();
         CompressedCircuit {
             num_rows: self.num_rows,
-            degree_bound: self.degree_bound,
             num_columns: self.num_columns,
-            blowup_log2: self.blowup_log2,
             blinded: self.blinded,
+            pcs_config: self.pcs_config,
             gates: self
                 .gates
                 .into_iter()
@@ -1649,10 +1751,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         let committer = self.make_committer::<H>();
         CompressedCircuit {
             num_rows: self.num_rows,
-            degree_bound: self.degree_bound,
             num_columns: self.num_columns,
-            blowup_log2: self.blowup_log2,
             blinded: self.blinded,
+            pcs_config: self.pcs_config,
             gates: self
                 .gates
                 .iter()
@@ -1674,10 +1775,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     pub fn to_proto(&self) -> proto::Circuit {
         proto::Circuit {
             num_rows: self.num_rows as u64,
-            degree_bound: self.degree_bound as u64,
             num_columns: self.num_columns as u64,
-            blowup_log2: self.blowup_log2 as u32,
             blinded: self.blinded,
+            pcs_config: Some(pcs_config_to_proto(&self.pcs_config)),
             selectors: self
                 .selectors
                 .iter()
@@ -1727,34 +1827,19 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             return Err(anyhow!("circuits must have at least one row"));
         }
 
-        let degree_bound = proto.degree_bound as usize;
-        if !degree_bound.is_power_of_two() {
-            return Err(anyhow!(
-                "invalid degree bound {} (not a power of 2)",
-                degree_bound
-            ));
-        }
+        let num_columns = proto.num_columns as usize;
+
+        let pcs_config = match &proto.pcs_config {
+            Some(proto) => pcs_config_from_proto::<G>(proto),
+            None => Err(anyhow!("missing PCS settings")),
+        }?;
+
+        let degree_bound = pcs_config.degree_bound;
         if degree_bound < num_rows {
             return Err(anyhow!(
                 "the degree bound {} is lower than the number of rows {}",
                 degree_bound,
                 num_rows
-            ));
-        }
-
-        let num_columns = proto.num_columns as usize;
-
-        let blowup_log2 = proto.blowup_log2 as usize;
-        if blowup_log2 == 0 {
-            return Err(anyhow!("invalid blowup factor 2^0"));
-        }
-        let degree_bound_log2 = degree_bound.trailing_zeros() as usize;
-        if degree_bound_log2 + blowup_log2 > F::BaseField::S {
-            return Err(anyhow!(
-                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
-                degree_bound_log2,
-                blowup_log2,
-                F::BaseField::S
             ));
         }
 
@@ -1860,10 +1945,9 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
 
         Ok(Self {
             num_rows,
-            degree_bound,
             num_columns,
-            blowup_log2,
             blinded: proto.blinded,
+            pcs_config,
             selectors,
             gates,
             sigma,
@@ -1887,17 +1971,14 @@ pub struct CompressedCircuit<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>
     /// padded to the next power of 2.
     num_rows: usize,
 
-    /// Number of witness rows (including the blinding rows) rounded up to the next power of 2.
-    degree_bound: usize,
-
     /// Number of witness columns.
     num_columns: usize,
 
-    /// Log2 of the blowup factor.
-    blowup_log2: usize,
-
     /// Whether or not the circuit is blinded (see [`Options::blind`]).
     blinded: bool,
+
+    /// Configuration parameters for the underlying PCS.
+    pcs_config: pcs::Options,
 
     /// Gates used in the circuit: the first component of each pair is the gate constraint and the
     /// second component is the set of instances of that gate across the circuit.
@@ -1917,20 +1998,16 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         self.num_rows
     }
 
-    pub fn degree_bound(&self) -> usize {
-        self.degree_bound
-    }
-
     pub fn num_columns(&self) -> usize {
         self.num_columns
     }
 
-    pub fn blowup_log2(&self) -> usize {
-        self.blowup_log2
-    }
-
     pub fn is_blinded(&self) -> bool {
         self.blinded
+    }
+
+    pub fn pcs_config(&self) -> &pcs::Options {
+        &self.pcs_config
     }
 
     pub fn public_cells(&self) -> &BTreeSet<Cell> {
@@ -1955,20 +2032,22 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
     fn get_quotient_stride(&self) -> Result<usize> {
         let mask_degree_bound = if self.blinded {
             mask_degree_bound(
-                self.blowup_log2,
+                self.pcs_config.security_bits,
+                self.pcs_config.blowup_log2,
+                self.pcs_config.grinding_bits,
                 self.gates.iter().map(|(constraint, _)| constraint),
             )
         } else {
             0
         };
-        if mask_degree_bound >= self.degree_bound {
+        if mask_degree_bound >= self.pcs_config.degree_bound {
             return Err(anyhow!(
                 "degree bound {} too small for blinding (the quotient masks need {})",
-                self.degree_bound,
+                self.pcs_config.degree_bound,
                 mask_degree_bound
             ));
         }
-        Ok(self.degree_bound - mask_degree_bound)
+        Ok(self.pcs_config.degree_bound - mask_degree_bound)
     }
 
     /// Calculates the number of chunks the quotient was split into.
@@ -1976,7 +2055,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
     /// See [`quotient_degree_bound`] for details.
     fn get_num_quotient_chunks(&self) -> Result<usize> {
         Ok(quotient_degree_bound(
-            self.degree_bound,
+            self.pcs_config.degree_bound,
             self.gates.iter().map(|(constraint, _)| constraint),
         )
         .div_ceil(self.get_quotient_stride()?))
@@ -1991,35 +2070,30 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         let commitment = &proof.commitment;
         let inner_proof = &proof.inner_proof;
 
-        if commitment.tree_roots().len() != NUM_COMMIT_INDICES {
+        let batches = commitment.batches();
+        if batches.len() != NUM_COMMIT_INDICES {
             return Err(anyhow!(
                 "wrong number of Merkle roots (got {}, want {})",
-                commitment.tree_roots().len(),
+                batches.len(),
                 NUM_COMMIT_INDICES
             ));
         }
-        if commitment.tree_roots()[COMMIT_INDEX_CIRCUIT] != self.circuit_commitment {
+        if batches[COMMIT_INDEX_CIRCUIT].root() != self.circuit_commitment {
             return Err(anyhow!(
                 "wrong circuit commitment (got {}, want {})",
-                commitment.tree_roots()[COMMIT_INDEX_CIRCUIT],
+                batches[COMMIT_INDEX_CIRCUIT].root(),
                 self.circuit_commitment
             ));
         }
 
-        if inner_proof.degree_bound() != self.degree_bound {
+        if !inner_proof.options().satisfies(&self.pcs_config) {
             return Err(anyhow!(
-                "wrong degree bound (got {}, want {})",
-                inner_proof.degree_bound(),
-                self.degree_bound
+                "PCS settings mismatch (got {:?}, want {:?})",
+                inner_proof.options(),
+                self.pcs_config
             ));
         }
-        if inner_proof.blowup_log2() != self.blowup_log2 {
-            return Err(anyhow!(
-                "blowup factor mismatch (got {}, want {})",
-                1usize << inner_proof.blowup_log2(),
-                1usize << self.blowup_log2
-            ));
-        }
+        let degree_bound = self.pcs_config.degree_bound;
 
         let num_gate_selectors = self
             .gates
@@ -2034,57 +2108,63 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         let num_sigma_polynomials = self.num_columns;
         let num_circuit_area_selectors = 1;
         let num_witness_columns = self.num_columns;
+        let num_witness_randomizers = num_witness_randomizers::<G>(self.blinded, self.num_columns);
         let num_permutation_accumulators = 1;
         let num_permutation_helpers = self.num_columns;
         let num_quotient_chunks = self.get_num_quotient_chunks()?;
         let num_fri_randomizers = if self.blinded { 1 } else { 0 };
-        let expected_polynomials = num_gate_selectors
-            + num_sigma_polynomials
-            + num_circuit_area_selectors
-            + num_witness_columns
-            + num_permutation_accumulators
-            + num_permutation_helpers
-            + num_quotient_chunks
-            + num_fri_randomizers;
 
-        if inner_proof.num_polys() != expected_polynomials {
+        if !batches[COMMIT_INDEX_CIRCUIT].base_field() {
             return Err(anyhow!(
-                "incorrect number of committed polynomials (got {}, want {})",
-                inner_proof.num_polys(),
-                expected_polynomials,
+                "the circuit polynomials must be over the base field"
             ));
         }
-
-        let batch_sizes = commitment.batch_sizes();
-        if batch_sizes[COMMIT_INDEX_CIRCUIT]
+        if batches[COMMIT_INDEX_CIRCUIT].num_polys()
             != num_gate_selectors + num_sigma_polynomials + num_circuit_area_selectors
         {
             return Err(anyhow!(
                 "invalid number of circuit polynomials (got {}, want {})",
-                batch_sizes[COMMIT_INDEX_CIRCUIT],
+                batches[COMMIT_INDEX_CIRCUIT].num_polys(),
                 num_gate_selectors + num_sigma_polynomials + num_circuit_area_selectors,
             ));
         }
-        if batch_sizes[COMMIT_INDEX_WITNESS] != num_witness_columns {
+        if !batches[COMMIT_INDEX_WITNESS].base_field() {
             return Err(anyhow!(
-                "invalid number of witness polynomials (got {}, want {})",
-                batch_sizes[COMMIT_INDEX_WITNESS],
-                num_witness_columns,
+                "the witness polynomials must be over the base field"
             ));
         }
-        if batch_sizes[COMMIT_INDEX_PERMUTATION_ARGUMENT]
+        if batches[COMMIT_INDEX_WITNESS].num_polys()
+            != num_witness_columns + num_witness_randomizers
+        {
+            return Err(anyhow!(
+                "invalid number of witness polynomials (got {}, want {})",
+                batches[COMMIT_INDEX_WITNESS].num_polys(),
+                num_witness_columns + num_witness_randomizers,
+            ));
+        }
+        if batches[COMMIT_INDEX_PERMUTATION_ARGUMENT].base_field() {
+            return Err(anyhow!(
+                "the permutation argument polynomials must not be over the base field"
+            ));
+        }
+        if batches[COMMIT_INDEX_PERMUTATION_ARGUMENT].num_polys()
             != num_permutation_accumulators + num_permutation_helpers
         {
             return Err(anyhow!(
                 "invalid number of permutation argument polynomials (got {}, want {})",
-                batch_sizes[COMMIT_INDEX_PERMUTATION_ARGUMENT],
+                batches[COMMIT_INDEX_PERMUTATION_ARGUMENT].num_polys(),
                 num_permutation_accumulators + num_permutation_helpers,
             ));
         }
-        if batch_sizes[COMMIT_INDEX_QUOTIENT] != num_quotient_chunks + num_fri_randomizers {
+        if batches[COMMIT_INDEX_QUOTIENT].base_field() {
+            return Err(anyhow!(
+                "the polynomials in the quotient batch must not be over the base field"
+            ));
+        }
+        if batches[COMMIT_INDEX_QUOTIENT].num_polys() != num_quotient_chunks + num_fri_randomizers {
             return Err(anyhow!(
                 "invalid number of polynomials in the quotient batch (got {}, want {})",
-                batch_sizes[COMMIT_INDEX_QUOTIENT],
+                batches[COMMIT_INDEX_QUOTIENT].num_polys(),
                 num_quotient_chunks + num_fri_randomizers,
             ));
         }
@@ -2101,7 +2181,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             }
         }
 
-        let omega = Polynomial::<G>::domain_element2(1, self.degree_bound);
+        let omega = Polynomial::<G>::domain_element2(1, degree_bound);
         let omega_inv = omega.invert_vartime().unwrap();
 
         let xi = H::challenge(
@@ -2187,7 +2267,8 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             let index = num_gate_selectors
                 + num_sigma_polynomials
                 + num_circuit_area_selectors
-                + num_witness_columns;
+                + num_witness_columns
+                + num_witness_randomizers;
             (points[&xi][index], points[&(xi * omega)][index])
         };
         let permutation_helpers: Vec<G> = {
@@ -2195,6 +2276,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 + num_sigma_polynomials
                 + num_circuit_area_selectors
                 + num_witness_columns
+                + num_witness_randomizers
                 + num_permutation_accumulators;
             (0..self.num_columns)
                 .map(|i| points[&xi][offset + i])
@@ -2244,6 +2326,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 + num_sigma_polynomials
                 + num_circuit_area_selectors
                 + num_witness_columns
+                + num_witness_randomizers
                 + num_permutation_accumulators
                 + num_permutation_helpers;
             let stride = self.get_quotient_stride()?;
@@ -2251,7 +2334,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 .map(|i| points[&xi][offset + i] * xi.pow_small(i * stride))
                 .sum()
         };
-        let zero = xi.pow_small(self.degree_bound) - G::ONE;
+        let zero = xi.pow_small(degree_bound) - G::ONE;
 
         let alpha = H::challenge(
             *DST_ALPHA,
@@ -2259,11 +2342,11 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         );
 
         let permutation_start_anchor_constraint =
-            permutation_accumulator * lagrange0(xi, self.degree_bound);
+            permutation_accumulator * lagrange0(xi, degree_bound);
         let permutation_end_anchor_constraint = permutation_accumulator
             * lagrange0(
                 xi * omega_inv.pow_small_vartime(self.num_rows),
-                self.degree_bound,
+                degree_bound,
             );
 
         let public_cell_constraint: G = {
@@ -2279,7 +2362,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
                 .collect();
             let mut lagrange: Vec<G> = rows
                 .iter()
-                .map(|&row| G::from(self.degree_bound as u64) * (xi - omega.pow_small_vartime(row)))
+                .map(|&row| G::from(degree_bound as u64) * (xi - omega.pow_small_vartime(row)))
                 .collect();
             G::invert_batch(lagrange.as_mut_slice());
             let lagrange: BTreeMap<usize, G> = rows
@@ -2325,10 +2408,9 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         proto::CompressedCircuit {
             hash_backend: Some(prost_types::Any::from_msg(&H::ProtoTag::default()).unwrap()),
             num_rows: self.num_rows as u64,
-            degree_bound: self.degree_bound as u64,
             num_columns: self.num_columns as u64,
-            blowup_log2: self.blowup_log2 as u32,
             blinded: self.blinded,
+            pcs_config: Some(pcs_config_to_proto(&self.pcs_config)),
             gates: self
                 .gates
                 .iter()
@@ -2373,35 +2455,19 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         }?;
 
         let num_rows = proto.num_rows as usize;
+        let num_columns = proto.num_columns as usize;
 
-        let degree_bound = proto.degree_bound as usize;
-        if !degree_bound.is_power_of_two() {
-            return Err(anyhow!(
-                "invalid degree bound {} (not a power of 2)",
-                degree_bound
-            ));
-        }
+        let pcs_config = match &proto.pcs_config {
+            Some(proto) => pcs_config_from_proto::<G>(proto),
+            None => Err(anyhow!("missing PCS settings")),
+        }?;
+
+        let degree_bound = pcs_config.degree_bound;
         if degree_bound < num_rows {
             return Err(anyhow!(
                 "the degree bound {} is lower than the number of rows {}",
                 degree_bound,
                 num_rows
-            ));
-        }
-
-        let num_columns = proto.num_columns as usize;
-
-        let blowup_log2 = proto.blowup_log2 as usize;
-        if blowup_log2 == 0 {
-            return Err(anyhow!("invalid blowup factor 2^0"));
-        }
-        let degree_bound_log2 = degree_bound.trailing_zeros() as usize;
-        if degree_bound_log2 + blowup_log2 > F::BaseField::S {
-            return Err(anyhow!(
-                "invalid extended domain size 2^{{{}+{}}} (exceeds the 2-adicity of the field, {})",
-                degree_bound_log2,
-                blowup_log2,
-                F::BaseField::S
             ));
         }
 
@@ -2461,10 +2527,9 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
 
         Ok(Self {
             num_rows,
-            degree_bound,
             num_columns,
-            blowup_log2,
             blinded: proto.blinded,
+            pcs_config,
             gates,
             public_cells,
             circuit_commitment: utils::load_hash(proto.circuit_commitment.as_slice())?,
@@ -2514,11 +2579,12 @@ mod tests {
             canonicalize_constraints,
             blowup_log2,
             blind,
+            ..Options::default()
         })?;
         assert_eq!(circuit.num_rows(), 3);
-        assert_eq!(circuit.degree_bound(), expected_degree_bound);
+        assert_eq!(circuit.pcs_config().degree_bound, expected_degree_bound);
         assert_eq!(circuit.num_columns(), 3);
-        assert_eq!(circuit.blowup_log2(), blowup_log2);
+        assert_eq!(circuit.pcs_config().blowup_log2, blowup_log2);
         assert_eq!(circuit.is_blinded(), blind);
         assert_eq!(circuit.num_gates(), 3);
         assert_eq!(circuit.get_max_gate_degree(), 2);
@@ -2535,10 +2601,10 @@ mod tests {
         witness.set(cell(2, 1), 35u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
         let proof = circuit.prove::<H>(witness)?;
-        assert_eq!(proof.degree_bound(), expected_degree_bound);
-        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(proof.pcs_config().degree_bound, expected_degree_bound);
+        assert_eq!(proof.pcs_config().blowup_log2, blowup_log2);
         assert_eq!(
-            proof.extended_domain_size(),
+            proof.pcs_config().extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
         assert_eq!(proof.num_polys(), expected_num_polys);
@@ -2552,14 +2618,14 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_bluesky_sha2_blowup_2() {
-        let c = parse_hash("0x494aac357b6f5ab4823556c990e2103966fcfc21741e75f6fc40179d0f78d0ff");
+        let c = parse_hash("0xa50d56f230b7d6aa3fad7d4155aeb9f81c1466209d744d0fbda7b899eccb6a85");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 1, false, 4, 17, c).is_ok()
         );
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 1, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0x80a860428464e9e7bc1143980f8b134724db4599b8fb8dedd9f7dc73d4a19bf9");
+        let c = parse_hash("0x3874914bb99178730b56609b7cf8649c63521642f174f1c43e8a8c77decda9e7");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 1, true, 256, 22, c).is_ok()
         );
@@ -2570,26 +2636,25 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_2() {
-        let c = parse_hash("0x5d238c3c08b337ff9d66b0a59508bbc3a4d85bdbf646532b828c55d0d60d9b9e");
+        let c = parse_hash("0xecae9813182a1afce0664ecfd0263989aad15f0df9fa15e90e58dcf0b34c32da");
         assert!(
             test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, false, 4, 17, c).is_ok()
         );
         assert!(
             test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0x3b4edcaab8d47a24310fe41411b6fd5a46cd0b9ba8ba3a4b8693e76148ec460e");
+        let c = parse_hash("0x68ee1cfdfa3a715d14e171b2cebf79fc8963eeb233faaa865b8b4f57d886ad8a");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, true, 1024, 19, c)
-                .is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 1, true, 256, 23, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, true, 1024, 19, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 1, true, 256, 23, c).is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_keccak256_blowup_2() {
-        let c = parse_hash("0xc4cd8b7e35b24ceeb0f496b261f4e050a8d169a1c7810c708b8acd2f5a5cda51");
+        let c = parse_hash("0x2fdb065db07faf4e0f3e870f3ca5fa071d4cf723f0ec4cf7e166548c1c7459a6");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 1, false, 4, 17, c)
                 .is_ok()
@@ -2598,7 +2663,7 @@ mod tests {
             test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 1, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0xe3b395a6ce823af66fcd8b1be7c4a58b15d8e79dc2df372b4490252709af81ae");
+        let c = parse_hash("0x221855b73b09f5c9e1a2e532534e101390550ae09449b1ed29eca8b18aafb9e2");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 1, true, 256, 22, c)
                 .is_ok()
@@ -2611,7 +2676,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_2() {
-        let c = parse_hash("0x86dcdee7e6873eaaa425dfc237fc4c7f77af904988bca7f0cd4c4c400b56bdb5");
+        let c = parse_hash("0x1cfdf49a4ad9c04773c4128e36c829ee6d56f3346da61a007455db3eca87fae6");
         assert!(
             test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, false, 4, 17, c)
                 .is_ok()
@@ -2620,27 +2685,27 @@ mod tests {
             test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0x4d4cc9e8eaaa01296defbcdb321057793799af019e5aa176b74bc636d2167d11");
+        let c = parse_hash("0x2791a00c7ec8c5b7d4eac400e53d126db196d6120e3b082bac6403452ef9f444");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, true, 1024, 19, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 1, true, 256, 23, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, true, 1024, 19, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 1, true, 256, 23, c)
                 .is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_sha2_blowup_4() {
-        let c = parse_hash("0x29e743ccb630504a114568903ca3a50d45084a38c05efc7ed373f137d93b378e");
+        let c = parse_hash("0x2eddc3df755eeeff8491387aa63c6c550b3a812fb01b203ccd0d73a503cde9fc");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 2, false, 4, 17, c).is_ok()
         );
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 2, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0x9688c0d20c3c3e29ec873448e2c9266bdf5438b952d77783219e0ed6c6df5735");
+        let c = parse_hash("0xca7f024475d882ab88e97cef2e34449a36857f01e30c3ba66c521738d1a3ad74");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 2, true, 128, 22, c).is_ok()
         );
@@ -2651,25 +2716,25 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_4() {
-        let c = parse_hash("0x3a1e72c5b00277cc520e0effd8bd1569fae66f60cdbee8908edbc21d11872b42");
+        let c = parse_hash("0x0cb0571df8b19c5167198e7b67641235ab4305c4decc42e1e533d6ec0ab30b01");
         assert!(
             test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, false, 4, 17, c).is_ok()
         );
         assert!(
             test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0x4c7d7516620c03a08d99b33688e2a9fdc3808b45d87dd69aa95ca85ca38fdd0c");
+        let c = parse_hash("0xe939cc71a8bc5951e3eb50859cb1c2c1f77c2e494728e936ff06f301b2d464c5");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, true, 512, 19, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 2, true, 128, 23, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, true, 512, 19, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 2, true, 128, 23, c).is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_keccak256_blowup_4() {
-        let c = parse_hash("0x25cba5a6d07e62bee1099521f0179b9a4c5a753695f5ff346e1c20fef6325362");
+        let c = parse_hash("0x74e0e2cbaf2170be82b0bc2f1d407f1ce6e38d531c427a7bf31be193f5e5257a");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 2, false, 4, 17, c)
                 .is_ok()
@@ -2678,7 +2743,7 @@ mod tests {
             test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 2, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0x27e4d3433480cea82eb942faa06f6ca8fca6b70eff7489e4f68447aa2dcdc4ca");
+        let c = parse_hash("0xed353f3eec35bd94fe35ed6b738028cd213663446ee0a0eabc7a640b6de4c02c");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 2, true, 128, 22, c)
                 .is_ok()
@@ -2691,7 +2756,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_4() {
-        let c = parse_hash("0x3fe4a6cc0d5570499ce1585875ffcd518881c5f4c69caa0b9eeeb74937a78c2c");
+        let c = parse_hash("0x808cb587d04173c9993e688ff4c9bbd481028c9e63cb7c2597bd231b89c5a977");
         assert!(
             test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, false, 4, 17, c)
                 .is_ok()
@@ -2700,27 +2765,27 @@ mod tests {
             test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0xa36a483e1102e89fee83608b007dada44fb8ad4af6de70b169cac1e53770bba0");
+        let c = parse_hash("0x58d79bf08258beffed986ed8876ca43c85b43b5faf439940b921ff3ae915aa38");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, true, 512, 19, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 2, true, 128, 23, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, true, 512, 19, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 2, true, 128, 23, c)
                 .is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_sha2_blowup_8() {
-        let c = parse_hash("0x5e09e011e83803e439e5e6b2239681a673e701087cfb737143b49681f1569295");
+        let c = parse_hash("0x8645a6a5c02132e38660559175a2f44645670d6ce2e681224dda072c69621b0e");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 3, false, 4, 17, c).is_ok()
         );
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(true, 3, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0xbe3e4c72baa3bb138ed2308ddbd92545f0d4c823eaa9a8ee0568efc9700cc57b");
+        let c = parse_hash("0x490c6c69659224c08a8bd8a1a7631a995cd698cae763d5ca4ddb9688d062fd62");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Sha2Hash<BS>>(false, 3, true, 64, 26, c).is_ok()
         );
@@ -2731,25 +2796,25 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_sha2_blowup_8() {
-        let c = parse_hash("0xd0d162bd36980cd1aa2dd012e23b91ee810691a6c41a7aea1703c235dd73ab16");
+        let c = parse_hash("0x6fcdfcb37af00d5698120b5c79a417063daed0173f1a95cf27b28afca3f03f02");
         assert!(
             test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, false, 4, 17, c).is_ok()
         );
         assert!(
             test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, false, 4, 17, c).is_ok()
         );
-        let c = parse_hash("0xd5ea16b3a4e9d498575a4c0e104e37c021d10a9a3bad6957a31f15c0c0256ddf");
+        let c = parse_hash("0x649e0a30be12a68a298346ac25c37d956dd39cf90734b1fc77dde4ff6a4f5cc9");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, true, 256, 19, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(false, 3, true, 64, 27, c).is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, true, 256, 19, c).is_ok()
+            test_vitalik_circuit_impl::<GL, GL4, Sha2Hash<GL4>>(true, 3, true, 64, 27, c).is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_bluesky_keccak256_blowup_8() {
-        let c = parse_hash("0x918cf20623717b6dd0e0aa6940f7627ee4ea905c5371812ec2578553fbd1cd35");
+        let c = parse_hash("0xf7df798f43941cbb9b65dea803848702fa8c6ab71946c35fee2269d9a040443a");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 3, false, 4, 17, c)
                 .is_ok()
@@ -2758,7 +2823,7 @@ mod tests {
             test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(true, 3, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0xac29596abf76483cc6322f88ee5e1e5f1f79263931872111715c8f18cc3648f1");
+        let c = parse_hash("0x6cff59a9db40aa47a7c131662154ccc54fb4e35eeaee1f7efb41856e480bfc45");
         assert!(
             test_vitalik_circuit_impl::<BS, BS, Keccak256Hash<BS>>(false, 3, true, 64, 26, c)
                 .is_ok()
@@ -2771,7 +2836,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_goldilocks_keccak256_blowup_8() {
-        let c = parse_hash("0xbcc0b716b9a6e0cadd9f9d7649c292d309de3d31ab1e96e4be3bec100f3b4567");
+        let c = parse_hash("0x6668ecb9015d90696479cc2a26336e0cb25014a44ad35df7f03f515b3d92536b");
         assert!(
             test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, false, 4, 17, c)
                 .is_ok()
@@ -2780,13 +2845,13 @@ mod tests {
             test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, false, 4, 17, c)
                 .is_ok()
         );
-        let c = parse_hash("0xf140ccebb14a5d8916177696f89577d8cd01ac78fc55baacb37f6559d7899210");
+        let c = parse_hash("0xec6aec9cb67616eccfe67e85f7e41e444d2ffae98fb9bf81c42716966ceebe28");
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, true, 256, 19, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(false, 3, true, 64, 27, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, true, 256, 19, c)
+            test_vitalik_circuit_impl::<GL, GL4, Keccak256Hash<GL4>>(true, 3, true, 64, 27, c)
                 .is_ok()
         );
     }
@@ -2825,11 +2890,12 @@ mod tests {
             canonicalize_constraints,
             blowup_log2,
             blind,
+            ..Options::default()
         })?;
         assert_eq!(circuit.num_rows(), 4);
-        assert_eq!(circuit.degree_bound(), expected_degree_bound);
+        assert_eq!(circuit.pcs_config().degree_bound, expected_degree_bound);
         assert_eq!(circuit.num_columns(), 4);
-        assert_eq!(circuit.blowup_log2(), blowup_log2);
+        assert_eq!(circuit.pcs_config().blowup_log2, blowup_log2);
         assert_eq!(circuit.is_blinded(), blind);
         assert_eq!(circuit.num_gates(), 3);
         assert_eq!(circuit.get_max_gate_degree(), 2);
@@ -2851,10 +2917,10 @@ mod tests {
         witness.set(cell(3, 2), 44u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
         let proof = circuit.prove::<H>(witness)?;
-        assert_eq!(proof.degree_bound(), expected_degree_bound);
-        assert_eq!(proof.blowup_log2(), blowup_log2);
+        assert_eq!(proof.pcs_config().degree_bound, expected_degree_bound);
+        assert_eq!(proof.pcs_config().blowup_log2, blowup_log2);
         assert_eq!(
-            proof.extended_domain_size(),
+            proof.pcs_config().extended_domain_size(),
             expected_degree_bound << blowup_log2
         );
         assert_eq!(proof.num_polys(), expected_num_polys);
@@ -2869,7 +2935,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_variation_bluesky_blowup_2() {
-        let c = parse_hash("0x0d83bdf8e62a3314f42cff6e5f6a29626ba61473afebcbe56ec726c62f8c48df");
+        let c = parse_hash("0x14663a22fd17d00655866bc603dc22665a44c462944b02e944cc5c92066d353b");
         assert!(
             test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 1, false, 4, 20, c)
                 .is_ok()
@@ -2878,7 +2944,7 @@ mod tests {
             test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 1, false, 4, 20, c)
                 .is_ok()
         );
-        let c = parse_hash("0x53afd92a276e95d9a93af6afcf530d5c8422b003f75589cc69312bad21d28286");
+        let c = parse_hash("0x278b49ff044bad2b27d0675183d892bdd9dd8583e260e33f2c09ed6713f3247c");
         assert!(
             test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 1, true, 256, 25, c)
                 .is_ok()
@@ -2891,7 +2957,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_variation_goldilocks_blowup_2() {
-        let c = parse_hash("0x7bbc068b0d252dbadd69b5880ad25d66fcc06fe9b4bbd74baca914018f29b97f");
+        let c = parse_hash("0x2424fd36f2070b3236830ea5e1e7a45fcf432f4b92f00b216566c6f604f6148d");
         assert!(
             test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, false, 4, 20, c)
                 .is_ok()
@@ -2900,20 +2966,20 @@ mod tests {
             test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, false, 4, 20, c)
                 .is_ok()
         );
-        let c = parse_hash("0x0991c338e2e47af4e218965ba5deca587bbd5063920aa85b5a43d67163c43b80");
+        let c = parse_hash("0xd2d12ff566c124df52858f9e93f81744f4912da6b0f8f97e084982fcfef52982");
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, true, 1024, 22, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 1, true, 256, 25, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, true, 1024, 22, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 1, true, 256, 25, c)
                 .is_ok()
         );
     }
 
     #[test]
     fn test_vitalik_circuit_variation_bluesky_blowup_4() {
-        let c = parse_hash("0xd0356eba7d6d5f06968ffa2d3804ab14123faeadcff5066c458d484ef005253e");
+        let c = parse_hash("0xb1ddc8f1c8e08467da59ba69a419315dff00e34574eed905045f97252194c1d6");
         assert!(
             test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 2, false, 4, 20, c)
                 .is_ok()
@@ -2922,7 +2988,7 @@ mod tests {
             test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(true, 2, false, 4, 20, c)
                 .is_ok()
         );
-        let c = parse_hash("0x160b80a89a2424f60b8e1e58a9753ca069f06778421e692bbf1c1ef22f11b816");
+        let c = parse_hash("0xaa379c376de2dc63538a2dfe80d566d73062b222a2c9fbd1109d9f37b9bba56a");
         assert!(
             test_vitalik_circuit_variation::<BS, BS, Sha2Hash<BS>>(false, 2, true, 128, 25, c)
                 .is_ok()
@@ -2935,7 +3001,7 @@ mod tests {
 
     #[test]
     fn test_vitalik_circuit_variation_goldilocks_blowup_4() {
-        let c = parse_hash("0xbe93c01dfc08b34e8f2efd3a4ed43a893aa199449c9c35a839e64f387450e41d");
+        let c = parse_hash("0xc98a1aa48a73f5a483e70f3b28987d8881f1defa4e975dbbbbf6c9feb6b3c2e0");
         assert!(
             test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 2, false, 4, 20, c)
                 .is_ok()
@@ -2944,19 +3010,39 @@ mod tests {
             test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 2, false, 4, 20, c)
                 .is_ok()
         );
-        let c = parse_hash("0x91b00431753f5bb800349a53b55477b878f74d8c9e8ebed01e841cc45e134296");
+        let c = parse_hash("0x840a4ad7b540a0ba59e3d7851549527608958cd7f2251cdbd5b52213471d30eb");
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 2, true, 512, 22, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(false, 2, true, 128, 25, c)
                 .is_ok()
         );
         assert!(
-            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 2, true, 512, 22, c)
+            test_vitalik_circuit_variation::<GL, GL4, Sha2Hash<GL4>>(true, 2, true, 128, 25, c)
                 .is_ok()
         );
     }
 
+    fn vitalik_circuit_options() -> Options {
+        Options {
+            canonicalize_constraints: false,
+            blowup_log2: 1,
+            blind: false,
+            ..Options::default()
+        }
+    }
+
     fn build_vitalik_circuit() -> Circuit<BS, BS> {
-        let mut builder = CircuitBuilder::<BS, BS>::default();
+        build_vitalik_circuit_with_options(vitalik_circuit_options())
+    }
+
+    fn build_vitalik_circuit_with_options(options: Options) -> Circuit<BS, BS> {
+        build_generic_vitalik_circuit(options)
+    }
+
+    /// Builds Vitalik's circuit over any field.
+    fn build_generic_vitalik_circuit<F: Field, G: Field256<BaseField = F>>(
+        options: Options,
+    ) -> Circuit<F, G> {
+        let mut builder = CircuitBuilder::<F, G>::default();
         builder.add_gate(0, (var(0) ^ 2) - var(1));
         builder.connect(cell(0, 0).into(), cell(1, 0).into());
         builder.connect(cell(0, 1).into(), cell(1, 1).into());
@@ -2965,19 +3051,13 @@ mod tests {
         builder.connect(cell(1, 2).into(), cell(2, 1).into());
         builder.add_gate(2, Constraint::nop());
         builder.declare_public_cells([cell(2, 0), cell(2, 1)]);
-        builder
-            .build(Options {
-                canonicalize_constraints: false,
-                blowup_log2: 1,
-                blind: false,
-            })
-            .unwrap()
+        builder.build(options).unwrap()
     }
 
     #[test]
     fn test_check_witness_detects_wrong_number_of_rows() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(4, 3, circuit.degree_bound());
+        let witness = Witness::new(4, 3, circuit.pcs_config().degree_bound);
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("wrong number of rows"));
     }
@@ -2985,7 +3065,7 @@ mod tests {
     #[test]
     fn test_check_witness_detects_wrong_number_of_columns() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(3, 4, circuit.degree_bound());
+        let witness = Witness::new(3, 4, circuit.pcs_config().degree_bound);
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("wrong number of columns"));
     }
@@ -2993,7 +3073,7 @@ mod tests {
     #[test]
     fn test_check_witness_detects_wrong_degree_bound() {
         let circuit = build_vitalik_circuit();
-        let witness = Witness::new(3, 3, circuit.degree_bound() * 2);
+        let witness = Witness::new(3, 3, circuit.pcs_config().degree_bound * 2);
         let error = circuit.check_witness(&witness).unwrap_err();
         assert!(error.to_string().contains("incorrect degree bound"));
     }
@@ -3047,15 +3127,31 @@ mod tests {
         CompressedCircuit<BS, BS, Sha2Hash<BS>>,
         Proof<BS, BS, Sha2Hash<BS>>,
     ) {
-        let circuit = build_vitalik_circuit();
+        prove_vitalik_circuit_with_options(vitalik_circuit_options())
+    }
+
+    fn prove_vitalik_circuit_with_options(
+        options: Options,
+    ) -> (
+        CompressedCircuit<BS, BS, Sha2Hash<BS>>,
+        Proof<BS, BS, Sha2Hash<BS>>,
+    ) {
+        prove_generic_vitalik_circuit(options)
+    }
+
+    /// Builds Vitalik's circuit over any field and proves it with a valid witness.
+    fn prove_generic_vitalik_circuit<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>(
+        options: Options,
+    ) -> (CompressedCircuit<F, G, H>, Proof<F, G, H>) {
+        let circuit = build_generic_vitalik_circuit::<F, G>(options);
         let mut witness = circuit.make_witness();
-        witness.set(cell(0, 0), from_const(3));
-        witness.set(cell(0, 1), from_const(9));
-        witness.set(cell(1, 0), from_const(3));
-        witness.set(cell(1, 1), from_const(9));
-        witness.set(cell(1, 2), from_const(35));
-        witness.set(cell(2, 0), from_const(3));
-        witness.set(cell(2, 1), from_const(35));
+        witness.set(cell(0, 0), 3u8.into());
+        witness.set(cell(0, 1), 9u8.into());
+        witness.set(cell(1, 0), 3u8.into());
+        witness.set(cell(1, 1), 9u8.into());
+        witness.set(cell(1, 2), 35u8.into());
+        witness.set(cell(2, 0), 3u8.into());
+        witness.set(cell(2, 1), 35u8.into());
         let proof = circuit.prove(witness).unwrap();
         (circuit.to_compressed(), proof)
     }
@@ -3149,6 +3245,121 @@ mod tests {
     }
 
     #[test]
+    fn test_circuit_batch_over_extension_field_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_CIRCUIT].base_field = false;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the circuit polynomials must be over the base field")
+        );
+    }
+
+    /// A witness committed over `G` rather than `F` wouldn't be proven to be over `F`.
+    #[test]
+    fn test_witness_batch_over_extension_field_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_WITNESS].base_field = false;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the witness polynomials must be over the base field")
+        );
+    }
+
+    #[test]
+    fn test_permutation_argument_batch_over_base_field_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_PERMUTATION_ARGUMENT].base_field = true;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the permutation argument polynomials must not be over the base field")
+        );
+    }
+
+    #[test]
+    fn test_quotient_batch_over_base_field_is_rejected() {
+        let (circuit, mut proof) = prove_vitalik_circuit();
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_QUOTIENT].base_field = true;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the polynomials in the quotient batch must not be over the base field")
+        );
+    }
+
+    /// Vitalik's circuit has 3 witness columns, one fewer than the extension degree of
+    /// Goldilocks^4, so blinding adds one witness randomizer.
+    #[test]
+    fn test_blinded_witness_batch_is_padded_to_extension_degree() {
+        let (circuit, proof) = prove_generic_vitalik_circuit::<GL, GL4, Sha2Hash<GL4>>(Options {
+            blind: true,
+            ..vitalik_circuit_options()
+        });
+        let batch = proof.commitment.batches()[COMMIT_INDEX_WITNESS];
+        assert!(batch.base_field());
+        assert_eq!(batch.num_polys(), 4);
+        assert!(circuit.verify(&proof).is_ok());
+    }
+
+    #[test]
+    fn test_unblinded_witness_batch_is_not_padded() {
+        let (circuit, proof) = prove_generic_vitalik_circuit::<GL, GL4, Sha2Hash<GL4>>(Options {
+            blind: false,
+            ..vitalik_circuit_options()
+        });
+        let batch = proof.commitment.batches()[COMMIT_INDEX_WITNESS];
+        assert!(batch.base_field());
+        assert_eq!(batch.num_polys(), 3);
+        assert!(circuit.verify(&proof).is_ok());
+    }
+
+    /// The extension degree of BlueSky over itself is 1.
+    #[test]
+    fn test_blinded_witness_batch_is_not_padded_with_bluesky() {
+        let (circuit, proof) = prove_vitalik_circuit_with_options(Options {
+            blind: true,
+            ..vitalik_circuit_options()
+        });
+        let batch = proof.commitment.batches()[COMMIT_INDEX_WITNESS];
+        assert!(batch.base_field());
+        assert_eq!(batch.num_polys(), 3);
+        assert!(circuit.verify(&proof).is_ok());
+    }
+
+    #[test]
+    fn test_witness_batch_without_randomizer_is_rejected() {
+        let (circuit, mut proof) =
+            prove_generic_vitalik_circuit::<GL, GL4, Sha2Hash<GL4>>(Options {
+                blind: true,
+                ..vitalik_circuit_options()
+            });
+        let mut commitment = proof.commitment.to_proto();
+        commitment.batches[COMMIT_INDEX_WITNESS].num_polys -= 1;
+        commitment.batches[COMMIT_INDEX_PERMUTATION_ARGUMENT].num_polys += 1;
+        proof.commitment = pcs::Commitment::from_proto(&commitment).unwrap();
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid number of witness polynomials")
+        );
+    }
+
+    #[test]
     fn test_extra_opening_is_not_reported_as_public() {
         let (circuit, mut proof) = prove_vitalik_circuit();
         proof.public_inputs.insert(cell(1, 2), from_const(35));
@@ -3160,7 +3371,7 @@ mod tests {
     #[test]
     fn test_oversized_selector_is_rejected() {
         let mut proto = build_vitalik_circuit().to_proto();
-        let degree_bound = proto.degree_bound as usize;
+        let degree_bound = proto.pcs_config.as_ref().unwrap().degree_bound as usize;
         proto.selectors[0]
             .coefficients
             .resize(degree_bound + 1, vec![1]);
@@ -3352,5 +3563,138 @@ mod tests {
         let circuit = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap();
         let error = circuit.verify(&proof).unwrap_err();
         assert!(error.to_string().contains("too small for blinding"));
+    }
+
+    #[test]
+    fn test_blinded_circuit_with_grinding() {
+        // 8 grinding bits bring the queries from 128 down to 120, so the 3 rows and the 123
+        // blinding rows fit in 128 rather than 256.
+        let (circuit, proof) = prove_vitalik_circuit_with_options(Options {
+            grinding_bits: 8,
+            blind: true,
+            ..vitalik_circuit_options()
+        });
+        assert_eq!(circuit.pcs_config().degree_bound, 128);
+        assert_eq!(circuit.pcs_config().grinding_bits, 8);
+        assert_eq!(proof.pcs_config(), circuit.pcs_config());
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_circuit_with_fri_rounds() {
+        let (circuit, proof) = prove_vitalik_circuit_with_options(Options {
+            fri_fold_rate: 2,
+            max_fri_rounds: 1,
+            ..vitalik_circuit_options()
+        });
+        assert_eq!(circuit.pcs_config().fold_rate, 2);
+        assert_eq!(circuit.pcs_config().max_rounds, 1);
+        assert_eq!(proof.pcs_config().num_rounds(), 1);
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    fn test_mismatched_pcs_config_is_rejected_impl(
+        circuit_options: Options,
+        proof_options: Options,
+    ) {
+        let (circuit, _) = prove_vitalik_circuit_with_options(circuit_options);
+        let (_, proof) = prove_vitalik_circuit_with_options(proof_options);
+        let error = circuit.verify(&proof).unwrap_err();
+        assert!(error.to_string().contains("PCS settings mismatch"));
+    }
+
+    #[test]
+    fn test_mismatched_pcs_config_is_rejected() {
+        test_mismatched_pcs_config_is_rejected_impl(
+            vitalik_circuit_options(),
+            Options {
+                fri_fold_rate: 2,
+                ..vitalik_circuit_options()
+            },
+        );
+        test_mismatched_pcs_config_is_rejected_impl(
+            vitalik_circuit_options(),
+            Options {
+                max_fri_rounds: 1,
+                ..vitalik_circuit_options()
+            },
+        );
+        test_mismatched_pcs_config_is_rejected_impl(
+            Options {
+                grinding_bits: 8,
+                ..vitalik_circuit_options()
+            },
+            vitalik_circuit_options(),
+        );
+    }
+
+    #[test]
+    fn test_proof_with_more_grinding_bits_is_accepted() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let (_, proof) = prove_vitalik_circuit_with_options(Options {
+            grinding_bits: 8,
+            ..vitalik_circuit_options()
+        });
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_pcs_config_serialization() {
+        let circuit = build_vitalik_circuit_with_options(Options {
+            fri_fold_rate: 2,
+            max_fri_rounds: 1,
+            grinding_bits: 8,
+            ..vitalik_circuit_options()
+        });
+        let pcs_config = *circuit.pcs_config();
+        let proto = circuit.to_proto();
+        let compressed_circuit = circuit.to_compressed::<Sha2Hash<BS>>();
+        let circuit = Circuit::<BS, BS>::from_proto(&proto).unwrap();
+        let compressed_circuit =
+            CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&compressed_circuit.to_proto())
+                .unwrap();
+        assert_eq!(*circuit.pcs_config(), pcs_config);
+        assert_eq!(*compressed_circuit.pcs_config(), pcs_config);
+    }
+
+    #[test]
+    fn test_circuit_without_pcs_config_is_rejected() {
+        let mut proto = build_vitalik_circuit().to_proto();
+        proto.pcs_config = None;
+        let error = Circuit::<BS, BS>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("missing PCS settings"));
+    }
+
+    #[test]
+    fn test_compressed_circuit_without_pcs_config_is_rejected() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.pcs_config = None;
+        let error = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
+        assert!(error.to_string().contains("missing PCS settings"));
+    }
+
+    #[test]
+    fn test_circuit_with_invalid_fold_rate_is_rejected() {
+        let mut proto = build_vitalik_circuit().to_proto();
+        proto.pcs_config.as_mut().unwrap().fold_rate = 0;
+        assert!(Circuit::<BS, BS>::from_proto(&proto).is_err());
+    }
+
+    #[test]
+    fn test_compressed_circuit_with_too_many_grinding_bits_is_rejected() {
+        let (circuit, _) = prove_vitalik_circuit();
+        let mut proto = circuit.to_proto();
+        proto.pcs_config.as_mut().unwrap().grinding_bits = pcs::PROOF_OF_WORK_BITS as u32 + 1;
+        assert!(CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).is_err());
     }
 }
