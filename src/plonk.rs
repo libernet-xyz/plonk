@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 pub const OPTIONS_DEFAULT_BLOWUP_LOG2: usize = 4;
 
 const COMMIT_INDEX_CIRCUIT: usize = 0;
-pub(crate) const COMMIT_INDEX_WITNESS: usize = 1;
+const COMMIT_INDEX_WITNESS: usize = 1;
 const COMMIT_INDEX_PERMUTATION_ARGUMENT: usize = 2;
 const COMMIT_INDEX_QUOTIENT: usize = 3;
 const NUM_COMMIT_INDICES: usize = 4;
@@ -922,53 +922,14 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> Proof<F, G, H> {
 }
 
 impl<G: PrimeField256, H: Hasher<G>> Proof<G, G, H> {
-    /// Serializes this proof to SCPF, the Starkom Compact Proof Format.
+    /// Serializes this proof to SCPF, the Starkom Compact Proof Format, which minimizes the gas
+    /// cost of sending it to EVM verifiers.
     ///
-    /// SCPF is the binary format of the proofs sent to EVM verifiers, and it minimizes the gas
-    /// cost of the calldata and of decoding it (see the `starkom-scpf` crate). It only supports
-    /// prime fields of about 256 bits, e.g. BlueSky. The data is made of a header, a pool of
-    /// 32-byte words, and a stream in which unsigned integers are varints, field elements are
-    /// inline 32-byte words holding their big-endian integer values, and hashes are pool
-    /// references, i.e. the varint positions of their words in the pool.
-    ///
-    /// The layout identifier is the Keccak-256 hash of `starkom.proto.plonk.v10.Proof`, and the
-    /// stream holds, in this order:
-    ///
-    /// 1. the values of the public inputs in increasing order of cell (by row, then by column), as
-    ///    inline words;
-    /// 2. the Merkle roots of the witness, permutation argument, and quotient batches of the
-    ///    commitment, as pool references;
-    /// 3. the `security_bits` and `grinding_bits` parameters of the inner DEEP-FRI proof and its
-    ///    proof-of-work nonce, as varints;
-    /// 4. for every opened point in increasing order of X-coordinate, its evaluations, as inline
-    ///    words;
-    /// 5. the Merkle roots of the FRI folding rounds of the inner proof, as pool references, then
-    ///    the number of coefficients of the folded quotient as a varint, followed by the
-    ///    coefficients, as inline words;
-    /// 6. for every query of the inner proof, the opening of every batch in commitment order (the
-    ///    leaf values as inline words, then the Merkle path from the leaf up as pool references),
-    ///    followed by the folds of all the rounds in order (the coset values as inline words, then
-    ///    the Merkle path from the root of the coset subtree up as pool references).
-    ///
-    /// The stream follows the fields of the [`Proof`](`proto::Proof`) protobuf, which the proof is
-    /// serialized to and then transcoded from, except that the batch openings and the FRI queries
-    /// are interleaved rather than following each other, so that a verifier can check every query
-    /// as soon as it reads it.
-    ///
-    /// The values that the verifier derives from the circuit (see [`CompressedCircuit`]) aren't
-    /// encoded: the public cells, the number of batches and the shape of every batch (the number
-    /// of polynomials and whether they're over the base field), the Merkle root of the circuit
-    /// batch, the other parameters of the inner proof, which must be those of the circuit, and the
-    /// X-coordinates of the opened points, which are `xi * omega^r` for every rotation `r` of the
-    /// circuit, `xi` being a Fiat-Shamir challenge. The verifier sorts them to match them with
-    /// their evaluations. Neither are the values that it derives from the parameters, i.e. the
-    /// numbers of FRI roots, queries, leaf values, coset values, and hashes of every Merkle path,
-    /// nor the query indices, which it derives from the proof of work. The hash backend isn't
-    /// encoded either, so decoders must know it in advance.
-    ///
-    /// NOTE: decoders rely on the shape of the proof that they derive from the circuit, so the
-    /// data of a proof that doesn't have it, e.g. one with extra public inputs or opened points,
-    /// doesn't decode to the same proof.
+    /// The proof is serialized to its [protobuf](`proto::Proof`) and transcoded to SCPF with the
+    /// layout specified in [`SCPF.md`](https://github.com/libernet-xyz/plonk/blob/main/SCPF.md).
+    /// The format itself is specified in
+    /// [`FORMAT.md`](https://github.com/libernet-xyz/scpf/blob/main/FORMAT.md) in the `scpf`
+    /// repository.
     pub fn to_scpf(&self) -> Vec<u8> {
         scpf::encode_proof::<G>(&self.to_proto())
     }

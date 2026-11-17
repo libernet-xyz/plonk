@@ -1,4 +1,3 @@
-use crate::plonk::COMMIT_INDEX_WITNESS;
 use crate::starkom::proto::plonk::v10 as proto;
 use crate::utils;
 use starkom_ff::PrimeField256;
@@ -16,8 +15,8 @@ fn push_hashes(encoder: &mut Encoder, hashes: &[Vec<u8>]) {
     encoder.push_hashes(hashes.iter().map(|hash| utils::load_hash(hash).unwrap()));
 }
 
-/// Transcodes the protobuf of a [PLONK proof](`proto::Proof`) to SCPF, with the layout described in
-/// [`Proof::to_scpf`](`crate::Proof::to_scpf`).
+/// Transcodes the protobuf of a [PLONK proof](`proto::Proof`) to SCPF, with the layout specified in
+/// `SCPF.md`.
 ///
 /// REQUIRES: `proof` must come from [`Proof::to_proto`](`crate::Proof::to_proto`).
 pub(crate) fn encode_proof<F: PrimeField256>(proof: &proto::Proof) -> Vec<u8> {
@@ -35,7 +34,7 @@ pub(crate) fn encode_proof<F: PrimeField256>(proof: &proto::Proof) -> Vec<u8> {
         commitment
             .batches
             .iter()
-            .skip(COMMIT_INDEX_WITNESS)
+            .skip(1) // skip the circuit batch
             .map(|batch| utils::load_hash(&batch.root).unwrap()),
     );
     encoder.push_u64(inner_proof.security_bits.into());
