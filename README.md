@@ -19,6 +19,13 @@ Zero-knowledge is optional in Starkom and you need to enable it explicitly in th
 The system is field-agnostic: it can run on any finite field as long as it has sufficient
 two-adicity (for FRI to run) and implements the [`starkom-ff`][starkom-ff] interface.
 
+Proofs can be serialized to and deserialized from [protobufs][protobuf]. Proofs over ~256-bit prime
+fields (e.g. [BlueSky][bluesky]) can also be serialized to [SCPF][starkom-scpf], the Starkom Compact
+Proof Format, which minimizes the gas cost for verification on the Ethereum Virtual Machine.
+
 [blind-option]: https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.Options.html#structfield.blind
+[bluesky]: https://crates.io/crates/starkom-bluesky
+[protobuf]: https://protobuf.dev/
 [starkom-ff]: https://crates.io/crates/starkom-ff
 [starkom-pcs]: https://crates.io/crates/starkom-pcs
+[starkom-scpf]: https://crates.io/crates/starkom-scpf

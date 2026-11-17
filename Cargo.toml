@@ -1,6 +1,6 @@
 [package]
 name = "starkom-plonk"
-version = "10.0.0"
+version = "10.1.0"
 description = "The PLONK arithmetization scheme used in Starkom."
 license = "Apache-2.0"
 repository = "https://github.com/libernet-xyz/plonk.git"
@@ -28,6 +28,7 @@ starkom-koalabear = "2.0.0"
 starkom-pcs = "10.0.0"
 starkom-poly = "4.6.4"
 starkom-schraderbrau = "2.0.0"
+starkom-scpf = "1.0.1"
 
 [build-dependencies]
 prost-build = "0.14.4"

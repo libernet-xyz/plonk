@@ -18,6 +18,7 @@ mod expr;
 mod lexer;
 mod parser;
 mod plonk;
+mod scpf;
 mod utils;
 mod witness;
 
