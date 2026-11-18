@@ -776,6 +776,8 @@ dependencies = [
 [[package]]
 name = "starkom-pcs"
 version = "11.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "444a2aa694f3f0a7f88eb901c27ac1ca6192d0cfddeb8fa1041615d836bd0367"
 dependencies = [
  "anyhow",
  "primitive-types",
@@ -860,9 +862,9 @@ dependencies = [
 
 [[package]]
 name = "starkom-scpf"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb822f974d166acc0d73814584c8df363c7f5a27e38b01262d3b4077d94fa73d"
+checksum = "a1e86541050e833de12eaf9e16def7cf5b81b5d4ea2093b4539e57cd0a3b96c0"
 dependencies = [
  "primitive-types",
  "prost",

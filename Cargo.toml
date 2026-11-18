@@ -25,10 +25,10 @@ starkom-bluesky = "4.0.1"
 starkom-ff = "5.0.2"
 starkom-goldilocks = "4.0.0"
 starkom-koalabear = "2.0.0"
-starkom-pcs = { version = "11.0.0", path = "../pcs" }
+starkom-pcs = "11.0.0"
 starkom-poly = "4.6.4"
 starkom-schraderbrau = "2.0.0"
-starkom-scpf = "1.0.1"
+starkom-scpf = "1.0.2"
 
 [build-dependencies]
 prost-build = "0.14.4"
