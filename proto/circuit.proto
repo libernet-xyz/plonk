@@ -51,7 +51,7 @@ message GateConstraint {
   // Only positive exponents can be serialized. Negative exponents (field inversions) must be
   // removed when building the circuit, before serialization, because they can't be proven. See the
   // docs for the `canonicalize_constraints` flag for details:
-  // https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.Options.html#structfield.canonicalize_constraints
+  // https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.CircuitOptions.html#structfield.canonicalize_constraints
   message Power {
     Variable variable = 1;
     uint64 exponent = 2;
