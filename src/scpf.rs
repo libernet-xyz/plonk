@@ -1,4 +1,4 @@
-use crate::starkom::proto::plonk::v10 as proto;
+use crate::starkom::proto::plonk::v11 as proto;
 use crate::utils;
 use starkom_ff::PrimeField256;
 use starkom_scpf::Encoder;

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 import "google/protobuf/any.proto";
 
-package starkom.proto.plonk.v10;
+package starkom.proto.plonk.v11;
 
 // Settings for the underlying polynomial commitment scheme.
 message PcsConfig {
@@ -34,7 +34,7 @@ message PcsConfig {
   // `log2(degree_bound) / fold_rate`, rounded down. Rather than being folded further, the
   // polynomial resulting from the last round is sent in the clear. With 0 there's no folding at all
   // and the whole DEEP quotient is sent in the clear.
-  uint64 max_rounds = 5;
+  uint32 max_rounds = 5;
 
   // Number of grinding bits.
   //

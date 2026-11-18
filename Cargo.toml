@@ -1,12 +1,12 @@
 [package]
 name = "starkom-plonk"
-version = "10.1.0"
+version = "11.0.0"
 description = "The PLONK arithmetization scheme used in Starkom."
 license = "Apache-2.0"
 repository = "https://github.com/libernet-xyz/plonk.git"
 readme = "README.md"
 edition = "2024"
-links = "starkom-plonk-v10"
+links = "starkom-plonk-v11"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -25,7 +25,7 @@ starkom-bluesky = "4.0.1"
 starkom-ff = "5.0.2"
 starkom-goldilocks = "4.0.0"
 starkom-koalabear = "2.0.0"
-starkom-pcs = "10.0.0"
+starkom-pcs = { version = "11.0.0", path = "../pcs" }
 starkom-poly = "4.6.4"
 starkom-schraderbrau = "2.0.0"
 starkom-scpf = "1.0.1"

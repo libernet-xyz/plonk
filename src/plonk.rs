@@ -1,7 +1,7 @@
 use crate::chip::Chip;
 use crate::expr::{Constraint, Variable};
 use crate::scpf;
-use crate::starkom::proto::plonk::v10 as proto;
+use crate::starkom::proto::plonk::v11 as proto;
 use crate::utils::{self, encode_cell, encode_usize, padded_circuit_size};
 use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
 use anyhow::{Result, anyhow};
@@ -192,14 +192,14 @@ fn pcs_config_to_proto(config: &pcs::Options) -> proto::PcsConfig {
         security_bits: config.security_bits as u32,
         blowup_log2: config.blowup_log2 as u32,
         fold_rate: config.fold_rate as u32,
-        max_rounds: config.max_rounds as u64,
+        max_rounds: config.max_rounds as u32,
         grinding_bits: config.grinding_bits as u32,
     }
 }
 
 fn pcs_config_from_proto<F: Field>(proto: &proto::PcsConfig) -> Result<pcs::Options> {
     let config = pcs::Options {
-        degree_bound: proto.degree_bound as usize,
+        degree_bound: usize::try_from(proto.degree_bound)?,
         security_bits: proto.security_bits as usize,
         blowup_log2: proto.blowup_log2 as usize,
         fold_rate: proto.fold_rate as usize,
@@ -243,7 +243,8 @@ pub struct Options {
     pub fri_fold_rate: usize,
 
     /// Maximum number of FRI folding rounds (see [`pcs::Options::max_rounds`]). The polynomial left
-    /// after the last round is sent in the clear, so 0 sends the whole DEEP quotient.
+    /// after the last round is sent in the clear, so 0 sends the whole DEEP quotient. Must not
+    /// exceed [`pcs::MAX_FRI_ROUNDS`], which is the default and stands for no limit.
     ///
     /// NOTE: specifying 0 does not impact zero-knowledge. If the [`blind`](`Self::blind`) flag is
     /// enabled it will be infeasible for an external observer to derive the original witness
@@ -271,7 +272,7 @@ impl Default for Options {
             security_bits: 128,
             blowup_log2: OPTIONS_DEFAULT_BLOWUP_LOG2,
             fri_fold_rate: 1,
-            max_fri_rounds: usize::MAX,
+            max_fri_rounds: pcs::MAX_FRI_ROUNDS,
             grinding_bits: 0,
             blind: false,
         }
@@ -937,7 +938,7 @@ impl<G: PrimeField256, H: Hasher<G>> Proof<G, G, H> {
 
 impl Name for proto::Proof {
     const NAME: &'static str = "Proof";
-    const PACKAGE: &'static str = "starkom.proto.plonk.v10";
+    const PACKAGE: &'static str = "starkom.proto.plonk.v11";
 
     /// Returns the type URL of the message, prefixed with `type.starkom.io` like the ones of the
     /// messages of `starkom-pcs`.
@@ -2112,13 +2113,6 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             ));
         }
 
-        if !inner_proof.options().satisfies(&self.pcs_config) {
-            return Err(anyhow!(
-                "PCS settings mismatch (got {:?}, want {:?})",
-                inner_proof.options(),
-                self.pcs_config
-            ));
-        }
         let degree_bound = self.pcs_config.degree_bound;
 
         let num_gate_selectors = self
@@ -2241,7 +2235,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
             })
             .collect::<Result<_>>()?;
 
-        inner_proof.verify(&commitment)?;
+        inner_proof.verify(&self.pcs_config, commitment)?;
 
         let sigma: Vec<G> = {
             let offset = num_gate_selectors;
@@ -3631,8 +3625,7 @@ mod tests {
     ) {
         let (circuit, _) = prove_vitalik_circuit_with_options(circuit_options);
         let (_, proof) = prove_vitalik_circuit_with_options(proof_options);
-        let error = circuit.verify(&proof).unwrap_err();
-        assert!(error.to_string().contains("PCS settings mismatch"));
+        assert!(circuit.verify(&proof).is_err());
     }
 
     #[test]
@@ -3640,14 +3633,7 @@ mod tests {
         test_mismatched_pcs_config_is_rejected_impl(
             vitalik_circuit_options(),
             Options {
-                fri_fold_rate: 2,
-                ..vitalik_circuit_options()
-            },
-        );
-        test_mismatched_pcs_config_is_rejected_impl(
-            vitalik_circuit_options(),
-            Options {
-                max_fri_rounds: 1,
+                security_bits: 120,
                 ..vitalik_circuit_options()
             },
         );
@@ -3657,6 +3643,55 @@ mod tests {
                 ..vitalik_circuit_options()
             },
             vitalik_circuit_options(),
+        );
+    }
+
+    fn test_proof_with_other_fri_settings_is_accepted_impl(
+        circuit_options: Options,
+        proof_options: Options,
+    ) {
+        let (circuit, _) = prove_vitalik_circuit_with_options(circuit_options);
+        let (_, proof) = prove_vitalik_circuit_with_options(proof_options);
+        let public_inputs = circuit.verify(&proof).unwrap();
+        assert_eq!(public_inputs.len(), 2);
+        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
+        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
+    }
+
+    #[test]
+    fn test_proof_with_other_fri_settings_is_accepted() {
+        test_proof_with_other_fri_settings_is_accepted_impl(
+            vitalik_circuit_options(),
+            Options {
+                fri_fold_rate: 2,
+                ..vitalik_circuit_options()
+            },
+        );
+        test_proof_with_other_fri_settings_is_accepted_impl(
+            vitalik_circuit_options(),
+            Options {
+                max_fri_rounds: 1,
+                ..vitalik_circuit_options()
+            },
+        );
+        test_proof_with_other_fri_settings_is_accepted_impl(
+            vitalik_circuit_options(),
+            Options {
+                max_fri_rounds: 0,
+                ..vitalik_circuit_options()
+            },
+        );
+        test_proof_with_other_fri_settings_is_accepted_impl(
+            Options {
+                blind: true,
+                ..vitalik_circuit_options()
+            },
+            Options {
+                fri_fold_rate: 2,
+                max_fri_rounds: 1,
+                blind: true,
+                ..vitalik_circuit_options()
+            },
         );
     }
 
@@ -3716,6 +3751,31 @@ mod tests {
         assert!(Circuit::<BS, BS>::from_proto(&proto).is_err());
     }
 
+    /// Checks that both [`Circuit::from_proto`] and [`CompressedCircuit::from_proto`] reject PCS
+    /// settings with the given degree bound.
+    fn test_invalid_degree_bound_is_rejected_impl(degree_bound: u64) {
+        let mut proto = build_vitalik_circuit().to_proto();
+        proto.pcs_config.as_mut().unwrap().degree_bound = degree_bound;
+        let (compressed_circuit, _) = prove_vitalik_circuit();
+        let mut compressed_proto = compressed_circuit.to_proto();
+        compressed_proto.pcs_config.as_mut().unwrap().degree_bound = degree_bound;
+        assert!(Circuit::<BS, BS>::from_proto(&proto).is_err());
+        assert!(CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&compressed_proto).is_err());
+    }
+
+    #[test]
+    fn test_degree_bound_truncated_on_32_bit_platforms_is_rejected() {
+        // On 32-bit platforms `as usize` would truncate these to the honest degree bound.
+        let degree_bound = build_vitalik_circuit().pcs_config().degree_bound as u64;
+        test_invalid_degree_bound_is_rejected_impl((1 << 32) + degree_bound);
+        test_invalid_degree_bound_is_rejected_impl((1 << 40) + degree_bound);
+    }
+
+    #[test]
+    fn test_huge_degree_bound_is_rejected() {
+        test_invalid_degree_bound_is_rejected_impl(u64::MAX);
+    }
+
     #[test]
     fn test_compressed_circuit_with_too_many_grinding_bits_is_rejected() {
         let (circuit, _) = prove_vitalik_circuit();
@@ -3765,19 +3825,19 @@ mod tests {
     /// with root 0x55 and one query. Every hash appears once.
     fn small_proof() -> Proof<BS, BS, Keccak256Hash<BS>> {
         let hash_backend = prost_types::Any::from_msg(
-            &pcs::starkom::proto::pcs::v10::KeccakHashBackend::default(),
+            &pcs::starkom::proto::pcs::v11::KeccakHashBackend::default(),
         )
         .unwrap();
-        let batch = |root: u8| pcs::starkom::proto::pcs::v10::commitment::Batch {
+        let batch = |root: u8| pcs::starkom::proto::pcs::v11::commitment::Batch {
             base_field: false,
             num_polys: 1,
             root: vec![root; 32],
         };
-        let leaf_proof = |value: u64, sibling: u8| pcs::starkom::proto::pcs::v10::MerkleProof {
+        let leaf_proof = |value: u64, sibling: u8| pcs::starkom::proto::pcs::v11::MerkleProof {
             leaf_values: vec![proto_scalar(value)],
             merkle_path: vec![vec![sibling; 32]],
         };
-        let point = |z: u64, values: [u64; 4]| pcs::starkom::proto::pcs::v10::proof::Point {
+        let point = |z: u64, values: [u64; 4]| pcs::starkom::proto::pcs::v11::proof::Point {
             z: proto_scalar(z),
             v: values.map(proto_scalar).to_vec(),
         };
@@ -3788,11 +3848,11 @@ mod tests {
         };
         Proof::from_proto(&proto::Proof {
             public_inputs: vec![public_input(2, 1, 35), public_input(2, 0, 3)],
-            commitment: Some(pcs::starkom::proto::pcs::v10::Commitment {
+            commitment: Some(pcs::starkom::proto::pcs::v11::Commitment {
                 hash_backend: Some(hash_backend.clone()),
                 batches: vec![batch(0x11), batch(0x22), batch(0x33), batch(0x44)],
             }),
-            inner_proof: Some(pcs::starkom::proto::pcs::v10::Proof {
+            inner_proof: Some(pcs::starkom::proto::pcs::v11::Proof {
                 hash_backend: Some(hash_backend),
                 degree_bound: 4,
                 security_bits: 128,
@@ -3804,7 +3864,7 @@ mod tests {
                 points: vec![point(456, [67, 68, 69, 70]), point(123, [45, 46, 47, 48])],
                 fri_roots: vec![vec![0x55; 32]],
                 folded_quotient: vec![proto_scalar(7)],
-                openings: vec![pcs::starkom::proto::pcs::v10::proof::Opening {
+                openings: vec![pcs::starkom::proto::pcs::v11::proof::Opening {
                     proofs: vec![
                         leaf_proof(10, 0xa1),
                         leaf_proof(11, 0xa2),
@@ -3812,9 +3872,9 @@ mod tests {
                         leaf_proof(13, 0xa4),
                     ],
                 }],
-                queries: vec![pcs::starkom::proto::pcs::v10::Query {
+                queries: vec![pcs::starkom::proto::pcs::v11::Query {
                     index: 5,
-                    folds: vec![pcs::starkom::proto::pcs::v10::query::LeafProof {
+                    folds: vec![pcs::starkom::proto::pcs::v11::query::LeafProof {
                         coset_values: vec![proto_scalar(20), proto_scalar(21)],
                         merkle_path: vec![vec![0xdd; 32]],
                     }],
@@ -3828,11 +3888,11 @@ mod tests {
     fn test_proof_full_name() {
         assert_eq!(
             <proto::Proof as Name>::full_name(),
-            "starkom.proto.plonk.v10.Proof"
+            "starkom.proto.plonk.v11.Proof"
         );
         assert_eq!(
             <proto::Proof as Name>::type_url(),
-            "type.starkom.io/starkom.proto.plonk.v10.Proof"
+            "type.starkom.io/starkom.proto.plonk.v11.Proof"
         );
     }
 
@@ -3840,7 +3900,7 @@ mod tests {
     fn test_proof_layout_identifier() {
         assert_eq!(
             starkom_scpf::layout_identifier::<proto::Proof>(),
-            parse_hash("0x781bb0c4b3513d20fb38966e93697ab9c21ea4d2e48cc19ae82d8d00cd1c015e")
+            parse_hash("0x7cda700e3097eeb7a607a078ad72d656f380990a899edb365d555d4948470125")
         );
     }
 
@@ -3908,7 +3968,7 @@ mod tests {
         assert_eq!(data.len(), 91402);
         assert_eq!(
             keccak256(data.as_slice()),
-            parse_hash("0xef57ed2339c6d0f00ffcef44bdffc2eedeb4dc6990c9148c67aa9469eb67c724")
+            parse_hash("0x912d0c023c98c37de76b771046b7597bd50573deb7cecef9fce6708612c68d48")
         );
     }
 }

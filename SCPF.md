@@ -1,7 +1,7 @@
 # SCPF Layout of PLONK Proofs
 
 This document specifies the layout of the SCPF data of PLONK proofs, i.e. of the
-`starkom.proto.plonk.v10.Proof` protobuf message, as encoded by [`Proof::to_scpf`][to-scpf]. The
+`starkom.proto.plonk.v11.Proof` protobuf message, as encoded by [`Proof::to_scpf`][to-scpf]. The
 binary format itself (the header, the pool, and the encoding of varints, inline words, and pool
 references) is specified in [`FORMAT.md`][format] in the `scpf` repository.
 
@@ -10,7 +10,7 @@ backend isn't encoded, so decoders must know it in advance; EVM verifiers use Ke
 
 ## Header
 
-The layout identifier is `keccak256("starkom.proto.plonk.v10.Proof")`, or `781bb0c4b3513d20fb38966e93697ab9c21ea4d2e48cc19ae82d8d00cd1c015e`.
+The layout identifier is `keccak256("starkom.proto.plonk.v11.Proof")`, or `7cda700e3097eeb7a607a078ad72d656f380990a899edb365d555d4948470125`.
 
 ## Stream
 
@@ -57,8 +57,8 @@ Everything else is derived by the verifier, mostly from the circuit (see `Compre
   - permutation argument: the accumulator and one helper for every column;
   - quotient: the chunks of the quotient, plus one FRI randomizer if the circuit is blinded.
 - The **protocol parameters** other than `security_bits` and `grinding_bits`, i.e. `degree_bound`,
-  `blowup_log2`, `fold_rate`, and `max_rounds`, are those of the circuit. `security_bits` and
-  `grinding_bits` must be at least those of the circuit.
+  `blowup_log2`, `fold_rate`, and `max_rounds`, are those of the circuit. `security_bits` must be
+  equal to that of the circuit, and `grinding_bits` must be at least that of the circuit.
 - The **opened points** are `xi * omega^r` for every rotation `r` of the circuit (which always
   include 0 and 1), `omega` being the generator of the evaluation domain and `xi` the Fiat-Shamir
   challenge derived from the transcript hash of the 4 Merkle roots. Their evaluations are matched to
@@ -74,8 +74,8 @@ Everything else is derived by the verifier, mostly from the circuit (see `Compre
 ## Relation with the protobuf
 
 `Proof::to_scpf` serializes the proof to its protobuf and transcodes the protobuf, so the stream
-follows the fields of `starkom.proto.plonk.v10.Proof` and of the `starkom.proto.pcs.v10.Commitment`
-and `starkom.proto.pcs.v10.Proof` messages that it contains, with two differences:
+follows the fields of `starkom.proto.plonk.v11.Proof` and of the `starkom.proto.pcs.v11.Commitment`
+and `starkom.proto.pcs.v11.Proof` messages that it contains, with two differences:
 
 - the fields that the verifier derives aren't encoded: the hash backends, the circuit root and the
   `base_field` and `num_polys` fields of the batches, `degree_bound`, `blowup_log2`, `fold_rate`,
