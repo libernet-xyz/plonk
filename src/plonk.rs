@@ -19,6 +19,9 @@ use std::sync::LazyLock;
 /// Used with the underlying PCS to compute low-degree extensions.
 pub const OPTIONS_DEFAULT_BLOWUP_LOG2: usize = 4;
 
+/// Default setting for [`pcs::Options::fold_rate`].
+const DEFAULT_FRI_FOLD_RATE: usize = 1;
+
 const COMMIT_INDEX_CIRCUIT: usize = 0;
 const COMMIT_INDEX_WITNESS: usize = 1;
 const COMMIT_INDEX_PERMUTATION_ARGUMENT: usize = 2;
@@ -191,8 +194,6 @@ fn pcs_config_to_proto(config: &pcs::Options) -> proto::PcsConfig {
         degree_bound: config.degree_bound as u64,
         security_bits: config.security_bits as u32,
         blowup_log2: config.blowup_log2 as u32,
-        fold_rate: config.fold_rate as u32,
-        max_rounds: config.max_rounds as u32,
         grinding_bits: config.grinding_bits as u32,
     }
 }
@@ -202,15 +203,20 @@ fn pcs_config_from_proto<F: Field>(proto: &proto::PcsConfig) -> Result<pcs::Opti
         degree_bound: usize::try_from(proto.degree_bound)?,
         security_bits: proto.security_bits as usize,
         blowup_log2: proto.blowup_log2 as usize,
-        fold_rate: proto.fold_rate as usize,
-        max_rounds: proto.max_rounds as usize,
         grinding_bits: proto.grinding_bits as usize,
+
+        // The FRI settings aren't part of the circuit.
+        fold_rate: DEFAULT_FRI_FOLD_RATE,
+        max_rounds: pcs::MAX_FRI_ROUNDS,
     };
     config.validate::<F>()?;
     Ok(config)
 }
 
-/// Circuit compilation & proving options.
+/// Circuit compilation options.
+///
+/// The FRI settings of the underlying PCS aren't part of a circuit, because they don't affect it:
+/// every proof chooses its own (see [`ProofOptions`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     /// Converts all constraints to canonical form using [`Constraint::canonicalize`].
@@ -238,23 +244,19 @@ pub struct Options {
     /// Log2 of the blowup factor used to compute the low-degree extensions for the underlying PCS.
     pub blowup_log2: usize,
 
-    /// Number of FRI folds per round, i.e. the base-2 logarithm of the folding arity (see
-    /// [`pcs::Options::fold_rate`]). Must be greater than 0.
-    pub fri_fold_rate: usize,
-
-    /// Maximum number of FRI folding rounds (see [`pcs::Options::max_rounds`]). The polynomial left
-    /// after the last round is sent in the clear, so 0 sends the whole DEEP quotient. Must not
-    /// exceed [`pcs::MAX_FRI_ROUNDS`], which is the default and stands for no limit.
+    /// The minimum number of proof-of-work bits that verifiers require from the proofs of the
+    /// circuit (see [`pcs::Options::grinding_bits`]). It's also the default of the proofs, which
+    /// can use more (see [`ProofOptions::grinding_bits`]). Must not exceed 256.
     ///
-    /// NOTE: specifying 0 does not impact zero-knowledge. If the [`blind`](`Self::blind`) flag is
-    /// enabled it will be infeasible for an external observer to derive the original witness
-    /// regardless of the number of FRI rounds. `max_fri_rounds` and
-    /// [`fri_fold_rate`](`Self::fri_fold_rate`) are only for proof size optimization.
-    pub max_fri_rounds: usize,
-
-    /// Number of proof-of-work bits required by the underlying PCS (see
-    /// [`pcs::Options::grinding_bits`]). Every grinding bit lowers the number of FRI queries, and
-    /// therefore the number of blinding rows of blinded circuits. Must not exceed 256.
+    /// Every grinding bit lowers the number of FRI queries, so the minimum determines the largest
+    /// number of queries of a proof, and therefore the blinding of blinded circuits: their blinding
+    /// rows and the masks of their quotient chunks are always sized for it, even in proofs with
+    /// more grinding bits.
+    ///
+    /// NOTE: to grind more than a circuit requires, prove with that same circuit and pass the
+    /// [`ProofOptions`] to [`Circuit::prove`]. A blinded circuit built with more grinding bits
+    /// requires more, and sizes its blinding for fewer queries, so its proofs don't verify
+    /// against this circuit even if the two have the same commitment.
     pub grinding_bits: usize,
 
     /// Indicates whether or not blinding must be added to the circuit. In other words, this flag
@@ -271,12 +273,41 @@ impl Default for Options {
             canonicalize_constraints: false,
             security_bits: 128,
             blowup_log2: OPTIONS_DEFAULT_BLOWUP_LOG2,
-            fri_fold_rate: 1,
-            max_fri_rounds: pcs::MAX_FRI_ROUNDS,
             grinding_bits: 0,
             blind: false,
         }
     }
+}
+
+/// The settings of the underlying PCS that every proof chooses on its own, independently of the
+/// circuit (see [`Circuit::prove`]).
+///
+/// The other settings, i.e. the degree bound, the security level, and the blowup factor, are fixed
+/// by the circuit, which also determines the minimum number of grinding bits. Verifiers accept
+/// every proof that [satisfies](`pcs::Options::satisfies`) them, whatever its `ProofOptions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofOptions {
+    /// Number of FRI folds per round, i.e. the base-2 logarithm of the folding arity (see
+    /// [`pcs::Options::fold_rate`]). Must be greater than 0.
+    pub fri_fold_rate: usize,
+
+    /// Maximum number of FRI folding rounds (see [`pcs::Options::max_rounds`]). The polynomial left
+    /// after the last round is sent in the clear, so 0 sends the whole DEEP quotient.
+    ///
+    /// This field must not exceed [`pcs::MAX_FRI_ROUNDS`], which stands for no limit.
+    ///
+    /// NOTE: specifying 0 does not impact zero-knowledge. If the circuit is
+    /// [blinded](`Options::blind`) it will be infeasible for an external observer to recover the
+    /// original witness regardless of the number of FRI rounds. `max_fri_rounds` and
+    /// [`fri_fold_rate`](`Self::fri_fold_rate`) only trade proof size for verification cost.
+    pub max_fri_rounds: usize,
+
+    /// Number of proof-of-work bits (see [`pcs::Options::grinding_bits`]). Must be at least the
+    /// minimum required by the circuit in [`Options::grinding_bits`], and must not exceed 256.
+    ///
+    /// Every grinding bit above the minimum lowers the number of FRI queries, and therefore the
+    /// size of the proof, at the cost of a longer proof-of-work search.
+    pub grinding_bits: usize,
 }
 
 pub trait CircuitView<F: Field, G: Field256<BaseField = F>> {
@@ -735,9 +766,11 @@ impl<F: Field, G: Field256<BaseField = F>> CircuitBuilder<F, G> {
                 degree_bound,
                 security_bits: options.security_bits,
                 blowup_log2: options.blowup_log2,
-                fold_rate: options.fri_fold_rate,
-                max_rounds: options.max_fri_rounds,
                 grinding_bits: options.grinding_bits,
+
+                // The FRI settings aren't part of the circuit.
+                fold_rate: DEFAULT_FRI_FOLD_RATE,
+                max_rounds: pcs::MAX_FRI_ROUNDS,
             },
             blinded: options.blind,
             selectors,
@@ -1011,8 +1044,23 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         self.blinded
     }
 
+    /// Returns the settings of the underlying PCS.
+    ///
+    /// The FRI settings, which aren't part of the circuit, are those of
+    /// [`Self::default_proof_options`].
     pub fn pcs_config(&self) -> &pcs::Options {
         &self.pcs_config
+    }
+
+    /// Returns the default options of the proofs of this circuit: one FRI fold per round, no limit
+    /// on the number of FRI rounds, and the minimum number of grinding bits of the circuit (see
+    /// [`Options::grinding_bits`]).
+    pub fn default_proof_options(&self) -> ProofOptions {
+        ProofOptions {
+            fri_fold_rate: self.pcs_config.fold_rate,
+            max_fri_rounds: self.pcs_config.max_rounds,
+            grinding_bits: self.pcs_config.grinding_bits,
+        }
     }
 
     pub fn num_gates(&self) -> usize {
@@ -1188,10 +1236,13 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         )
     }
 
-    /// Builds a PCS committer with the circuit batch: the gate selectors, the sigma polynomials,
-    /// and the circuit area selector, all over the base field `F`.
-    fn make_committer<H: Hasher<G>>(&self) -> pcs::Committer<G, H> {
-        let mut committer = pcs::Committer::<G, H>::new(self.pcs_config);
+    /// Builds a PCS committer with the given options and the circuit batch: the gate selectors, the
+    /// sigma polynomials, and the circuit area selector, all over the base field `F`.
+    ///
+    /// The circuit batch doesn't depend on the [proof-specific settings](`ProofOptions`), so
+    /// neither does the circuit commitment.
+    fn make_committer<H: Hasher<G>>(&self, options: pcs::Options) -> pcs::Committer<G, H> {
+        let mut committer = pcs::Committer::<G, H>::new(options);
         committer.add_base_batch(
             self.selectors
                 .iter()
@@ -1614,9 +1665,44 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             .collect()
     }
 
-    /// Proves correctness of the given witness, or returns an error in case of a constraint
-    /// violation.
-    pub fn prove<H: Hasher<G>>(&self, mut witness: Witness<F>) -> Result<Proof<F, G, H>> {
+    /// Builds the final PCS configuration combining the [settings of the circuit](`Options`) with
+    /// the [proof-specific ones](`ProofOptions`).
+    ///
+    /// Returns an error if the specified `options` are invalid as per [`pcs::Options::validate`],
+    /// or if they don't satisfy those of the circuit (for example if
+    /// [`grinding_bits`](`ProofOptions::grinding_bits`) is insufficient).
+    fn proof_pcs_config(&self, options: &ProofOptions) -> Result<pcs::Options> {
+        let config = pcs::Options {
+            fold_rate: options.fri_fold_rate,
+            max_rounds: options.max_fri_rounds,
+            grinding_bits: options.grinding_bits,
+            ..self.pcs_config
+        };
+        config.validate::<G>()?;
+        if !config.satisfies(&self.pcs_config) {
+            return Err(anyhow!(
+                "too few grinding bits (got {}, the circuit requires at least {})",
+                options.grinding_bits,
+                self.pcs_config.grinding_bits
+            ));
+        }
+        Ok(config)
+    }
+
+    /// Proves correctness of the given witness with the given options, or returns an error in case
+    /// of a constraint violation or of invalid options.
+    ///
+    /// Use [`Self::default_proof_options`] for the defaults of the circuit. The proof verifies
+    /// against this circuit with any valid options, as long as they have at least as many
+    /// grinding bits as the circuit requires (see [`ProofOptions`]). The options only affect the
+    /// proof size and its verification cost.
+    pub fn prove<H: Hasher<G>>(
+        &self,
+        mut witness: Witness<F>,
+        options: &ProofOptions,
+    ) -> Result<Proof<F, G, H>> {
+        let pcs_config = self.proof_pcs_config(options)?;
+
         if self.blinded {
             witness.blind();
         }
@@ -1644,7 +1730,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
             ));
         }
 
-        let mut committer = self.make_committer::<H>();
+        let mut committer = self.make_committer::<H>(pcs_config);
 
         let columns = witness.clone().encode();
         committer.add_base_batch(
@@ -1757,7 +1843,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     }
 
     pub fn to_compressed<H: Hasher<G>>(self) -> CompressedCircuit<F, G, H> {
-        let committer = self.make_committer::<H>();
+        let committer = self.make_committer::<H>(self.pcs_config);
         CompressedCircuit {
             num_rows: self.num_rows,
             num_columns: self.num_columns,
@@ -1775,7 +1861,7 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
     }
 
     pub fn as_compressed<H: Hasher<G>>(&self) -> CompressedCircuit<F, G, H> {
-        let committer = self.make_committer::<H>();
+        let committer = self.make_committer::<H>(self.pcs_config);
         CompressedCircuit {
             num_rows: self.num_rows,
             num_columns: self.num_columns,
@@ -1794,6 +1880,8 @@ impl<F: Field, G: Field256<BaseField = F>> Circuit<F, G> {
         }
     }
 
+    /// Verifies a [`Proof`] like [`CompressedCircuit::verify`] does, including its warning about
+    /// the cost of verification.
     pub fn verify<H: Hasher<G>>(&self, proof: &Proof<F, G, H>) -> Result<BTreeMap<Cell, F>> {
         self.as_compressed::<H>().verify(proof)
     }
@@ -2033,6 +2121,7 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
         self.blinded
     }
 
+    /// Returns the settings of the underlying PCS (see [`Circuit::pcs_config`]).
     pub fn pcs_config(&self) -> &pcs::Options {
         &self.pcs_config
     }
@@ -2093,6 +2182,20 @@ impl<F: Field, G: Field256<BaseField = F>, H: Hasher<G>> CompressedCircuit<F, G,
     ///
     /// The returned map has exactly one entry for every cell in [`Self::public_cells`]. Any extra
     /// opening the proof may carry is ignored.
+    ///
+    /// The proof is accepted with any FRI settings and any number of grinding bits that satisfy the
+    /// settings of the circuit (see [`ProofOptions`]).
+    ///
+    /// WARNING: the prover chooses the FRI settings, and with them the cost of verification. The
+    /// polynomial left after the last folding round is sent in the clear and evaluated at every
+    /// query, so for example with [`max_fri_rounds`](`ProofOptions::max_fri_rounds`) set to 0
+    /// verification takes `O(num_queries * degree_bound)` field operations, and the proof carries
+    /// `degree_bound` more field elements. That's not a soundness issue, but verifiers of untrusted
+    /// proofs that must bound their costs should check the settings of the proof (see
+    /// [`Proof::pcs_config`]) before verifying it, e.g. by rejecting proofs whose folded
+    /// polynomial has more than a given number of coefficients
+    /// (`degree_bound >> (num_rounds * fold_rate)`, see [`pcs::Options::num_rounds`]). EVM
+    /// verifiers don't need to, because the submitter of the proof pays for the gas.
     pub fn verify(&self, proof: &Proof<F, G, H>) -> Result<BTreeMap<Cell, F>> {
         let commitment = &proof.commitment;
         let inner_proof = &proof.inner_proof;
@@ -2620,7 +2723,7 @@ mod tests {
         witness.set(cell(2, 0), 3u8.into());
         witness.set(cell(2, 1), 35u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
-        let proof = circuit.prove::<H>(witness)?;
+        let proof = circuit.prove::<H>(witness, &circuit.default_proof_options())?;
         assert_eq!(proof.pcs_config().degree_bound, expected_degree_bound);
         assert_eq!(proof.pcs_config().blowup_log2, blowup_log2);
         assert_eq!(
@@ -2936,7 +3039,7 @@ mod tests {
         witness.set(cell(3, 1), 4u8.into());
         witness.set(cell(3, 2), 44u8.into());
         assert!(circuit.check_witness(&witness).is_ok());
-        let proof = circuit.prove::<H>(witness)?;
+        let proof = circuit.prove::<H>(witness, &circuit.default_proof_options())?;
         assert_eq!(proof.pcs_config().degree_bound, expected_degree_bound);
         assert_eq!(proof.pcs_config().blowup_log2, blowup_log2);
         assert_eq!(
@@ -3159,11 +3262,11 @@ mod tests {
         prove_generic_vitalik_circuit(options)
     }
 
-    /// Builds Vitalik's circuit over any field and proves it with a valid witness.
-    fn prove_generic_vitalik_circuit<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>(
-        options: Options,
-    ) -> (CompressedCircuit<F, G, H>, Proof<F, G, H>) {
-        let circuit = build_generic_vitalik_circuit::<F, G>(options);
+    /// Returns a valid witness for Vitalik's circuit, proving that 3 is a solution of
+    /// `x^3 + x + 5 = 35`.
+    fn make_vitalik_witness<F: Field, G: Field256<BaseField = F>>(
+        circuit: &Circuit<F, G>,
+    ) -> Witness<F> {
         let mut witness = circuit.make_witness();
         witness.set(cell(0, 0), 3u8.into());
         witness.set(cell(0, 1), 9u8.into());
@@ -3172,7 +3275,21 @@ mod tests {
         witness.set(cell(1, 2), 35u8.into());
         witness.set(cell(2, 0), 3u8.into());
         witness.set(cell(2, 1), 35u8.into());
-        let proof = circuit.prove(witness).unwrap();
+        witness
+    }
+
+    /// Builds Vitalik's circuit over any field and proves it with a valid witness and the default
+    /// proof options of the circuit.
+    fn prove_generic_vitalik_circuit<F: Field, G: Field256<BaseField = F>, H: Hasher<G>>(
+        options: Options,
+    ) -> (CompressedCircuit<F, G, H>, Proof<F, G, H>) {
+        let circuit = build_generic_vitalik_circuit::<F, G>(options);
+        let proof = circuit
+            .prove(
+                make_vitalik_witness(&circuit),
+                &circuit.default_proof_options(),
+            )
+            .unwrap();
         (circuit.to_compressed(), proof)
     }
 
@@ -3451,7 +3568,9 @@ mod tests {
         witness.set(cell(1, 2), from_const(35));
         witness.set(cell(2, 0), from_const(3));
         witness.set(cell(2, 1), from_const(35));
-        let proof = circuit.prove::<Sha2Hash<BS>>(witness).unwrap();
+        let proof = circuit
+            .prove::<Sha2Hash<BS>>(witness, &circuit.default_proof_options())
+            .unwrap();
         let circuit = Circuit::<BS, BS>::from_proto(&circuit.to_proto()).unwrap();
         let public_inputs = circuit.verify(&proof).unwrap();
         assert_eq!(public_inputs.len(), 2);
@@ -3603,22 +3722,6 @@ mod tests {
         assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
     }
 
-    #[test]
-    fn test_circuit_with_fri_rounds() {
-        let (circuit, proof) = prove_vitalik_circuit_with_options(Options {
-            fri_fold_rate: 2,
-            max_fri_rounds: 1,
-            ..vitalik_circuit_options()
-        });
-        assert_eq!(circuit.pcs_config().fold_rate, 2);
-        assert_eq!(circuit.pcs_config().max_rounds, 1);
-        assert_eq!(proof.pcs_config().num_rounds(), 1);
-        let public_inputs = circuit.verify(&proof).unwrap();
-        assert_eq!(public_inputs.len(), 2);
-        assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
-        assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
-    }
-
     fn test_mismatched_pcs_config_is_rejected_impl(
         circuit_options: Options,
         proof_options: Options,
@@ -3646,53 +3749,169 @@ mod tests {
         );
     }
 
-    fn test_proof_with_other_fri_settings_is_accepted_impl(
+    #[test]
+    fn test_default_proof_options() {
+        let circuit = build_vitalik_circuit_with_options(Options {
+            grinding_bits: 8,
+            ..vitalik_circuit_options()
+        });
+        assert_eq!(
+            circuit.default_proof_options(),
+            ProofOptions {
+                fri_fold_rate: 1,
+                max_fri_rounds: pcs::MAX_FRI_ROUNDS,
+                grinding_bits: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn test_proof_options_are_used() {
+        let circuit = build_vitalik_circuit_with_options(Options {
+            grinding_bits: 8,
+            ..vitalik_circuit_options()
+        });
+        let options = ProofOptions {
+            fri_fold_rate: 2,
+            max_fri_rounds: 1,
+            grinding_bits: 12,
+        };
+        let proof = circuit
+            .prove::<Sha2Hash<BS>>(make_vitalik_witness(&circuit), &options)
+            .unwrap();
+        assert_eq!(
+            *proof.pcs_config(),
+            pcs::Options {
+                fold_rate: 2,
+                max_rounds: 1,
+                grinding_bits: 12,
+                ..*circuit.pcs_config()
+            }
+        );
+    }
+
+    /// Builds Vitalik's circuit with `circuit_options`, proves it with `proof_options`, and
+    /// checks that the proof verifies against the circuit.
+    fn test_proof_with_proof_options_is_accepted_impl(
         circuit_options: Options,
-        proof_options: Options,
+        proof_options: ProofOptions,
     ) {
-        let (circuit, _) = prove_vitalik_circuit_with_options(circuit_options);
-        let (_, proof) = prove_vitalik_circuit_with_options(proof_options);
-        let public_inputs = circuit.verify(&proof).unwrap();
+        let circuit = build_vitalik_circuit_with_options(circuit_options);
+        let proof = circuit
+            .prove::<Sha2Hash<BS>>(make_vitalik_witness(&circuit), &proof_options)
+            .unwrap();
+        let public_inputs = circuit
+            .to_compressed::<Sha2Hash<BS>>()
+            .verify(&proof)
+            .unwrap();
         assert_eq!(public_inputs.len(), 2);
         assert_eq!(public_inputs[&cell(2, 0)], from_const(3));
         assert_eq!(public_inputs[&cell(2, 1)], from_const(35));
     }
 
     #[test]
-    fn test_proof_with_other_fri_settings_is_accepted() {
-        test_proof_with_other_fri_settings_is_accepted_impl(
-            vitalik_circuit_options(),
-            Options {
-                fri_fold_rate: 2,
+    fn test_proof_with_more_grinding_bits_than_the_circuit_is_accepted() {
+        // A blinded circuit sizes the masks of its quotient for the largest number of queries,
+        // i.e. for its minimum number of grinding bits, so a proof with more grinding bits (and
+        // fewer queries) must keep the same masks.
+        for blind in [false, true] {
+            for grinding_bits in [12, 16, 20] {
+                test_proof_with_proof_options_is_accepted_impl(
+                    Options {
+                        grinding_bits: 8,
+                        blind,
+                        ..vitalik_circuit_options()
+                    },
+                    ProofOptions {
+                        fri_fold_rate: 1,
+                        max_fri_rounds: pcs::MAX_FRI_ROUNDS,
+                        grinding_bits,
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_proof_with_other_fri_settings_than_the_circuit_is_accepted() {
+        for blind in [false, true] {
+            let circuit_options = Options {
+                grinding_bits: 8,
+                blind,
                 ..vitalik_circuit_options()
-            },
-        );
-        test_proof_with_other_fri_settings_is_accepted_impl(
-            vitalik_circuit_options(),
-            Options {
-                max_fri_rounds: 1,
-                ..vitalik_circuit_options()
-            },
-        );
-        test_proof_with_other_fri_settings_is_accepted_impl(
-            vitalik_circuit_options(),
-            Options {
-                max_fri_rounds: 0,
-                ..vitalik_circuit_options()
-            },
-        );
-        test_proof_with_other_fri_settings_is_accepted_impl(
-            Options {
-                blind: true,
-                ..vitalik_circuit_options()
-            },
-            Options {
-                fri_fold_rate: 2,
-                max_fri_rounds: 1,
-                blind: true,
-                ..vitalik_circuit_options()
-            },
-        );
+            };
+            test_proof_with_proof_options_is_accepted_impl(
+                circuit_options.clone(),
+                ProofOptions {
+                    fri_fold_rate: 2,
+                    max_fri_rounds: pcs::MAX_FRI_ROUNDS,
+                    grinding_bits: 8,
+                },
+            );
+            test_proof_with_proof_options_is_accepted_impl(
+                circuit_options.clone(),
+                ProofOptions {
+                    fri_fold_rate: 1,
+                    max_fri_rounds: 1,
+                    grinding_bits: 8,
+                },
+            );
+            test_proof_with_proof_options_is_accepted_impl(
+                circuit_options.clone(),
+                ProofOptions {
+                    fri_fold_rate: 1,
+                    max_fri_rounds: 0,
+                    grinding_bits: 8,
+                },
+            );
+            test_proof_with_proof_options_is_accepted_impl(
+                circuit_options,
+                ProofOptions {
+                    fri_fold_rate: 2,
+                    max_fri_rounds: 1,
+                    grinding_bits: 16,
+                },
+            );
+        }
+    }
+
+    /// Builds Vitalik's circuit with 8 grinding bits and checks that proving it with
+    /// `proof_options` fails.
+    fn test_invalid_proof_options_are_rejected_impl(proof_options: ProofOptions) {
+        let circuit = build_vitalik_circuit_with_options(Options {
+            grinding_bits: 8,
+            ..vitalik_circuit_options()
+        });
+        let result = circuit.prove::<Sha2Hash<BS>>(make_vitalik_witness(&circuit), &proof_options);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_proof_with_fewer_grinding_bits_than_the_circuit_is_rejected() {
+        test_invalid_proof_options_are_rejected_impl(ProofOptions {
+            fri_fold_rate: 1,
+            max_fri_rounds: pcs::MAX_FRI_ROUNDS,
+            grinding_bits: 7,
+        });
+    }
+
+    #[test]
+    fn test_invalid_proof_options_are_rejected() {
+        test_invalid_proof_options_are_rejected_impl(ProofOptions {
+            fri_fold_rate: 0,
+            max_fri_rounds: pcs::MAX_FRI_ROUNDS,
+            grinding_bits: 8,
+        });
+        test_invalid_proof_options_are_rejected_impl(ProofOptions {
+            fri_fold_rate: 1,
+            max_fri_rounds: pcs::MAX_FRI_ROUNDS + 1,
+            grinding_bits: 8,
+        });
+        test_invalid_proof_options_are_rejected_impl(ProofOptions {
+            fri_fold_rate: 1,
+            max_fri_rounds: pcs::MAX_FRI_ROUNDS,
+            grinding_bits: pcs::PROOF_OF_WORK_BITS + 1,
+        });
     }
 
     #[test]
@@ -3711,8 +3930,6 @@ mod tests {
     #[test]
     fn test_pcs_config_serialization() {
         let circuit = build_vitalik_circuit_with_options(Options {
-            fri_fold_rate: 2,
-            max_fri_rounds: 1,
             grinding_bits: 8,
             ..vitalik_circuit_options()
         });
@@ -3742,13 +3959,6 @@ mod tests {
         proto.pcs_config = None;
         let error = CompressedCircuit::<BS, BS, Sha2Hash<BS>>::from_proto(&proto).unwrap_err();
         assert!(error.to_string().contains("missing PCS settings"));
-    }
-
-    #[test]
-    fn test_circuit_with_invalid_fold_rate_is_rejected() {
-        let mut proto = build_vitalik_circuit().to_proto();
-        proto.pcs_config.as_mut().unwrap().fold_rate = 0;
-        assert!(Circuit::<BS, BS>::from_proto(&proto).is_err());
     }
 
     /// Checks that both [`Circuit::from_proto`] and [`CompressedCircuit::from_proto`] reject PCS
@@ -3928,9 +4138,9 @@ mod tests {
                 &scpf_scalar(35)[..],
                 // The roots of the witness, permutation argument, and quotient batches.
                 &[0, 1, 2][..],
-                // The degree bound, the security level (128 takes two bytes), the blowup factor, the
-                // fold rate, the maximum number of rounds, the grinding bits, and the nonce (300
-                // takes two bytes).
+                // The degree bound, the security level (128 takes two bytes), the blowup factor,
+                // the fold rate, the maximum number of rounds, the grinding bits, and the nonce
+                // (300 takes two bytes).
                 &[4, 0x80, 0x80, 2, 1, 1, 8, 0x81, 0x2c][..],
                 // The evaluations at the opened points, in increasing order of X-coordinate.
                 &scpf_scalar(45)[..],

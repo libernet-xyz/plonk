@@ -5,6 +5,9 @@ import "google/protobuf/any.proto";
 package starkom.proto.plonk.v11;
 
 // Settings for the underlying polynomial commitment scheme.
+//
+// Note that the FRI settings, i.e. the fold rate and the maximum number of rounds, aren't part of a
+// circuit, because they don't affect it: every proof chooses its own.
 message PcsConfig {
   // Size of the evaluation domain.
   uint64 degree_bound = 1;
@@ -20,22 +23,6 @@ message PcsConfig {
   // Log2 of the blowup factor.
   uint32 blowup_log2 = 3;
 
-  // Number of FRI folds per round.
-  //
-  // This is the base-2 logarithm of the folding arity: every round folds the DEEP quotient exactly
-  // this many times, reducing the number of required rounds.
-  //
-  // `fold_rate` must be greater than 0.
-  uint32 fold_rate = 4;
-
-  // Maximum number of FRI folding rounds.
-  //
-  // The actual number of rounds is the minimum between this value and
-  // `log2(degree_bound) / fold_rate`, rounded down. Rather than being folded further, the
-  // polynomial resulting from the last round is sent in the clear. With 0 there's no folding at all
-  // and the whole DEEP quotient is sent in the clear.
-  uint32 max_rounds = 5;
-
   // Number of grinding bits.
   //
   // Every proof carries a single proof-of-work nonce whose hash must have at least this many
@@ -45,7 +32,7 @@ message PcsConfig {
   // (and therefore fewer queries) are accepted too.
   //
   // To disable proof-of-work set this field to 0. It must not exceed 256.
-  uint32 grinding_bits = 6;
+  uint32 grinding_bits = 4;
 }
 
 // Describes a polynomial constraint enforced by a `Gate`.
