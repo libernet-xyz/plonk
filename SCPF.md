@@ -20,7 +20,11 @@ The stream holds the following items, in this order:
 | ------------------------------------------------------- | --------------- | ---------------------------------------- |
 | Values of the public inputs                             | Inline words    | One for every public cell of the circuit |
 | Roots of the witness, permutation, and quotient batches | Pool references | 3                                        |
+| `degree_bound` of the DEEP-FRI proof                    | Varint          | 1                                        |
 | `security_bits` of the DEEP-FRI proof                   | Varint          | 1                                        |
+| `blowup_log2` of the DEEP-FRI proof                     | Varint          | 1                                        |
+| `fold_rate` of the DEEP-FRI proof                       | Varint          | 1                                        |
+| `max_rounds` of the DEEP-FRI proof                      | Varint          | 1                                        |
 | `grinding_bits` of the DEEP-FRI proof                   | Varint          | 1                                        |
 | Proof-of-work nonce                                     | Varint          | 1                                        |
 | Evaluations of the committed polynomials                | Inline words    | Number of polynomials × number of points |
@@ -28,6 +32,12 @@ The stream holds the following items, in this order:
 | Number of coefficients of the folded quotient           | Varint          | 1                                        |
 | Coefficients of the folded quotient                     | Inline words    | As many as the previous item says        |
 | Queries                                                 | See below       | Number of queries                        |
+
+The protocol parameters of the DEEP-FRI proof follow the order of the fields of its protobuf.
+Verifiers must check them against those of the circuit, like
+[`pcs::Options::satisfies`][pcs-options-satisfies] does: `degree_bound`, `security_bits`, and
+`blowup_log2` must exactly match those of the circuit, `grinding_bits` must be at least that of the
+circuit, and every proof chooses its own `fold_rate` and `max_rounds`.
 
 The public inputs are in increasing order of cell, i.e. by row and then by column, and the
 evaluations are grouped by point, the points being in increasing order of X-coordinate. Every group
@@ -56,9 +66,6 @@ Everything else is derived by the verifier, mostly from the circuit (see `Compre
     field);
   - permutation argument: the accumulator and one helper for every column;
   - quotient: the chunks of the quotient, plus one FRI randomizer if the circuit is blinded.
-- The **protocol parameters** other than `security_bits` and `grinding_bits`, i.e. `degree_bound`,
-  `blowup_log2`, `fold_rate`, and `max_rounds`, are those of the circuit. `security_bits` must be
-  equal to that of the circuit, and `grinding_bits` must be at least that of the circuit.
 - The **opened points** are `xi * omega^r` for every rotation `r` of the circuit (which always
   include 0 and 1), `omega` being the generator of the evaluation domain and `xi` the Fiat-Shamir
   challenge derived from the transcript hash of the 4 Merkle roots. Their evaluations are matched to
@@ -78,9 +85,8 @@ follows the fields of `starkom.proto.plonk.v11.Proof` and of the `starkom.proto.
 and `starkom.proto.pcs.v11.Proof` messages that it contains, with two differences:
 
 - the fields that the verifier derives aren't encoded: the hash backends, the circuit root and the
-  `base_field` and `num_polys` fields of the batches, `degree_bound`, `blowup_log2`, `fold_rate`,
-  `max_rounds`, the X-coordinates `z` of the points, the cells of the public inputs, and the query
-  indices;
+  `base_field` and `num_polys` fields of the batches, the X-coordinates `z` of the points, the cells
+  of the public inputs, and the query indices;
 - the batch openings and the FRI queries are interleaved rather than following each other, so that
   a verifier can check every query as soon as it reads it.
 
@@ -89,4 +95,5 @@ that doesn't have it, e.g. one with extra public inputs or opened points, doesn'
 proof.
 
 [format]: https://github.com/libernet-xyz/scpf/blob/main/FORMAT.md
+[pcs-options-satisfies]: https://docs.rs/starkom-pcs/latest/starkom_pcs/struct.Options.html#method.satisfies
 [to-scpf]: https://docs.rs/starkom-plonk/latest/starkom_plonk/struct.Proof.html#method.to_scpf

@@ -3928,9 +3928,10 @@ mod tests {
                 &scpf_scalar(35)[..],
                 // The roots of the witness, permutation argument, and quotient batches.
                 &[0, 1, 2][..],
-                // The security level (128 takes two bytes), the grinding bits, and the nonce (300
+                // The degree bound, the security level (128 takes two bytes), the blowup factor, the
+                // fold rate, the maximum number of rounds, the grinding bits, and the nonce (300
                 // takes two bytes).
-                &[0x80, 0x80, 8, 0x81, 0x2c][..],
+                &[4, 0x80, 0x80, 2, 1, 1, 8, 0x81, 0x2c][..],
                 // The evaluations at the opened points, in increasing order of X-coordinate.
                 &scpf_scalar(45)[..],
                 &scpf_scalar(46)[..],
@@ -3965,10 +3966,10 @@ mod tests {
         let (_, proof) =
             prove_generic_vitalik_circuit::<BS, BS, Keccak256Hash<BS>>(vitalik_circuit_options());
         let data = proof.to_scpf();
-        assert_eq!(data.len(), 91402);
+        assert_eq!(data.len(), 91410);
         assert_eq!(
             keccak256(data.as_slice()),
-            parse_hash("0x912d0c023c98c37de76b771046b7597bd50573deb7cecef9fce6708612c68d48")
+            parse_hash("0x7de96872623cacd9443b142845533c05c5a2628d39a6b450e31bf1fa870184c2")
         );
     }
 }

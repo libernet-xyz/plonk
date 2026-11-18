@@ -37,7 +37,11 @@ pub(crate) fn encode_proof<F: PrimeField256>(proof: &proto::Proof) -> Vec<u8> {
             .skip(1) // skip the circuit batch
             .map(|batch| utils::load_hash(&batch.root).unwrap()),
     );
+    encoder.push_u64(inner_proof.degree_bound);
     encoder.push_u64(inner_proof.security_bits.into());
+    encoder.push_u64(inner_proof.blowup_log2.into());
+    encoder.push_u64(inner_proof.fold_rate.into());
+    encoder.push_u64(inner_proof.max_rounds.into());
     encoder.push_u64(inner_proof.grinding_bits.into());
     encoder.push_u64(inner_proof.nonce);
     for point in &inner_proof.points {
