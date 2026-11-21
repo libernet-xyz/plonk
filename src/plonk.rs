@@ -1,7 +1,7 @@
 use crate::chip::Chip;
 use crate::expr::{Constraint, Variable};
 use crate::scpf;
-use crate::starkom::proto::plonk::v11 as proto;
+use crate::starkom::proto::plonk::v12 as proto;
 use crate::utils::{self, encode_cell, encode_usize, padded_circuit_size};
 use crate::witness::{Cell, CellOffset, Partitioner, Witness, WitnessView};
 use anyhow::{Result, anyhow};
@@ -972,7 +972,7 @@ impl<G: PrimeField256, H: Hasher<G>> Proof<G, G, H> {
 
 impl Name for proto::Proof {
     const NAME: &'static str = "Proof";
-    const PACKAGE: &'static str = "starkom.proto.plonk.v11";
+    const PACKAGE: &'static str = "starkom.proto.plonk.v12";
 
     /// Returns the type URL of the message, prefixed with `type.starkom.io` like the ones of the
     /// messages of `starkom-pcs`.
@@ -4038,19 +4038,19 @@ mod tests {
     /// with root 0x55 and one query. Every hash appears once.
     fn small_proof() -> Proof<BS, BS, Keccak256Hash<BS>> {
         let hash_backend = prost_types::Any::from_msg(
-            &pcs::starkom::proto::pcs::v11::KeccakHashBackend::default(),
+            &pcs::starkom::proto::pcs::v12::KeccakHashBackend::default(),
         )
         .unwrap();
-        let batch = |root: u8| pcs::starkom::proto::pcs::v11::commitment::Batch {
+        let batch = |root: u8| pcs::starkom::proto::pcs::v12::commitment::Batch {
             base_field: false,
             num_polys: 1,
             root: vec![root; 32],
         };
-        let leaf_proof = |value: u64, sibling: u8| pcs::starkom::proto::pcs::v11::MerkleProof {
+        let leaf_proof = |value: u64, sibling: u8| pcs::starkom::proto::pcs::v12::MerkleProof {
             leaf_values: vec![proto_scalar(value)],
             merkle_path: vec![vec![sibling; 32]],
         };
-        let point = |z: u64, values: [u64; 4]| pcs::starkom::proto::pcs::v11::proof::Point {
+        let point = |z: u64, values: [u64; 4]| pcs::starkom::proto::pcs::v12::proof::Point {
             z: proto_scalar(z),
             v: values.map(proto_scalar).to_vec(),
         };
@@ -4061,11 +4061,11 @@ mod tests {
         };
         Proof::from_proto(&proto::Proof {
             public_inputs: vec![public_input(2, 1, 35), public_input(2, 0, 3)],
-            commitment: Some(pcs::starkom::proto::pcs::v11::Commitment {
+            commitment: Some(pcs::starkom::proto::pcs::v12::Commitment {
                 hash_backend: Some(hash_backend.clone()),
                 batches: vec![batch(0x11), batch(0x22), batch(0x33), batch(0x44)],
             }),
-            inner_proof: Some(pcs::starkom::proto::pcs::v11::Proof {
+            inner_proof: Some(pcs::starkom::proto::pcs::v12::Proof {
                 hash_backend: Some(hash_backend),
                 degree_bound: 4,
                 security_bits: 128,
@@ -4077,7 +4077,7 @@ mod tests {
                 points: vec![point(456, [67, 68, 69, 70]), point(123, [45, 46, 47, 48])],
                 fri_roots: vec![vec![0x55; 32]],
                 folded_quotient: vec![proto_scalar(7)],
-                openings: vec![pcs::starkom::proto::pcs::v11::proof::Opening {
+                openings: vec![pcs::starkom::proto::pcs::v12::proof::Opening {
                     proofs: vec![
                         leaf_proof(10, 0xa1),
                         leaf_proof(11, 0xa2),
@@ -4085,9 +4085,9 @@ mod tests {
                         leaf_proof(13, 0xa4),
                     ],
                 }],
-                queries: vec![pcs::starkom::proto::pcs::v11::Query {
+                queries: vec![pcs::starkom::proto::pcs::v12::Query {
                     index: 5,
-                    folds: vec![pcs::starkom::proto::pcs::v11::query::LeafProof {
+                    folds: vec![pcs::starkom::proto::pcs::v12::query::LeafProof {
                         coset_values: vec![proto_scalar(20), proto_scalar(21)],
                         merkle_path: vec![vec![0xdd; 32]],
                     }],
@@ -4101,11 +4101,11 @@ mod tests {
     fn test_proof_full_name() {
         assert_eq!(
             <proto::Proof as Name>::full_name(),
-            "starkom.proto.plonk.v11.Proof"
+            "starkom.proto.plonk.v12.Proof"
         );
         assert_eq!(
             <proto::Proof as Name>::type_url(),
-            "type.starkom.io/starkom.proto.plonk.v11.Proof"
+            "type.starkom.io/starkom.proto.plonk.v12.Proof"
         );
     }
 
@@ -4113,7 +4113,7 @@ mod tests {
     fn test_proof_layout_identifier() {
         assert_eq!(
             starkom_scpf::layout_identifier::<proto::Proof>(),
-            parse_hash("0x7cda700e3097eeb7a607a078ad72d656f380990a899edb365d555d4948470125")
+            parse_hash("0x5e93625320fedb2da52b40544282d4aa84916e23ccbb568f5aadd55576fd34f8")
         );
     }
 
@@ -4182,7 +4182,7 @@ mod tests {
         assert_eq!(data.len(), 91410);
         assert_eq!(
             keccak256(data.as_slice()),
-            parse_hash("0xa9215a3c4f06e51ab065d992dd6c155f180244c33f3fcc09470937290476825c")
+            parse_hash("0xa7cb94286f40ecc88bef2c64b7a59e6d620991cd82d6d4ee8df972f0f56d8475")
         );
     }
 }

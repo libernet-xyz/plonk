@@ -1,7 +1,7 @@
 # SCPF Layout of PLONK Proofs
 
 This document specifies the layout of the SCPF data of PLONK proofs, i.e. of the
-`starkom.proto.plonk.v11.Proof` protobuf message, as encoded by [`Proof::to_scpf`][to-scpf]. The
+`starkom.proto.plonk.v12.Proof` protobuf message, as encoded by [`Proof::to_scpf`][to-scpf]. The
 binary format itself (the header, the pool, and the encoding of varints, inline words, and pool
 references) is specified in [`FORMAT.md`][format] in the `scpf` repository.
 
@@ -10,7 +10,7 @@ backend isn't encoded, so decoders must know it in advance; EVM verifiers use Ke
 
 ## Header
 
-The layout identifier is `keccak256("starkom.proto.plonk.v11.Proof")`, or `7cda700e3097eeb7a607a078ad72d656f380990a899edb365d555d4948470125`.
+The layout identifier is `keccak256("starkom.proto.plonk.v12.Proof")`, or `5e93625320fedb2da52b40544282d4aa84916e23ccbb568f5aadd55576fd34f8`.
 
 ## Stream
 
@@ -81,8 +81,8 @@ Everything else is derived by the verifier, mostly from the circuit (see `Compre
 ## Relation with the protobuf
 
 `Proof::to_scpf` serializes the proof to its protobuf and transcodes the protobuf, so the stream
-follows the fields of `starkom.proto.plonk.v11.Proof` and of the `starkom.proto.pcs.v11.Commitment`
-and `starkom.proto.pcs.v11.Proof` messages that it contains, with two differences:
+follows the fields of `starkom.proto.plonk.v12.Proof` and of the `starkom.proto.pcs.v12.Commitment`
+and `starkom.proto.pcs.v12.Proof` messages that it contains, with two differences:
 
 - the fields that the verifier derives aren't encoded: the hash backends, the circuit root and the
   `base_field` and `num_polys` fields of the batches, the X-coordinates `z` of the points, the cells

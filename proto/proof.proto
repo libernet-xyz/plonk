@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package starkom.proto.plonk.v11;
+package starkom.proto.plonk.v12;
 
 import "pcs/pcs.proto";
 
@@ -25,8 +25,8 @@ message Proof {
   repeated PublicInput public_inputs = 1;
 
   // The inner DEEP-FRI commitment.
-  pcs.v11.Commitment commitment = 2;
+  pcs.v12.Commitment commitment = 2;
 
   // The inner DEEP-FRI proof.
-  pcs.v11.Proof inner_proof = 3;
+  pcs.v12.Proof inner_proof = 3;
 }
